@@ -75,6 +75,8 @@ pub enum Error {
     VhostUserGetQueueMaxNum(#[source] VhostError),
     #[error("Get protocol features failed")]
     VhostUserGetProtocolFeatures(#[source] VhostError),
+    #[error("Get shmem config failed")]
+    VhostUserGetShmemConfig(#[source] VhostError),
     #[error("Backend does not support protocol features {0:#x}")]
     UnsupportedProtocolFeatures(u64),
     #[error("Protocol features {0:#x} saved without PROTOCOL_FEATURES acknowledged")]
@@ -207,6 +209,7 @@ impl Error {
             Error::VhostUserGetFeatures(e)
             | Error::VhostUserGetQueueMaxNum(e)
             | Error::VhostUserGetProtocolFeatures(e)
+            | Error::VhostUserGetShmemConfig(e)
             | Error::VhostUserGetVringBase(e)
             | Error::VhostUserSetOwner(e)
             | Error::VhostUserSetFeatures(e)
