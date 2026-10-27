@@ -5,11 +5,12 @@
 use std::os::unix::io::AsRawFd;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Barrier, Mutex};
+use std::thread::{self, JoinHandle};
 use std::{io, result};
 
 use event_monitor::event;
 use log::{error, info, warn};
-use seccompiler::SeccompAction;
+use seccompiler::{SeccompAction, apply_filter};
 use vhost::vhost_user::message::{
     VhostUserConfigFlags, VhostUserMMap, VhostUserMMapFlags, VhostUserProtocolFeatures,
     VhostUserVirtioFeatures,
@@ -18,12 +19,13 @@ use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontend, VhostUserFrontend
 use vm_device::UserspaceMapping;
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
+use vmm_sys_util::epoll::{ControlOperation, Epoll, EpollEvent, EventSet};
 use vmm_sys_util::eventfd::EventFd;
 
 use super::vu_common_ctrl::VhostUserHandle;
 use super::{Error, Result};
 use crate::device::ActivationContext;
-use crate::seccomp_filters::Thread;
+use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::vhost_user::{VhostUserCommon, VhostUserState};
 use crate::{
     ActivateResult, GuestRegionMmap, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon, VirtioDevice,
@@ -33,14 +35,14 @@ use crate::{
 pub type State = VhostUserState<()>;
 
 struct BackendReqHandler {
-    interrupt_cb: Arc<dyn VirtioInterrupt>,
-    shm_regions: Option<VirtioSharedMemoryList>,
+    interrupt_cb: Mutex<Option<Arc<dyn VirtioInterrupt>>>,
+    shm_regions: Arc<Mutex<Option<VirtioSharedMemoryList>>>,
 }
 
 impl BackendReqHandler {
     fn region_target_addr(&self, req: &VhostUserMMap) -> io::Result<*mut libc::c_void> {
-        let shm_list = self
-            .shm_regions
+        let guard = self.shm_regions.lock().unwrap();
+        let shm_list = guard
             .as_ref()
             .ok_or_else(|| io::Error::other("No shared memory region configured"))?;
         let region = shm_list
@@ -65,12 +67,14 @@ impl BackendReqHandler {
 
 impl VhostUserFrontendReqHandler for BackendReqHandler {
     fn handle_config_change(&self) -> io::Result<u64> {
-        self.interrupt_cb
-            .trigger(VirtioInterruptType::Config)
-            .map_err(|e| {
-                error!("Failed to signal config change: {e:?}");
-                io::Error::other(e)
-            })?;
+        if let Some(ref interrupt_cb) = *self.interrupt_cb.lock().unwrap() {
+            interrupt_cb
+                .trigger(VirtioInterruptType::Config)
+                .map_err(|e| {
+                    error!("Failed to signal config change: {e:?}");
+                    io::Error::other(e)
+                })?;
+        }
         Ok(0)
     }
 
@@ -126,8 +130,10 @@ pub struct GenericVhostUser {
     id: String,
     // Hold ownership of the memory that is allocated for the device
     // which will be automatically dropped when the device is dropped
-    cache: Option<VirtioSharedMemoryList>,
+    cache: Arc<Mutex<Option<VirtioSharedMemoryList>>>,
     shmem_sizes: Vec<u64>,
+    backend_req_handler: Arc<BackendReqHandler>,
+    pre_activate_worker: Option<(EventFd, JoinHandle<FrontendReqHandler<BackendReqHandler>>)>,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
     cfg_warning: AtomicBool,
@@ -157,6 +163,12 @@ impl GenericVhostUser {
                 Ok(())
             })?;
 
+        let cache = Arc::new(Mutex::new(cache));
+        let backend_req_handler = Arc::new(BackendReqHandler {
+            interrupt_cb: Mutex::new(None),
+            shm_regions: Arc::clone(&cache),
+        });
+
         let (
             avail_features,
             acked_features,
@@ -165,6 +177,7 @@ impl GenericVhostUser {
             paused,
             vring_bases,
             shmem_sizes,
+            pre_activate_worker,
         ) = if let Some(state) = state {
             info!("Restoring generic vhost-user {id}");
             vu.set_protocol_features_vhost_user(
@@ -182,6 +195,7 @@ impl GenericVhostUser {
                 true,
                 state.vring_bases,
                 Vec::new(),
+                None,
             )
         } else {
             let avail_protocol_features = VhostUserProtocolFeatures::CONFIG
@@ -227,6 +241,94 @@ since the backend only supports {backend_num_queues}\n",
                     Vec::new()
                 };
 
+            let pre_activate_worker = if acked_protocol_features
+                & VhostUserProtocolFeatures::BACKEND_REQ.bits()
+                != 0
+            {
+                let mut handler = FrontendReqHandler::new(Arc::clone(&backend_req_handler))
+                    .map_err(Error::FrontendReqHandlerCreation)?;
+
+                if acked_protocol_features & VhostUserProtocolFeatures::REPLY_ACK.bits() != 0 {
+                    handler.set_reply_ack_flag(true);
+                }
+
+                vu.socket_handle()
+                    .set_backend_request_fd(&handler.get_tx_raw_fd())
+                    .map_err(Error::VhostUserSetBackendRequestFd)?;
+
+                let kill_evt = EventFd::new(libc::EFD_NONBLOCK).map_err(Error::CreateEventFd)?;
+                let epoll = Epoll::new().map_err(Error::EpollCreate)?;
+                epoll
+                    .ctl(
+                        ControlOperation::Add,
+                        handler.as_raw_fd(),
+                        EpollEvent::new(EventSet::IN, 0),
+                    )
+                    .map_err(Error::EpollCtl)?;
+                epoll
+                    .ctl(
+                        ControlOperation::Add,
+                        kill_evt.as_raw_fd(),
+                        EpollEvent::new(EventSet::IN, 1),
+                    )
+                    .map_err(Error::EpollCtl)?;
+
+                let seccomp_filter =
+                    get_seccomp_filter(&seccomp_action, Thread::VirtioGenericVhostUser)
+                        .map_err(Error::CreateSeccompFilter)?;
+                let thread_exit_evt = exit_evt.try_clone().map_err(Error::CreateEventFd)?;
+                let handle = thread::Builder::new()
+                    .name(format!("{id}_backend_req"))
+                    .spawn(move || {
+                        if !seccomp_filter.is_empty()
+                            && let Err(e) = apply_filter(&seccomp_filter)
+                        {
+                            error!("Error applying seccomp filter: {e:?}");
+                            thread_exit_evt.write(1).ok();
+                            return handler;
+                        }
+                        let mut events = [EpollEvent::default(); 2];
+                        loop {
+                            let num_events = match epoll.wait(-1, &mut events) {
+                                Ok(n) => n,
+                                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                                Err(e) => {
+                                    error!("BackendReqHandler epoll wait error: {e:?}");
+                                    break;
+                                }
+                            };
+                            let mut stop = false;
+                            for event in events.iter().take(num_events) {
+                                if event.data() == 1 {
+                                    stop = true;
+                                    break;
+                                }
+                                if event.event_set().intersects(
+                                    EventSet::ERROR | EventSet::HANG_UP | EventSet::READ_HANG_UP,
+                                ) {
+                                    stop = true;
+                                    break;
+                                }
+                                if event.event_set().contains(EventSet::IN)
+                                    && let Err(e) = handler.handle_request()
+                                {
+                                    error!("BackendReqHandler error: {e:?}");
+                                    stop = true;
+                                    break;
+                                }
+                            }
+                            if stop {
+                                break;
+                            }
+                        }
+                        handler
+                    })
+                    .map_err(Error::ThreadSpawn)?;
+                Some((kill_evt, handle))
+            } else {
+                None
+            };
+
             let mut avail_features = acked_features;
             if access_platform_enabled {
                 avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
@@ -244,6 +346,7 @@ since the backend only supports {backend_num_queues}\n",
                 false,
                 None,
                 shmem_sizes,
+                pre_activate_worker,
             )
         };
 
@@ -269,6 +372,8 @@ since the backend only supports {backend_num_queues}\n",
             id,
             cache,
             shmem_sizes,
+            backend_req_handler,
+            pre_activate_worker,
             seccomp_action,
             exit_evt,
             cfg_warning: AtomicBool::new(false),
@@ -277,6 +382,15 @@ since the backend only supports {backend_num_queues}\n",
 
     pub fn negotiated_shmem_sizes(&self) -> &[u64] {
         &self.shmem_sizes
+    }
+
+    fn stop_pre_activate_worker(&mut self) -> Option<FrontendReqHandler<BackendReqHandler>> {
+        if let Some((kill_evt, handle)) = self.pre_activate_worker.take() {
+            let _ = kill_evt.write(1);
+            handle.join().ok()
+        } else {
+            None
+        }
     }
 
     fn state(&self) -> result::Result<State, MigratableError> {
@@ -301,6 +415,7 @@ space access. Reads will return 0xFF and writes will be ignored."
 
 impl Drop for GenericVhostUser {
     fn drop(&mut self) {
+        let _ = self.stop_pre_activate_worker();
         self.vu_common.shutdown();
     }
 }
@@ -384,32 +499,36 @@ impl VirtioDevice for GenericVhostUser {
         self.vu_common
             .virtio_common
             .activate(&queues, Arc::clone(&interrupt_cb))?;
+        *self.backend_req_handler.interrupt_cb.lock().unwrap() = Some(Arc::clone(&interrupt_cb));
 
         let has_backend_req = self.vu_common.acked_protocol_features
             & VhostUserProtocolFeatures::BACKEND_REQ.bits()
             != 0;
 
-        let backend_req_handler = has_backend_req
-            .then(|| {
-                let mut handler = FrontendReqHandler::new(Arc::new(BackendReqHandler {
-                    interrupt_cb: Arc::clone(&interrupt_cb),
-                    shm_regions: self.cache.clone(),
-                }))
-                .map_err(|e| {
-                    crate::ActivateError::VhostUserSetup(Error::FrontendReqHandlerCreation(e))
-                })?;
+        let backend_req_handler = if let Some(handler) = self.stop_pre_activate_worker() {
+            Some(handler)
+        } else {
+            has_backend_req
+                .then(|| {
+                    let mut handler = FrontendReqHandler::new(Arc::clone(
+                        &self.backend_req_handler,
+                    ))
+                    .map_err(|e| {
+                        crate::ActivateError::VhostUserSetup(Error::FrontendReqHandlerCreation(e))
+                    })?;
 
-                if self.vu_common.acked_protocol_features
-                    & VhostUserProtocolFeatures::REPLY_ACK.bits()
-                    != 0
-                {
-                    handler.set_reply_ack_flag(true);
-                }
+                    if self.vu_common.acked_protocol_features
+                        & VhostUserProtocolFeatures::REPLY_ACK.bits()
+                        != 0
+                    {
+                        handler.set_reply_ack_flag(true);
+                    }
 
-                Ok(handler)
-            })
-            // Return inner Err early, keep Option of `Ok` value
-            .transpose()?;
+                    Ok(handler)
+                })
+                // Return inner Err early, keep Option of `Ok` value
+                .transpose()?
+        };
 
         // Run a dedicated thread for handling potential reconnections with
         // the backend.
@@ -447,18 +566,19 @@ impl VirtioDevice for GenericVhostUser {
     }
 
     fn shutdown(&mut self) {
+        let _ = self.stop_pre_activate_worker();
         self.vu_common.shutdown();
     }
 
     fn get_shm_regions(&self) -> Option<VirtioSharedMemoryList> {
-        self.cache.clone()
+        self.cache.lock().unwrap().clone()
     }
 
     fn set_shm_regions(
         &mut self,
         shm_regions: VirtioSharedMemoryList,
     ) -> result::Result<(), crate::Error> {
-        self.cache = Some(shm_regions);
+        *self.cache.lock().unwrap() = Some(shm_regions);
         Ok(())
     }
 
@@ -471,7 +591,7 @@ impl VirtioDevice for GenericVhostUser {
 
     fn userspace_mappings(&self) -> Vec<UserspaceMapping> {
         let mut mappings = Vec::new();
-        if let Some(cache) = self.cache.as_ref() {
+        if let Some(cache) = self.cache.lock().unwrap().as_ref() {
             mappings.push(UserspaceMapping {
                 mem_slot: cache.mem_slot,
                 addr: cache.addr,

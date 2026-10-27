@@ -169,6 +169,10 @@ pub enum Error {
     ConnectKilled,
     #[error("Timed out waiting for vhost-user connection")]
     VhostUserConnectTimeout,
+    #[error("Failed to create seccomp filter")]
+    CreateSeccompFilter(#[source] seccompiler::Error),
+    #[error("Failed to spawn thread")]
+    ThreadSpawn(#[source] io::Error),
 }
 type Result<T> = result::Result<T, Error>;
 
