@@ -198,9 +198,10 @@ impl BlockEpollHandler {
     fn check_request(features: u64, request: &Request) -> result::Result<(), ExecuteError> {
         let request_type = request.request_type();
         if (has_feature(features, VIRTIO_BLK_F_RO.into()))
-            && !(request_type == RequestType::In
-                || request_type == RequestType::GetDeviceId
-                || request_type == RequestType::Flush)
+            && matches!(
+                request_type,
+                RequestType::Out | RequestType::Discard | RequestType::WriteZeroes
+            )
         {
             // For virtio spec compliance
             // "A device MUST set the status byte to VIRTIO_BLK_S_IOERR for a write request
@@ -289,7 +290,7 @@ impl BlockEpollHandler {
                 warn!("Request check failed: {request:x?} {e:?}");
                 desc_chain
                     .memory()
-                    .write_obj(VIRTIO_BLK_S_IOERR, request.status_addr())
+                    .write_obj(VIRTIO_BLK_S_IOERR as u8, request.status_addr())
                     .map_err(Error::RequestStatus)?;
 
                 // If no asynchronous operation has been submitted, we can
@@ -1167,13 +1168,13 @@ impl VirtioDevice for Block {
 
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
 
-        for i in 0..queues.len() {
-            let (_, mut queue, queue_evt) = queues.remove(0);
+        // `queue_idx` is the virtqueue number the driver configured. It differs from
+        // the position in `queues`, which only holds the enabled queues.
+        for (queue_idx, mut queue, queue_evt) in queues.drain(..) {
             queue.set_event_idx(event_idx);
 
             let queue_size = queue.size();
             let (kill_evt, pause_evt) = self.common.dup_eventfds()?;
-            let queue_idx = i as u16;
 
             let mut handler = BlockEpollHandler {
                 queue_index: queue_idx,
@@ -1215,7 +1216,7 @@ impl VirtioDevice for Block {
             let paused_sync = self.common.paused_sync.clone();
 
             self.common.spawn_worker(
-                &format!("{}_q{}", self.id.clone(), i),
+                &format!("{}_q{}", self.id.clone(), queue_idx),
                 &self.seccomp_action,
                 Thread::VirtioBlock,
                 &self.exit_evt,
@@ -1355,9 +1356,11 @@ mod tests {
     use std::fs;
     use std::io::Result as IoResult;
     use std::path::Path;
+    use std::sync::{Mutex, mpsc};
 
     use block::async_io::{AsyncIoCompletion, AsyncIoOperation, AsyncIoResult};
     use hypervisor::Vm;
+    use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use vm_memory::GuestAddress;
     use vm_virtio::queue::testing::VirtQueue as GuestQ;
     use vmm_sys_util::eventfd::EFD_NONBLOCK;
@@ -1394,7 +1397,7 @@ mod tests {
         }
     }
 
-    fn make_block_with_serial(dir: &Path, serial: Option<&str>) -> Block {
+    fn make_block_with_serial(dir: &Path, serial: Option<&str>, num_queues: u16) -> Block {
         use block::ImageType;
         use block::factory::{DiskOpenOptions, open_disk};
 
@@ -1419,7 +1422,7 @@ mod tests {
             path,
             false,
             false,
-            1,
+            num_queues,
             256,
             serial,
             SeccompAction::Allow,
@@ -1439,7 +1442,7 @@ mod tests {
         use vmm_sys_util::tempdir::TempDir;
 
         let dir = TempDir::new_with_prefix("/dev/shm/ch-serial").unwrap();
-        let block = make_block_with_serial(dir.as_path(), Some("abc"));
+        let block = make_block_with_serial(dir.as_path(), Some("abc"), 1);
         assert_eq!(block.serial.len(), VIRTIO_BLK_ID_BYTES as usize);
         assert_eq!(&block.serial[..3], b"abc");
         assert!(block.serial[3..].iter().all(|b| *b == 0));
@@ -1451,22 +1454,15 @@ mod tests {
 
         let dir = TempDir::new_with_prefix("/dev/shm/ch-serial").unwrap();
         let serial = "0123456789abcdefghij";
-        let block = make_block_with_serial(dir.as_path(), Some(serial));
+        let block = make_block_with_serial(dir.as_path(), Some(serial), 1);
         assert_eq!(&block.serial[..], serial.as_bytes());
     }
 
-    #[test]
-    fn parse_failure_reclaims_head() {
-        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
-        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
-        vq.dtable[0].set(0x2000, 16, 0, 0);
-        vq.avail.ring[0].set(0);
-        vq.avail.idx.set(1);
-
+    fn make_handler(queue: Queue, mem: &GuestMemoryMmap, acked_features: u64) -> BlockEpollHandler {
         let evt = || EventFd::new(EFD_NONBLOCK).unwrap();
-        let mut handler = BlockEpollHandler {
+        BlockEpollHandler {
             queue_index: 0,
-            queue: vq.create_queue(),
+            queue,
             mem: GuestMemoryAtomic::new(mem.clone()),
             disk_image: Box::new(Noop(evt())),
             disk_nsectors: Arc::new(AtomicU64::new(0)),
@@ -1483,11 +1479,121 @@ mod tests {
             rate_limiter: None,
             access_platform: None,
             host_cpus: None,
-            acked_features: 0,
-        };
+            acked_features,
+        }
+    }
+
+    const REQ_HDR_ADDR: u64 = 0x2000;
+    const REQ_DATA_ADDR: u64 = 0x3000;
+    const REQ_STATUS_ADDR: u64 = 0x4000;
+
+    /// Processes one request of `request_type` with a 16 byte device-readable
+    /// data descriptor and a 1 byte status descriptor. Returns the status
+    /// byte and the 3 bytes after it, which are poisoned with 0xff before.
+    fn process_one_request(request_type: u32, acked_features: u64) -> [u8; 4] {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        mem.write_obj(request_type, GuestAddress(REQ_HDR_ADDR))
+            .unwrap();
+        mem.write_slice(&[0xff; 4], GuestAddress(REQ_STATUS_ADDR))
+            .unwrap();
+        let next = VRING_DESC_F_NEXT as u16;
+        let write = VRING_DESC_F_WRITE as u16;
+        vq.dtable[0].set(REQ_HDR_ADDR, 16, next, 1);
+        vq.dtable[1].set(REQ_DATA_ADDR, 16, next, 2);
+        vq.dtable[2].set(REQ_STATUS_ADDR, 1, write, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        let mut handler = make_handler(vq.create_queue(), &mem, acked_features);
+        handler.process_queue_submit().unwrap();
+
+        assert_eq!(vq.used.idx.get(), 1);
+        let mut status = [0u8; 4];
+        mem.read_slice(&mut status, GuestAddress(REQ_STATUS_ADDR))
+            .unwrap();
+        status
+    }
+
+    struct QueueInterruptSender(Mutex<mpsc::Sender<u16>>);
+    impl VirtioInterrupt for QueueInterruptSender {
+        fn trigger(&self, int_type: VirtioInterruptType) -> IoResult<()> {
+            if let VirtioInterruptType::Queue(queue_index) = int_type {
+                self.0.lock().unwrap().send(queue_index).unwrap();
+            }
+            Ok(())
+        }
+        fn set_notifier(&self, _: u32, _: Option<EventFd>, _: &dyn Vm) -> IoResult<()> {
+            Ok(())
+        }
+    }
+
+    // A driver may enable only some queues. The worker of each queue must
+    // still signal the vector of its own queue index.
+    #[test]
+    fn sparse_queue_signals_its_own_index() {
+        use vmm_sys_util::tempdir::TempDir;
+
+        // Boring setup: a GET_ID request on a 2 queue device of which the
+        // driver only enabled queue 1.
+        let dir = TempDir::new_with_prefix("/dev/shm/ch-sparse-queue").unwrap();
+        let mut block = make_block_with_serial(dir.as_path(), None, 2);
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        mem.write_obj(VIRTIO_BLK_T_GET_ID, GuestAddress(REQ_HDR_ADDR))
+            .unwrap();
+        let next = VRING_DESC_F_NEXT as u16;
+        let write = VRING_DESC_F_WRITE as u16;
+        vq.dtable[0].set(REQ_HDR_ADDR, 16, next, 1);
+        vq.dtable[1].set(REQ_DATA_ADDR, VIRTIO_BLK_ID_BYTES, next | write, 2);
+        vq.dtable[2].set(REQ_STATUS_ADDR, 1, write, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+        let queue_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let (tx, rx) = mpsc::channel();
+
+        block
+            .activate(ActivationContext {
+                mem: GuestMemoryAtomic::new(mem.clone()),
+                interrupt_cb: Arc::new(QueueInterruptSender(Mutex::new(tx))),
+                queues: vec![(1, vq.create_queue(), queue_evt.try_clone().unwrap())],
+                device_status: Arc::new(AtomicU8::new(0)),
+            })
+            .unwrap();
+        queue_evt.write(1).unwrap();
+
+        // The interesting part: the completion signals queue 1, not queue 0.
+        let queue_index = rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        block.reset();
+        assert_eq!(queue_index, 1);
+    }
+
+    #[test]
+    fn parse_failure_reclaims_head() {
+        let mem = GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+        vq.dtable[0].set(0x2000, 16, 0, 0);
+        vq.avail.ring[0].set(0);
+        vq.avail.idx.set(1);
+
+        let mut handler = make_handler(vq.create_queue(), &mem, 0);
 
         handler.process_queue_submit().unwrap();
 
         assert_eq!(vq.used.idx.get(), 1);
+    }
+
+    // The status descriptor may be a single byte, so a rejected request must
+    // not write past it.
+    #[test]
+    fn rejected_request_writes_one_status_byte() {
+        let status = process_one_request(VIRTIO_BLK_T_OUT, 1 << VIRTIO_BLK_F_RO);
+        assert_eq!(status, [VIRTIO_BLK_S_IOERR as u8, 0xff, 0xff, 0xff]);
+    }
+
+    #[test]
+    fn read_only_device_reports_unknown_request_unsupported() {
+        let status = process_one_request(0x7f, 1 << VIRTIO_BLK_F_RO);
+        assert_eq!(status[0], VIRTIO_BLK_S_UNSUPP as u8);
     }
 }

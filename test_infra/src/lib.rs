@@ -4,6 +4,7 @@
 //
 
 #![expect(clippy::undocumented_unsafe_blocks)]
+#![expect(clippy::panic, reason = "test code")]
 
 use std::any::Any;
 use std::collections::HashMap;
@@ -1284,26 +1285,31 @@ impl Guest {
         Self::new_from_ip_range(disk_config, "192.168", next_guest_id())
     }
 
+    #[must_use]
     pub fn with_cpu(mut self, count: u32) -> Self {
         self.num_cpu = count;
         self
     }
 
+    #[must_use]
     pub fn with_memory(mut self, mem_size: &str) -> Self {
         self.mem_size_str = mem_size.to_string();
         self
     }
 
+    #[must_use]
     pub fn with_nested(mut self, nested: bool) -> Self {
         self.nested = nested;
         self
     }
 
+    #[must_use]
     pub fn with_kernel_path(mut self, kernel_path: &str) -> Self {
         self.kernel_path = Some(kernel_path.to_string());
         self
     }
 
+    #[must_use]
     pub fn with_kernel(mut self, kernel: String) -> Self {
         self.kernel_path = Some(kernel);
         self
@@ -2116,8 +2122,9 @@ impl<'a> GuestCommand<'a> {
             } else {
                 "hvc0"
             };
-            let igvm = direct_igvm_boot_path(Some(console_str))
-                .expect("IGVM boot file not found for console type: {console_str}");
+            let igvm = direct_igvm_boot_path(Some(console_str)).unwrap_or_else(|| {
+                panic!("IGVM boot file not found for console type: {console_str}")
+            });
             self.command.args([
                 "--igvm",
                 igvm.to_str().expect("IGVM path is not valid UTF-8"),

@@ -4,6 +4,7 @@
 //
 #![cfg(any(devcli_testenv, clippy))]
 #![expect(clippy::undocumented_unsafe_blocks)]
+#![expect(clippy::panic, reason = "test code")]
 // When enabling the `mshv` feature, we skip quite some tests and
 // hence have known dead-code. This annotation silences dead-code
 // related warnings for our quality workflow to pass.
@@ -22,6 +23,7 @@ use std::{fs, panic, thread};
 
 use block::ImageType;
 use test_infra::*;
+use vmm::memory_manager::SNAPSHOT_FILENAME;
 use vmm_sys_util::tempdir::TempDir;
 use vmm_sys_util::tempfile::TempFile;
 use wait_timeout::ChildExt;
@@ -158,13 +160,27 @@ mod common_parallel {
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(
+        target_arch = "x86_64",
+        all(target_arch = "aarch64", not(feature = "mshv"))
+    ))]
     fn test_nested_virtualization_on() {
+        #[cfg(target_arch = "aarch64")]
+        if fs::read_to_string("/proc/cmdline")
+            .expect("Failed to read /proc/cmdline")
+            .split_ascii_whitespace()
+            .rev()
+            .find_map(|arg| arg.strip_prefix("kvm-arm.mode="))
+            != Some("nested")
+        {
+            eprintln!("SKIPPED: host kernel was not booted with kvm-arm.mode=nested");
+            return;
+        }
         _test_nested_virtualization(true);
     }
 
     #[test]
-    #[cfg(target_arch = "x86_64")]
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     fn test_nested_virtualization_off() {
         _test_nested_virtualization(false);
     }
@@ -2970,6 +2986,96 @@ mod common_parallel {
     #[test]
     fn test_console_socket_interaction() {
         _test_socket_interaction(ConsoleKind::Console);
+    }
+
+    // Bridge TCP to a pty for the shared interaction check.
+    fn _test_tcp_interaction(kind: ConsoleKind) {
+        let disk_config = UbuntuDiskConfig::new(JAMMY_IMAGE_NAME.to_string());
+        let guest = Guest::new(Box::new(disk_config));
+        let tcp_pty = guest.tmp_dir.as_path().join("tcp.pty");
+
+        let port = TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let mut cmdline = DIRECT_KERNEL_BOOT_CMDLINE.to_owned();
+        if let ConsoleKind::Serial = kind {
+            cmdline += if cfg!(target_arch = "x86_64") {
+                " console=ttyS0"
+            } else {
+                " console=ttyAMA0"
+            };
+        }
+
+        let tcp_arg = format!("tcp=127.0.0.1:{port},server=on");
+        let (serial, console) = match kind {
+            ConsoleKind::Serial => (tcp_arg.as_str(), "null"),
+            ConsoleKind::Console => ("null", tcp_arg.as_str()),
+        };
+
+        let mut child = GuestCommand::new(&guest)
+            .default_cpus()
+            .default_memory()
+            .args(["--kernel", direct_kernel_boot_path().to_str().unwrap()])
+            .args(["--cmdline", &cmdline])
+            .default_disks()
+            .default_net()
+            .args(["--serial", serial])
+            .args(["--console", console])
+            .spawn()
+            .unwrap();
+
+        let boot = panic::catch_unwind(|| {
+            guest.wait_vm_boot().unwrap();
+        });
+
+        let mut socat_command = Command::new("socat");
+        let socat_args = [
+            &format!("pty,link={},raw,echo=0", tcp_pty.display()),
+            &format!("TCP-CONNECT:127.0.0.1:{port}"),
+        ];
+        socat_command.args(socat_args);
+
+        let mut socat_child = socat_command.spawn().unwrap();
+        thread::sleep(Duration::new(1, 0));
+
+        let interaction = panic::catch_unwind(|| {
+            _test_pty_interaction(tcp_pty);
+        });
+
+        let _ = socat_child.kill();
+        let _ = socat_child.wait();
+
+        let shutdown = panic::catch_unwind(|| {
+            guest.ssh_command("sudo shutdown -h now").unwrap();
+        });
+
+        let _ = child.wait_timeout(Duration::from_secs(20));
+        kill_child(&mut child);
+        let output = child.wait_with_output().unwrap();
+        handle_child_output(boot.and(interaction).and(shutdown), &output);
+
+        let r = panic::catch_unwind(|| {
+            if !output.status.success() {
+                panic!(
+                    "Cloud Hypervisor process failed to terminate gracefully: {:?}",
+                    output.status
+                );
+            }
+        });
+        handle_child_output(r, &output);
+    }
+
+    #[test]
+    fn test_serial_tcp_interaction() {
+        _test_tcp_interaction(ConsoleKind::Serial);
+    }
+
+    #[test]
+    fn test_console_tcp_interaction() {
+        _test_tcp_interaction(ConsoleKind::Console);
     }
 
     fn _test_serial_socket_stale_cleanup(reboot: bool) {
@@ -6909,7 +7015,15 @@ mod common_parallel {
         src_vm_cmd
             .args([
                 "--cpus",
-                format!("boot={boot_vcpus},max={max_vcpus}").as_str(),
+                format!(
+                    "boot={boot_vcpus},max={max_vcpus}{}",
+                    if cfg!(target_arch = "aarch64") {
+                        ",nested=off"
+                    } else {
+                        ""
+                    }
+                )
+                .as_str(),
             ])
             .args(memory_param)
             .default_kernel_cmdline()
@@ -10101,6 +10215,19 @@ mod snapshot_restore_common {
 
         handle_child_output(r, &output);
 
+        let snapshot_memory_checksum = if memory_restore_mode == Some("copyonwrite") {
+            let memory_file_path = Path::new(&snapshot_dir).join(SNAPSHOT_FILENAME);
+            let mut memory_file = File::open(&memory_file_path).unwrap();
+            let memory_file_size = memory_file.metadata().unwrap().len();
+            Some((
+                memory_file_path,
+                memory_file_size,
+                compute_file_checksum(&mut memory_file, memory_file_size),
+            ))
+        } else {
+            None
+        };
+
         // Remove the vsock socket file.
         Command::new("rm")
             .arg("-f")
@@ -10191,7 +10318,7 @@ mod snapshot_restore_common {
             // fallback to copy keeps RAM anonymous), and the mapped file must
             // outlive the VM.
             let maps = read_to_string(format!("/proc/{}/maps", child.id())).unwrap();
-            assert!(maps.contains(&format!("{snapshot_dir}/memory-ranges")));
+            assert!(maps.contains(&format!("{snapshot_dir}/{SNAPSHOT_FILENAME}")));
         } else {
             // Remove the snapshot dir
             let _ = remove_dir_all(snapshot_dir.as_str());
@@ -10238,6 +10365,15 @@ mod snapshot_restore_common {
             }
 
             guest.check_devices_common(Some(&socket), Some(&console_text), None);
+
+            if memory_restore_mode == Some("copyonwrite") {
+                guest
+                    .ssh_command(
+                        "sudo dd if=/dev/urandom of=/dev/shm/cow-test bs=1M count=64 conv=fsync \
+                         && sudo dd if=/dev/shm/cow-test of=/dev/null bs=1M count=64",
+                    )
+                    .expect("Failed to write and read guest memory during COW restore");
+            }
 
             #[cfg(target_arch = "x86_64")]
             guest.remove_test_disk(&api_socket_restored);
@@ -10305,6 +10441,20 @@ mod snapshot_restore_common {
         });
 
         handle_child_output(r, &output);
+
+        if let Some((memory_file_path, initial_size, initial_checksum)) = snapshot_memory_checksum {
+            let mut memory_file = File::open(&memory_file_path).unwrap();
+            let memory_file_size = memory_file.metadata().unwrap().len();
+            assert_eq!(
+                memory_file_size, initial_size,
+                "Copy-on-write restore changed the snapshot memory file size"
+            );
+            assert_eq!(
+                initial_checksum,
+                compute_file_checksum(&mut memory_file, memory_file_size),
+                "Copy-on-write restore modified the snapshot memory file"
+            );
+        }
     }
 
     #[cfg(not(feature = "mshv"))]
@@ -11697,7 +11847,15 @@ mod common_sequential {
         src_vm_cmd
             .args([
                 "--cpus",
-                format!("boot={boot_vcpus},max={max_vcpus}").as_str(),
+                format!(
+                    "boot={boot_vcpus},max={max_vcpus}{}",
+                    if cfg!(target_arch = "aarch64") {
+                        ",nested=off"
+                    } else {
+                        ""
+                    }
+                )
+                .as_str(),
             ])
             .args(memory_param)
             .default_kernel_cmdline()
@@ -11897,7 +12055,15 @@ mod common_sequential {
         src_vm_cmd
             .args([
                 "--cpus",
-                format!("boot={boot_vcpus},max={max_vcpus}").as_str(),
+                format!(
+                    "boot={boot_vcpus},max={max_vcpus}{}",
+                    if cfg!(target_arch = "aarch64") {
+                        ",nested=off"
+                    } else {
+                        ""
+                    }
+                )
+                .as_str(),
             ])
             .args(memory_param)
             .default_kernel_cmdline()

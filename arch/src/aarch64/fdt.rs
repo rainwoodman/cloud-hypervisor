@@ -108,6 +108,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
     numa_nodes: &NumaNodes,
     virtio_iommu_bdf: Option<u32>,
     pmu_supported: bool,
+    nested: bool,
     uefi_mmap_size: Option<u32>,
 ) -> FdtWriterResult<Vec<u8>> {
     // Allocate stuff necessary for the holding the blob.
@@ -136,7 +137,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
         create_pmu_node(&mut fdt)?;
     }
     create_clock_node(&mut fdt)?;
-    create_psci_node(&mut fdt)?;
+    create_psci_node(&mut fdt, nested)?;
     create_devices_node(&mut fdt, device_info)?;
     create_pci_nodes(&mut fdt, pci_space_info, virtio_iommu_bdf)?;
     if numa_nodes.len() > 1 {
@@ -439,6 +440,7 @@ fn create_memory_node(
             ram_regions
         };
 
+        #[expect(clippy::panic, reason = "memory layout invariant")]
         if ram_regions.len() > 2 {
             panic!(
                 "There should be up to two non-continuous regions, divided by the
@@ -454,6 +456,7 @@ fn create_memory_node(
             let ram_start = super::layout::RAM_START.raw_value();
             let mem_32bit_reserved_start = super::layout::MEM_32BIT_RESERVED_START.raw_value();
 
+            #[expect(clippy::panic, reason = "memory layout invariant")]
             if !((first_region_start <= &ram_start)
                 && (first_region_end > &ram_start)
                 && (first_region_end <= &mem_32bit_reserved_start))
@@ -477,6 +480,7 @@ fn create_memory_node(
         if let Some((second_region_start, second_region_end)) = ram_regions.get(1) {
             let ram_64bit_start = super::layout::RAM_64BIT_START.raw_value();
 
+            #[expect(clippy::panic, reason = "memory layout invariant")]
             if second_region_start != &ram_64bit_start {
                 panic!(
                     "Unexpected second memory region layout: start: 0x{second_region_start:08x}, ram_64bit_start: 0x{ram_64bit_start:08x}"
@@ -617,14 +621,14 @@ fn create_timer_node(fdt: &mut FdtWriter) -> FdtWriterResult<()> {
     Ok(())
 }
 
-fn create_psci_node(fdt: &mut FdtWriter) -> FdtWriterResult<()> {
+fn create_psci_node(fdt: &mut FdtWriter, nested: bool) -> FdtWriterResult<()> {
     let compatible = "arm,psci-0.2";
     let psci_node = fdt.begin_node("psci")?;
     fdt.property_string("compatible", compatible)?;
     // Two methods available: hvc and smc.
-    // As per documentation, PSCI calls between a guest and hypervisor may use the HVC conduit instead of SMC.
-    // So, since we are using kvm, we need to use hvc.
-    fdt.property_string("method", "hvc")?;
+    // Regular EL1 guests use the HVC conduit.
+    // With nested virtualisation, L1 guests need to use SMC as HVC is forwarded to vEL2.
+    fdt.property_string("method", if nested { "smc" } else { "hvc" })?;
     fdt.end_node(psci_node)?;
 
     Ok(())
@@ -1099,6 +1103,26 @@ mod tests {
             write_fdt_to_memory(&vec![0; max + 1], &mem),
             Err(Error::FdtTooLarge(n, m)) if n == max + 1 && m == layout::FDT_MAX_SIZE
         ));
+    }
+
+    #[test]
+    fn test_psci_conduit_nested_virt() {
+        let mut writer = FdtWriter::new().unwrap();
+        let root = writer.begin_node("").unwrap();
+        create_psci_node(&mut writer, true).unwrap();
+        writer.end_node(root).unwrap();
+
+        let dtb = writer.finish().unwrap();
+        let fdt = fdt_parser::Fdt::new(&dtb).unwrap();
+        let method = fdt
+            .find_node("/psci")
+            .unwrap()
+            .property("method")
+            .unwrap()
+            .as_str()
+            .unwrap();
+
+        assert_eq!(method, "smc");
     }
 
     // Helper function to create a simple NumaNode for testing
