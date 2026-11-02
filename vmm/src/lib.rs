@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write, stdout};
+use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
 #[cfg(feature = "guest_debug")]
@@ -62,7 +63,8 @@ use crate::memory_manager::{MemoryManager, MemoryRangePolicy};
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::migration::get_vm_snapshot;
 use crate::migration::transport::{
-    self, ReceiveAdditionalConnections, ReceiveListener, SendAdditionalConnections, SocketStream,
+    self, CONNECTION_SETUP_TIMEOUT, ReceiveAdditionalConnections, ReceiveListener,
+    SendAdditionalConnections, SocketStream,
 };
 use crate::migration::worker::{
     MigrationSeccompFilters, MigrationWorker, MigrationWorkerHandle, MigrationWorkerResult,
@@ -476,7 +478,8 @@ pub fn start_vmm_thread(
     exit_event: EventFd,
     seccomp_action: &SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
-    no_shutdown: bool,
+    shutdown_action: GuestShutdownAction,
+    reset_action: GuestResetAction,
     landlock_enable: bool,
 ) -> Result<VmmThreadHandle> {
     #[cfg(feature = "guest_debug")]
@@ -516,7 +519,8 @@ pub fn start_vmm_thread(
                     vmm_seccomp_action,
                     hypervisor,
                     exit_event,
-                    no_shutdown,
+                    shutdown_action,
+                    reset_action,
                 )?;
 
                 vmm.setup_signal_handler(landlock_enable)?;
@@ -693,6 +697,28 @@ impl VmOwnership {
     }
 }
 
+/// Action to take when the guest requests shutdown.
+#[derive(Default, Clone, Copy)]
+pub enum GuestShutdownAction {
+    /// Shut down the VM and exit the VMM.
+    #[default]
+    ExitVmm,
+    /// Shut down the VM while keeping the VMM running.
+    ShutdownVm,
+}
+
+/// Action to take when the guest requests a reset.
+#[derive(Default, Clone, Copy)]
+pub enum GuestResetAction {
+    /// Reset the VM.
+    #[default]
+    ResetVm,
+    /// Shut down the VM and exit the VMM.
+    ExitVmm,
+    /// Shut down the VM while keeping the VMM running.
+    ShutdownVm,
+}
+
 pub struct Vmm {
     epoll: EpollContext,
     exit_evt: EventFd,
@@ -716,7 +742,10 @@ pub struct Vmm {
     console_info: Option<ConsoleInfo>,
     serial_socket_listener: Option<Arc<LockedUnixListener>>,
     console_socket_listener: Option<Arc<LockedUnixListener>>,
-    no_shutdown: bool,
+    serial_tcp_listener: Option<Arc<TcpListener>>,
+    console_tcp_listener: Option<Arc<TcpListener>>,
+    shutdown_action: GuestShutdownAction,
+    reset_action: GuestResetAction,
     check_migration_evt: EventFd,
 }
 
@@ -881,7 +910,8 @@ impl Vmm {
         seccomp_action: SeccompAction,
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         exit_evt: EventFd,
-        no_shutdown: bool,
+        shutdown_action: GuestShutdownAction,
+        reset_action: GuestResetAction,
     ) -> Result<Self> {
         let mut epoll = EpollContext::new().map_err(Error::Epoll)?;
         let reset_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
@@ -941,7 +971,10 @@ impl Vmm {
             console_info: None,
             serial_socket_listener: None,
             console_socket_listener: None,
-            no_shutdown,
+            serial_tcp_listener: None,
+            console_tcp_listener: None,
+            shutdown_action,
+            reset_action,
             check_migration_evt,
         })
     }
@@ -1118,6 +1151,11 @@ impl Vmm {
         event!("vm", "migration-receive-ready");
         // Accept the connection and get the socket
         let mut socket = listener.accept()?;
+        // The sender sends its first request right after connecting. Without
+        // a timeout, a peer that stays silent blocks the receiver forever.
+        socket
+            .set_read_timeout(Some(CONNECTION_SETUP_TIMEOUT))
+            .map_err(MigratableError::MigrateSocket)?;
 
         event!("vm", "migration-receive-starting");
         let mut state = ReceiveMigrationState::Established;
@@ -1138,6 +1176,14 @@ impl Vmm {
                 )))
             })?;
             debug!("Command '{:?}' received", req.command());
+
+            if matches!(state, ReceiveMigrationState::Established) {
+                // Later requests can take long, e.g. while the memory goes over
+                // the additional connections.
+                socket
+                    .set_read_timeout(None)
+                    .map_err(MigratableError::MigrateSocket)?;
+            }
 
             state = self
                 .vm_receive_migration_step(
@@ -1676,7 +1722,7 @@ impl Vmm {
         let memory_mode = send_data_migration.effective_memory_mode();
 
         // Set up the socket connection
-        let mut socket = transport::send_migration_socket(
+        let mut socket = transport::connect_and_setup_socket(
             &send_data_migration.destination_url,
             send_data_migration.tls_dir.as_deref(),
         )?;
@@ -2092,6 +2138,7 @@ impl Vmm {
 
     /// Handles the outcome of the migration worker thread.
     fn check_migration(&mut self) {
+        #[expect(clippy::panic, reason = "only called during a migration")]
         let VmOwnership::Migration {
             migration_worker_handle,
             ..
@@ -2240,17 +2287,31 @@ impl Vmm {
                         // Consume the event.
                         self.reset_evt.read().map_err(Error::EventFdRead)?;
                         // TODO: Future follow-up must resolve lifecycle handling while migrating.
-                        self.vm_reboot().map_err(Error::VmReboot)?;
+                        match self.reset_action {
+                            GuestResetAction::ResetVm => {
+                                self.vm_reboot().map_err(Error::VmReboot)?;
+                            }
+                            GuestResetAction::ExitVmm => {
+                                self.vmm_shutdown().map_err(Error::VmmShutdown)?;
+                                break 'outer;
+                            }
+                            GuestResetAction::ShutdownVm => {
+                                self.vm_shutdown().map_err(Error::VmShutdown)?;
+                            }
+                        }
                     }
                     EpollDispatch::GuestExit => {
                         info!("VM guest exit event");
                         self.guest_exit_evt.read().map_err(Error::EventFdRead)?;
                         // TODO: Future follow-up must resolve lifecycle handling while migrating.
-                        if self.no_shutdown {
-                            self.vm_shutdown().map_err(Error::VmShutdown)?;
-                        } else {
-                            self.vmm_shutdown().map_err(Error::VmmShutdown)?;
-                            break 'outer;
+                        match self.shutdown_action {
+                            GuestShutdownAction::ExitVmm => {
+                                self.vmm_shutdown().map_err(Error::VmmShutdown)?;
+                                break 'outer;
+                            }
+                            GuestShutdownAction::ShutdownVm => {
+                                self.vm_shutdown().map_err(Error::VmShutdown)?;
+                            }
                         }
                     }
                     EpollDispatch::ActivateVirtioDevices => {
@@ -2623,8 +2684,11 @@ impl RequestHandler for Vmm {
                 // Swap each VFIO device's saved path or stale FD for the cdev
                 // FD received with the restore request, and install the fresh
                 // iommufd FD backing them. The one saved in the snapshot is
-                // stale, and validate() has confirmed both accompany vfio_fds.
-                if let Some(restored_vfios) = restore_cfg.vfio_fds {
+                // stale, and validate() has confirmed both accompany a
+                // non-empty vfio_fds.
+                if let Some(restored_vfios) = restore_cfg.vfio_fds
+                    && !restored_vfios.is_empty()
+                {
                     let mut config = vm_config.lock().unwrap();
                     if let Some(vm_device_configs) = config.devices.as_mut() {
                         for v in restored_vfios.iter() {
@@ -2855,6 +2919,8 @@ impl RequestHandler for Vmm {
         self.console_info = None;
         self.serial_socket_listener = None;
         self.console_socket_listener = None;
+        self.serial_tcp_listener = None;
+        self.console_tcp_listener = None;
         self.vm_config = None;
         event!("vm", "deleted");
 
@@ -3566,6 +3632,7 @@ mod tests {
 
     use super::*;
     use crate::config::RestoredVfioConfig;
+    use crate::console_devices::ConsoleDeviceError;
     #[cfg(target_arch = "x86_64")]
     use crate::vm_config::DebugConsoleConfig;
     use crate::vm_config::{
@@ -3585,7 +3652,8 @@ mod tests {
             SeccompAction::Allow,
             hypervisor::new().unwrap(),
             EventFd::new(EFD_NONBLOCK).unwrap(),
-            false,
+            GuestShutdownAction::default(),
+            GuestResetAction::default(),
         )
         .unwrap()
     }
@@ -3648,6 +3716,7 @@ mod tests {
                     file: None,
                     mode: ConsoleOutputMode::Null,
                     socket: None,
+                    tcp: None,
                 },
             },
             console: ConsoleConfig {
@@ -3656,6 +3725,7 @@ mod tests {
                     // Caution: Don't use `Tty` to not mess with users terminal
                     mode: ConsoleOutputMode::Off,
                     socket: None,
+                    tcp: None,
                 },
                 pci_common: PciDeviceCommonConfig::default(),
             },
@@ -3694,6 +3764,21 @@ mod tests {
         assert!(matches!(
             vmm.vm_create(config),
             Err(VmError::VmAlreadyCreated)
+        ));
+    }
+
+    // vm.create sets up the console devices before the config is validated.
+    #[test]
+    fn test_vmm_vm_create_serial_file_without_path() {
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.serial.common.mode = ConsoleOutputMode::File;
+
+        assert!(matches!(
+            vmm.vm_create(config),
+            Err(VmError::CreateConsoleDevices(
+                ConsoleDeviceError::MissingFilePath
+            ))
         ));
     }
 

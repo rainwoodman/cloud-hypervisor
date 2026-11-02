@@ -85,7 +85,7 @@ use devices::{AcpiNotificationFlags, acpi, interrupt_controller, legacy, pvpanic
 use event_monitor::event;
 use hypervisor::IoEventAddress;
 #[cfg(target_arch = "aarch64")]
-use hypervisor::arch::aarch64::regs::AARCH64_PMU_IRQ;
+use hypervisor::arch::aarch64::regs::{AARCH64_GIC_MAINT_IRQ, AARCH64_PMU_IRQ};
 #[cfg(feature = "kvm")]
 use iommufd_ioctls::IommuFd;
 #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
@@ -359,6 +359,10 @@ pub enum DeviceManagerError {
     /// Cannot find a memory range for persistent memory
     #[error("Cannot find a memory range for persistent memory")]
     PmemRangeAllocation,
+
+    /// Cannot find a memory range for shared memory
+    #[error("Cannot find a memory range for shared memory")]
+    ShmemRangeAllocation,
 
     /// Cannot create iommufd
     #[cfg(feature = "kvm")]
@@ -652,6 +656,10 @@ pub enum DeviceManagerError {
     /// Cannot create a RateLimiterGroup
     #[error("Cannot create a RateLimiterGroup")]
     RateLimiterGroupCreate(#[source] group::Error),
+
+    /// The MMIO aperture is too small for all PCI segments
+    #[error("No MMIO aperture left for PCI segment {0}")]
+    PciSegmentMmioAperture(u16),
 
     // Invalid console info
     #[error("Invalid console info")]
@@ -1152,7 +1160,7 @@ fn create_mmio_allocators(
     num_pci_segments: u16,
     weights: &[u32],
     alignment: u64,
-) -> Box<[Arc<Mutex<AddressAllocator>>]> {
+) -> DeviceManagerResult<Box<[Arc<Mutex<AddressAllocator>>]>> {
     let total_weight: u32 = weights.iter().sum();
 
     // Start each PCI segment mmio range on an aligned boundary
@@ -1172,14 +1180,15 @@ fn create_mmio_allocators(
         } else {
             pci_segment_mmio_size * weight
         };
-        let allocator = Arc::new(Mutex::new(
-            AddressAllocator::new(GuestAddress(mmio_start), mmio_size).unwrap(),
-        ));
+        let allocator = AddressAllocator::new(GuestAddress(mmio_start), mmio_size).ok_or(
+            DeviceManagerError::PciSegmentMmioAperture(segment_id as u16),
+        )?;
+        let allocator = Arc::new(Mutex::new(allocator));
         mmio_allocators.push(allocator);
         i += weight;
     }
 
-    mmio_allocators.into_boxed_slice()
+    Ok(mmio_allocators.into_boxed_slice())
 }
 
 fn use_64bit_bar_for_virtio_device(
@@ -1248,7 +1257,7 @@ impl DeviceManager {
             num_pci_segments,
             &mmio32_aperture_weights,
             4 << 10,
-        );
+        )?;
 
         let mut mmio64_aperture_weights: Vec<u32> =
             iter::repeat_n(DEFAULT_PCI_SEGMENT_APERTURE_WEIGHT, num_pci_segments.into()).collect();
@@ -1267,7 +1276,7 @@ impl DeviceManager {
             num_pci_segments,
             &mmio64_aperture_weights,
             4 << 30,
-        );
+        )?;
 
         // Keep BARs off reserved ranges.
         for (base, end) in memory_manager.lock().unwrap().reserved_regions() {
@@ -1821,12 +1830,19 @@ impl DeviceManager {
         &mut self,
         snapshot: Option<&Snapshot>,
     ) -> DeviceManagerResult<Arc<Mutex<dyn InterruptController>>> {
+        let maintenance_irq = self
+            .cpu_manager
+            .lock()
+            .unwrap()
+            .nested()
+            .then_some(AARCH64_GIC_MAINT_IRQ);
         let interrupt_controller: Arc<Mutex<gic::Gic>> = Arc::new(Mutex::new(
             gic::Gic::new(
                 self.config.lock().unwrap().cpus.boot_vcpus,
                 Arc::clone(&self.msi_interrupt_manager)
                     as Arc<dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>>,
                 Arc::clone(&self.address_manager.vm),
+                maintenance_irq,
             )
             .map_err(DeviceManagerError::CreateInterruptController)?,
         ));
@@ -2605,6 +2621,7 @@ impl DeviceManager {
                 self.console.socket = Some(listener);
                 Endpoint::Socket(Arc::new(inner))
             }
+            ConsoleTransport::TcpListen(listener) => Endpoint::TcpListen(listener),
             ConsoleTransport::Null => Endpoint::Null,
             ConsoleTransport::Off => return Ok(None),
         };
@@ -2682,7 +2699,8 @@ impl DeviceManager {
             ConsoleTransport::Off
             | ConsoleTransport::Null
             | ConsoleTransport::Pty(_)
-            | ConsoleTransport::Socket(_) => None,
+            | ConsoleTransport::Socket(_)
+            | ConsoleTransport::TcpListen(_) => None,
         };
 
         if !matches!(console_info.serial, ConsoleTransport::Off) {
@@ -2690,7 +2708,8 @@ impl DeviceManager {
             self.serial_manager = match console_info.serial {
                 ConsoleTransport::Pty(_)
                 | ConsoleTransport::Tty(_)
-                | ConsoleTransport::Socket(_) => {
+                | ConsoleTransport::Socket(_)
+                | ConsoleTransport::TcpListen(_) => {
                     let serial_manager = SerialManager::new(serial, console_info.serial)
                         .map_err(DeviceManagerError::CreateSerialManager)?;
                     if let Some(mut serial_manager) = serial_manager {
@@ -2718,7 +2737,8 @@ impl DeviceManager {
                 ConsoleTransport::Off
                 | ConsoleTransport::Null
                 | ConsoleTransport::Pty(_)
-                | ConsoleTransport::Socket(_) => None,
+                | ConsoleTransport::Socket(_)
+                | ConsoleTransport::TcpListen(_) => None,
             };
             if let Some(writer) = debug_console_writer {
                 let _ = self.add_debug_console_device(writer)?;
@@ -3316,23 +3336,101 @@ impl DeviceManager {
         let mut node = device_node!(id);
 
         if let Some(generic_vhost_user_socket) = generic_vhost_user_cfg.socket.to_str() {
-            let generic_vhost_user_device = Arc::new(Mutex::new(
-                vhost_user::GenericVhostUser::new(
-                    id.clone(),
-                    generic_vhost_user_socket,
-                    generic_vhost_user_cfg.queue_sizes.clone(),
-                    generic_vhost_user_cfg.device_type,
+            let (mut vhost_user_device, shmem_sizes) = vhost_user::GenericVhostUser::new(
+                id.clone(),
+                generic_vhost_user_socket,
+                generic_vhost_user_cfg.queue_sizes.clone(),
+                generic_vhost_user_cfg.device_type,
+                self.seccomp_action.clone(),
+                self.exit_evt
+                    .try_clone()
+                    .map_err(DeviceManagerError::EventFd)?,
+                self.force_access_platform,
+                state_from_id(snapshot, id.as_str())
+                    .map_err(DeviceManagerError::RestoreGetState)?,
+            )
+            .map_err(DeviceManagerError::CreateGenericVhostUser)?;
+
+            let total_size: u64 = shmem_sizes.iter().sum();
+            if total_size > 0 {
+                let bar_size = total_size.next_power_of_two();
+                let restored_addr = if let Some(existing_node) =
+                    self.device_tree.lock().unwrap().get(&id)
+                {
+                    let addr = existing_node
+                        .resources
+                        .iter()
+                        .find_map(|resource| match resource {
+                            Resource::MmioAddressRange { base, size } if *size == bar_size => {
+                                Some(GuestAddress(*base))
+                            }
+                            _ => None,
+                        });
+                    if addr.is_none() {
+                        return Err(DeviceManagerError::ShmemRangeAllocation);
+                    }
+                    addr
+                } else {
+                    None
+                };
+                let addr = self.pci_segments
+                    [generic_vhost_user_cfg.pci_common.pci_segment as usize]
+                    .mem64_allocator
+                    .lock()
+                    .unwrap()
+                    .allocate(restored_addr, bar_size, Some(bar_size))
+                    .ok_or(DeviceManagerError::ShmemRangeAllocation)?;
+
+                // Update the node with correct resource information.
+                node.resources.push(Resource::MmioAddressRange {
+                    base: addr.raw_value(),
+                    size: bar_size,
+                });
+
+                let mmap_region = MmapRegion::build(
                     None,
-                    self.seccomp_action.clone(),
-                    self.exit_evt
-                        .try_clone()
-                        .map_err(DeviceManagerError::EventFd)?,
-                    self.force_access_platform,
-                    state_from_id(snapshot, id.as_str())
-                        .map_err(DeviceManagerError::RestoreGetState)?,
+                    bar_size as usize,
+                    libc::PROT_NONE,
+                    libc::MAP_ANONYMOUS | libc::MAP_PRIVATE,
                 )
-                .map_err(DeviceManagerError::CreateGenericVhostUser)?,
-            ));
+                .map_err(DeviceManagerError::NewMmapRegion)?;
+                // SAFETY: `mmap_region.size()` and `mmap_region.as_ptr()` refer to a valid
+                // anonymous mapping owned by `VirtioSharedMemoryList` until device teardown.
+                let mem_slot = unsafe {
+                    self.memory_manager
+                        .lock()
+                        .unwrap()
+                        .create_userspace_mapping(
+                            addr.raw_value(),
+                            bar_size as usize,
+                            mmap_region.as_ptr(),
+                            false,
+                            false,
+                            false,
+                            hypervisor::MemoryVisibility::Shared,
+                        )
+                        .map_err(DeviceManagerError::MemoryManager)?
+                };
+                let mut offset = 0u64;
+                let region_list = shmem_sizes
+                    .into_iter()
+                    .map(|len| {
+                        let region = virtio_devices::VirtioSharedMemory { offset, len };
+                        offset += len;
+                        region
+                    })
+                    .collect();
+                let shm_list = virtio_devices::VirtioSharedMemoryList {
+                    mem_slot,
+                    addr,
+                    mapping: Arc::new(mmap_region),
+                    region_list,
+                };
+                virtio_devices::VirtioDevice::set_shm_regions(&mut vhost_user_device, shm_list)
+                    .unwrap();
+            }
+
+            let generic_vhost_user_device = Arc::new(Mutex::new(vhost_user_device));
 
             // Update the device tree with the migratable device.
             node.migratable =
@@ -6785,12 +6883,6 @@ impl Drop for DeviceManager {
             }
         }
 
-        // Wake up the DeviceManager threads (mainly virtio device workers),
-        // to avoid deadlock on waiting for paused/parked worker threads.
-        if let Err(e) = self.resume() {
-            error!("Error resuming DeviceManager: {e:?}");
-        }
-
         for handle in self.virtio_devices.drain(..) {
             handle.virtio_device.lock().unwrap().shutdown();
         }
@@ -6884,7 +6976,7 @@ mod tests {
 
     #[test]
     fn test_create_mmio_allocators() {
-        let res = create_mmio_allocators(0x100000, 0x3fffff, 1, &[1], 4 << 10);
+        let res = create_mmio_allocators(0x100000, 0x3fffff, 1, &[1], 4 << 10).unwrap();
         assert_eq!(res.len(), 1);
         assert_eq!(
             res[0].lock().unwrap().base(),
@@ -6895,7 +6987,7 @@ mod tests {
             vm_memory::GuestAddress(0x3fffff)
         );
 
-        let res = create_mmio_allocators(0x100000, 0x3fffff, 2, &[1, 1], 4 << 10);
+        let res = create_mmio_allocators(0x100000, 0x3fffff, 2, &[1, 1], 4 << 10).unwrap();
         assert_eq!(res.len(), 2);
         assert_eq!(
             res[0].lock().unwrap().base(),
@@ -6914,7 +7006,7 @@ mod tests {
             vm_memory::GuestAddress(0x3fffff)
         );
 
-        let res = create_mmio_allocators(0x100000, 0x3fffff, 2, &[2, 1], 4 << 10);
+        let res = create_mmio_allocators(0x100000, 0x3fffff, 2, &[2, 1], 4 << 10).unwrap();
         assert_eq!(res.len(), 2);
         assert_eq!(
             res[0].lock().unwrap().base(),
@@ -6932,5 +7024,11 @@ mod tests {
             res[1].lock().unwrap().end(),
             vm_memory::GuestAddress(0x3fffff)
         );
+
+        // The 3 MiB aperture rounds down to 0 for each of 1024 segments.
+        assert!(matches!(
+            create_mmio_allocators(0x100000, 0x3fffff, 1024, &[1; 1024], 4 << 10),
+            Err(DeviceManagerError::PciSegmentMmioAperture(0))
+        ));
     }
 }

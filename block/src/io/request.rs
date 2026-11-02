@@ -19,7 +19,7 @@ use log::{error, warn};
 use smallvec::SmallVec;
 use virtio_bindings::virtio_blk::{
     VIRTIO_BLK_T_DISCARD, VIRTIO_BLK_T_WRITE_ZEROES, VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP,
-    virtio_blk_discard_write_zeroes,
+    virtio_blk_discard_write_zeroes, virtio_blk_outhdr,
 };
 use virtio_queue::DescriptorChain;
 use vm_memory::bitmap::Bitmap;
@@ -96,6 +96,10 @@ impl Request {
         // The head contains the request type which MUST be readable.
         if hdr_desc.is_write_only() {
             return Err(Error::UnexpectedWriteOnlyDescriptor);
+        }
+
+        if (hdr_desc.len() as usize) < size_of::<virtio_blk_outhdr>() {
+            return Err(Error::DescriptorLengthTooSmall);
         }
 
         let hdr_desc_addr = hdr_desc.addr();
@@ -627,9 +631,6 @@ impl Request {
                 .checked_add(u64::from(*data_len))
                 .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
         }
-        if total_bytes == 0 {
-            return Ok(());
-        }
         if !total_bytes.is_multiple_of(SECTOR_SIZE) {
             return Err(ExecuteError::BadRequest(Error::InvalidDataLength));
         }
@@ -830,5 +831,73 @@ mod tests {
         assert!(bitmap.dirty_at(0x1000));
         assert!(bitmap.dirty_at(0x4000));
         assert!(!bitmap.dirty_at(0x5000));
+    }
+
+    // A request without data still has to start within the disk.
+    #[test]
+    fn zero_length_request_past_capacity_is_rejected() {
+        for request_type in [RequestType::In, RequestType::Out] {
+            for (sector, valid) in [(1024, true), (1025, false), (1 << 54, false)] {
+                let request = Request {
+                    request_type,
+                    sector,
+                    data_descriptors: SmallVec::from_slice(&[(GuestAddress(0), 0)]),
+                    status_addr: GuestAddress(0),
+                    writeback: true,
+                    start: Instant::now(),
+                };
+                let result = request.check_data_bounds(1024);
+                if valid {
+                    result.expect("an empty request at capacity should be accepted");
+                } else {
+                    assert!(
+                        matches!(result, Err(ExecuteError::BadRequest(Error::InvalidOffset))),
+                        "empty request at sector {sector} was accepted"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_header_descriptor_is_rejected() {
+        use virtio_bindings::virtio_blk::VIRTIO_BLK_T_IN;
+        use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+        use virtio_queue::QueueT;
+        use vm_memory::bitmap::AtomicBitmap;
+        use vm_memory::{GuestAddressSpace, GuestMemoryAtomic};
+        use vm_virtio::queue::testing::VirtQueue as GuestQ;
+
+        let mem =
+            GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        mem.write_obj(VIRTIO_BLK_T_IN, GuestAddress(0x2000))
+            .unwrap();
+        let mem_atomic = GuestMemoryAtomic::new(mem.clone());
+
+        for (hdr_len, valid) in [(0, false), (8, false), (15, false), (16, true)] {
+            let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+            vq.dtable[0].set(0x2000, hdr_len, VRING_DESC_F_NEXT as u16, 1);
+            vq.dtable[1].set(
+                0x3000,
+                512,
+                (VRING_DESC_F_NEXT | VRING_DESC_F_WRITE) as u16,
+                2,
+            );
+            vq.dtable[2].set(0x4000, 1, VRING_DESC_F_WRITE as u16, 0);
+            vq.avail.ring[0].set(0);
+            vq.avail.idx.set(1);
+
+            let mut queue = vq.create_queue();
+            let mut chain = queue.pop_descriptor_chain(mem_atomic.memory()).unwrap();
+            let result = Request::parse(&mut chain, None);
+            if valid {
+                assert_eq!(result.unwrap().request_type(), RequestType::In);
+            } else {
+                assert!(
+                    matches!(result, Err(Error::DescriptorLengthTooSmall)),
+                    "header of {hdr_len} bytes was accepted"
+                );
+            }
+        }
     }
 }

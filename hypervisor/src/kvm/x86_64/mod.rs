@@ -8,12 +8,14 @@
 //
 //
 
+#[cfg(feature = "sev_snp")]
+use kvm_bindings::KVM_MEMORY_ATTRIBUTE_PRIVATE;
 use kvm_bindings::nested::KvmNestedStateBuffer;
+#[cfg(feature = "sev_snp")]
+use kvm_ioctls::VmFd;
 use serde::{Deserialize, Serialize};
 use vmm_sys_util::fam;
-///
 /// Export generically-named wrappers of kvm-bindings for Unix-based platforms
-///
 pub use {
     kvm_bindings::CpuId, kvm_bindings::KVM_CPUID_FLAG_SIGNIFCANT_INDEX, kvm_bindings::MsrList,
     kvm_bindings::Msrs as MsrEntries, kvm_bindings::Xsave as xsave2,
@@ -33,37 +35,52 @@ use crate::kvm::{Cap, Kvm, KvmError, KvmResult};
 #[cfg(feature = "sev_snp")]
 pub(crate) mod sev;
 
-///
-/// Check KVM extension for Linux
-///
-pub fn check_required_kvm_extensions(kvm: &Kvm) -> KvmResult<()> {
-    macro_rules! check_extension {
-        ($cap:expr) => {
-            if !kvm.check_extension($cap) {
-                return Err(KvmError::CapabilityMissing($cap));
-            }
-        };
-    }
+macro_rules! check_extension {
+    ($kvm:expr, $cap:expr) => {
+        if !$kvm.check_extension($cap) {
+            return Err(KvmError::CapabilityMissing($cap));
+        }
+    };
+}
 
+/// Check KVM extension for Linux
+pub fn check_required_kvm_extensions(kvm: &Kvm) -> KvmResult<()> {
     // DeviceCtrl, EnableCap, and SetGuestDebug are also required, but some kernels have
     // the features implemented without the capability flags.
-    check_extension!(Cap::AdjustClock);
-    check_extension!(Cap::ExtCpuid);
-    check_extension!(Cap::GetTscKhz);
-    check_extension!(Cap::ImmediateExit);
-    check_extension!(Cap::Ioeventfd);
-    check_extension!(Cap::Irqchip);
-    check_extension!(Cap::Irqfd);
-    check_extension!(Cap::IrqRouting);
-    check_extension!(Cap::MpState);
-    check_extension!(Cap::SetIdentityMapAddr);
-    check_extension!(Cap::SetTssAddr);
-    check_extension!(Cap::SplitIrqchip);
-    check_extension!(Cap::TscDeadlineTimer);
-    check_extension!(Cap::UserMemory);
-    check_extension!(Cap::UserNmi);
-    check_extension!(Cap::VcpuEvents);
-    check_extension!(Cap::Xsave2);
+    check_extension!(kvm, Cap::AdjustClock);
+    check_extension!(kvm, Cap::ExtCpuid);
+    check_extension!(kvm, Cap::GetTscKhz);
+    check_extension!(kvm, Cap::ImmediateExit);
+    check_extension!(kvm, Cap::Ioeventfd);
+    check_extension!(kvm, Cap::Irqchip);
+    check_extension!(kvm, Cap::Irqfd);
+    check_extension!(kvm, Cap::IrqRouting);
+    check_extension!(kvm, Cap::MpState);
+    check_extension!(kvm, Cap::SetIdentityMapAddr);
+    check_extension!(kvm, Cap::SetTssAddr);
+    check_extension!(kvm, Cap::SplitIrqchip);
+    check_extension!(kvm, Cap::TscDeadlineTimer);
+    check_extension!(kvm, Cap::UserMemory);
+    check_extension!(kvm, Cap::UserNmi);
+    check_extension!(kvm, Cap::VcpuEvents);
+    check_extension!(kvm, Cap::Xsave2);
+    Ok(())
+}
+
+#[cfg(feature = "sev_snp")]
+/// Check KVM extensions required for SEV-SNP.
+pub fn check_required_sev_snp_extensions(vm: &VmFd) -> KvmResult<()> {
+    check_extension!(vm, Cap::GuestMemfd);
+    // MEMORY_ATTRIBUTES is a bit mask and requires special handling.
+    let check_result = vm.check_extension_int(Cap::MemoryAttributes);
+    if check_result <= 0 {
+        return Err(KvmError::CapabilityMissing(Cap::MemoryAttributes));
+    }
+    let memory_attributes = check_result as u32;
+    if memory_attributes & KVM_MEMORY_ATTRIBUTE_PRIVATE == 0 {
+        return Err(KvmError::MemoryAttributePrivateMissing(memory_attributes));
+    }
+    check_extension!(vm, Cap::UserMemory2);
     Ok(())
 }
 

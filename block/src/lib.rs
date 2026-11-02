@@ -22,6 +22,7 @@ mod sparse;
 pub(crate) mod test_util;
 use std::fmt::{self, Debug};
 use std::fs::{File, OpenOptions};
+use std::io::{Seek, SeekFrom};
 use std::os::linux::fs::MetadataExt;
 use std::os::unix::fs::{FileExt, FileTypeExt};
 use std::os::unix::io::{AsRawFd, RawFd};
@@ -33,9 +34,7 @@ pub use aligned_file::AlignedFile;
 use formats::qcow;
 #[cfg(feature = "io_uring")]
 use io_uring::{IoUring, Probe, opcode};
-use libc::{
-    FALLOC_FL_KEEP_SIZE, FALLOC_FL_PUNCH_HOLE, FALLOC_FL_ZERO_RANGE, S_IFBLK, S_IFMT, ioctl,
-};
+use libc::ioctl;
 use log::{debug, info, warn};
 pub use request::{ExecuteAsync, MAX_DISCARD_WRITE_ZEROES_SEG, Request, RequestType};
 use serde::{Deserialize, Serialize};
@@ -44,6 +43,7 @@ use thiserror::Error;
 use virtio_bindings::virtio_blk::*;
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryBackend, GuestMemoryError};
+use vmm_sys_util::fallocate::{FallocateMode, fallocate};
 use vmm_sys_util::{aio, ioctl_io_nr, ioctl_ior_nr};
 
 use crate::async_io::AsyncIoError;
@@ -302,18 +302,14 @@ pub fn block_io_uring_is_supported() -> bool {
     }
 }
 
-/// Returns `true` iff `fd` refers to a block device.
+/// Returns `true` iff `file` refers to a block device.
 ///
-/// Returns `false` if the `fstat()` probe itself fails. Callers that need to
+/// Returns `false` if the metadata probe itself fails. Callers that need to
 /// distinguish "not a block device" from "couldn't tell" should fall back to
 /// regular-file behaviour, which is what every current caller already does.
-pub(crate) fn is_block_device(fd: RawFd) -> bool {
-    // SAFETY: `libc::stat` is POD; zero-initialization is a valid bit pattern
-    // and `fstat` overwrites every field it cares about on success.
-    let mut stat: libc::stat = unsafe { mem::zeroed() };
-    // SAFETY: FFI call with a valid fd and a valid out-pointer.
-    let ret = unsafe { libc::fstat(fd, &mut stat) };
-    ret == 0 && stat.st_mode & S_IFMT == S_IFBLK
+pub(crate) fn is_block_device(file: &File) -> bool {
+    file.metadata()
+        .is_ok_and(|metadata| metadata.file_type().is_block_device())
 }
 
 /// Returns the kernel reported direct I/O alignment for `fd`, or `None`
@@ -377,52 +373,44 @@ pub(crate) fn probe_direct_alignment(fd: RawFd) -> Option<u64> {
 pub fn probe_sparse_support(file: &File) -> bool {
     let fd = file.as_raw_fd();
 
-    if is_block_device(fd) {
+    if is_block_device(file) {
         probe_block_device_sparse_support(fd)
     } else {
-        probe_file_sparse_support(fd)
+        probe_file_sparse_support(file)
     }
 }
 
 /// Probe sparse support for a regular file using fallocate().
-fn probe_file_sparse_support(fd: libc::c_int) -> bool {
-    // SAFETY: FFI call with valid fd
-    let file_size = unsafe { libc::lseek(fd, 0, libc::SEEK_END) };
-    if file_size < 0 {
-        let err = io::Error::last_os_error();
-        warn!("Failed to get file size for sparse probe: {err}");
-        return false;
-    }
+fn probe_file_sparse_support(mut file: &File) -> bool {
+    let file_size = match file.seek(SeekFrom::End(0)) {
+        Ok(size) => size,
+        Err(err) => {
+            warn!("Failed to get file size for sparse probe: {err}");
+            return false;
+        }
+    };
 
-    // SAFETY: FFI call with valid fd, probing past EOF is safe with KEEP_SIZE
-    let punch_hole =
-        unsafe { libc::fallocate(fd, FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE, file_size, 1) }
-            == 0;
-
-    if !punch_hole {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EOPNOTSUPP) {
+    let punch_hole = fallocate(file, FallocateMode::PunchHole, true, file_size, 1);
+    if let Err(err) = &punch_hole {
+        if err.errno() == libc::EOPNOTSUPP {
             debug!("File does not support FALLOC_FL_PUNCH_HOLE: {err}");
         } else {
             debug!("PUNCH_HOLE probe returned unexpected error: {err}");
         }
     }
 
-    // SAFETY: FFI call with valid fd, probing past EOF is safe with KEEP_SIZE
-    let zero_range =
-        unsafe { libc::fallocate(fd, FALLOC_FL_ZERO_RANGE | FALLOC_FL_KEEP_SIZE, file_size, 1) }
-            == 0;
-
-    if !zero_range {
-        let err = io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::EOPNOTSUPP) {
-            debug!("File does not support FALLOC_FL_ZERO_RANGE: {err}");
-        }
+    let zero_range = fallocate(file, FallocateMode::ZeroRange, true, file_size, 1);
+    if let Err(err) = &zero_range
+        && err.errno() == libc::EOPNOTSUPP
+    {
+        debug!("File does not support FALLOC_FL_ZERO_RANGE: {err}");
     }
 
-    let supported = punch_hole || zero_range;
+    let supported = punch_hole.is_ok() || zero_range.is_ok();
     info!(
-        "Probed file sparse support: punch_hole={punch_hole}, zero_range={zero_range} => {supported}"
+        "Probed file sparse support: punch_hole={}, zero_range={} => {supported}",
+        punch_hole.is_ok(),
+        zero_range.is_ok()
     );
     supported
 }
@@ -641,6 +629,7 @@ impl DiskTopology {
     /// Overrides the logical block size advertised to the guest with `block_size`.
     /// The physical block size and minimum I/O size are raised to `block_size`
     /// when smaller, since neither can be below one logical block.
+    #[must_use]
     pub fn with_block_size(self, block_size: u64) -> Self {
         Self {
             logical_block_size: block_size,
@@ -674,7 +663,7 @@ impl DiskTopology {
     }
 
     pub fn probe(f: &File) -> io::Result<Self> {
-        let topology = if is_block_device(f.as_raw_fd()) {
+        let topology = if is_block_device(f) {
             DiskTopology {
                 logical_block_size: Self::query_block_size(f, BlockSize::LogicalBlock)?,
                 physical_block_size: Self::query_block_size(f, BlockSize::PhysicalBlock)?,
@@ -697,15 +686,16 @@ impl DiskTopology {
 
 #[cfg(test)]
 mod tests {
-    use std::alloc::{Layout, alloc_zeroed, dealloc};
+    use std::alloc::Layout;
     use std::fs::OpenOptions;
     use std::io::Write;
+    use std::mem;
     use std::os::unix::fs::OpenOptionsExt;
-    use std::{mem, ptr, slice};
 
     use vmm_sys_util::tempfile::TempFile;
 
     use super::*;
+    use crate::async_io::OwnedIoBuffer;
 
     #[test]
     fn with_block_size_raises_physical_and_min_io() {
@@ -843,43 +833,20 @@ mod tests {
         let topo = DiskTopology::probe(&f).unwrap();
         let alignment = topo.logical_block_size as usize;
 
-        let layout = Layout::from_size_align(alignment, alignment).unwrap();
-        // SAFETY: layout is valid (non-zero, power-of-two alignment).
-        let buf = unsafe { alloc_zeroed(layout) };
-        assert!(!buf.is_null());
+        let mut buf = OwnedIoBuffer::new(alignment, alignment).unwrap();
+        buf.as_mut_slice().fill(0xAB);
 
-        // SAFETY: buf is valid for `alignment` bytes.
-        unsafe { ptr::write_bytes(buf, 0xAB, alignment) };
+        let written = f.write_at(buf.as_slice(), 0).unwrap();
+        assert_eq!(written, alignment);
 
-        // SAFETY: buf is aligned and sized for O_DIRECT; fd is valid.
-        let written = unsafe { libc::pwrite(f.as_raw_fd(), buf.cast(), alignment, 0) };
-        assert_eq!(
-            written as usize,
-            alignment,
-            "O_DIRECT pwrite failed: {}",
-            io::Error::last_os_error()
-        );
+        buf.as_mut_slice().fill(0);
+        let read = f.read_at(buf.as_mut_slice(), 0).unwrap();
+        assert_eq!(read, alignment);
 
-        // SAFETY: buf is valid for `alignment` bytes.
-        unsafe { ptr::write_bytes(buf, 0x00, alignment) };
-        // SAFETY: buf is aligned and sized for O_DIRECT; fd is valid.
-        let read = unsafe { libc::pread(f.as_raw_fd(), buf.cast(), alignment, 0) };
-        assert_eq!(
-            read as usize,
-            alignment,
-            "O_DIRECT pread failed: {}",
-            io::Error::last_os_error()
-        );
-
-        // SAFETY: buf is valid for `alignment` bytes after successful pread.
-        let slice = unsafe { slice::from_raw_parts(buf, alignment) };
         assert!(
-            slice.iter().all(|&b| b == 0xAB),
+            buf.as_slice().iter().all(|&b| b == 0xAB),
             "Data mismatch after O_DIRECT roundtrip"
         );
-
-        // SAFETY: buf was allocated with this layout via alloc_zeroed.
-        unsafe { dealloc(buf, layout) };
     }
 
     #[test]
