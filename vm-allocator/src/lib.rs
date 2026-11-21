@@ -26,3 +26,5 @@ mod memory_slot;
 pub use memory_slot::MemorySlotAllocator;
 mod guest_memory;
 pub use guest_memory::{Error as GuestRegionError, GuestMemory, GuestRegion};
+mod range_map;
+pub use range_map::{RangeMap, RangeMapError};
