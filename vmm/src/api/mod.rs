@@ -36,6 +36,7 @@ pub mod http;
 use std::collections::HashSet;
 use std::io;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::os::fd::RawFd;
 use std::path::PathBuf;
 use std::str::FromStr;
 use std::sync::mpsc::{RecvError, SendError, Sender, channel};
@@ -55,16 +56,18 @@ pub use self::dbus::start_dbus_thread;
 pub use self::http::{start_http_fd_thread, start_http_path_thread};
 use crate::Error as VmmError;
 use crate::config::{
-    RestoreConfig, RestoredVfioConfig, VmMemoryZoneUpdateData, deserialize_restored_fd,
+    Error as ConfigError, RestoreConfig, RestoredVfioConfig, Result as ConfigResult,
+    VmMemoryZoneUpdateData, take_inherited_fd, validate_inherited_fds,
 };
 use crate::device_tree::DeviceTree;
+use crate::external_fds::{ExternalFds, Target};
 use crate::migration::transport::{
     MAX_MIGRATION_CONNECTIONS, TcpAddressParseError, tcp_address_to_server_name,
 };
 use crate::vm::{Error as VmError, VmState};
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
-    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    ConsoleOutput, DeviceConfig, DiskConfig, ExternalFd, FsConfig, GenericVhostUserConfig,
+    NetConfig, PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 
 /// API errors are sent back from the VMM API server through the ApiResponse.
@@ -323,17 +326,27 @@ pub struct VmReceiveMigrationData {
     pub tls_dir: Option<PathBuf>,
     /// Optional VFIO device id to cdev FD pairs, used to substitute each
     /// device's saved path or stale FD in the received VmConfig.
+    /// Deprecated: use `external_fds` with VFIO targets instead.
     #[serde(default)]
     pub vfio_fds: Option<Vec<RestoredVfioConfig>>,
-    // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
-    #[serde(default, deserialize_with = "deserialize_restored_fd")]
-    pub iommufd_fd: Option<i32>,
+    /// Deprecated: use `external_fds` with an IOMMU target instead.
+    // Deserialized FDs are discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iommufd_fd: ExternalFd,
     /// Optional memory zone update data
     #[serde(default)]
     pub zone_updates: Vec<VmMemoryZoneUpdateData>,
     /// Enable the background thread for faulting all remaining pages.
     #[serde(default = "default_receive_migration_background_fetch_pages")]
     pub background_fetch_pages: bool,
+    /// New output of the serial console, in the mode of the source VM.
+    #[serde(default)]
+    pub serial: Option<ConsoleOutput>,
+    /// New output of the virtio console, in the mode of the source VM.
+    #[serde(default)]
+    pub console: Option<ConsoleOutput>,
+    #[serde(default, flatten)]
+    pub(crate) external_fds: ExternalFds,
 }
 
 fn default_receive_migration_background_fetch_pages() -> bool {
@@ -342,6 +355,11 @@ fn default_receive_migration_background_fetch_pages() -> bool {
 
 #[derive(Debug, Error)]
 pub enum VmReceiveMigrationConfigError {
+    // TODO(fd): Remove after the deprecation period for the legacy FD fields.
+    #[error("Cannot combine external_fds with legacy FD fields")]
+    MixedFdFormats,
+    #[error("Invalid inherited file descriptor")]
+    InheritedFd(#[from] ConfigError),
     /// Parsing of `VmReceiveMigrationData` failed
     #[error("Error parsing receive migration parameters")]
     ParseError(#[source] OptionParserError),
@@ -359,39 +377,33 @@ pub enum VmReceiveMigrationConfigError {
     /// The TLS configuration is invalid.
     #[error("Invalid TLS configuration for receive-migration")]
     InvalidTlsConfiguration(#[source] TlsConfigError),
-    /// Every VFIO device needs a replacement in vfio_fds and none was found for the respective
-    /// device
-    #[error(
-        "VFIO device '{0}' has no replacement in vfio_fds, its source path or fd is not usable on the destination"
-    )]
-    VfioDeviceNoReplacementFd(String),
-    /// The `vfio_fds` option was used without supplying `iommufd_fd`
-    #[error("Usage of `vfio_fds` requires `iommufd_fd` to be specified")]
-    VfioFdRequiresIommufdFd,
-    /// `iommufd_fd` was provided without also enabling the iommufd backend.
-    #[error("Platform `iommufd_fd=<fd>` requires `iommufd=on`")]
-    IommufdFdRequiresIommufd,
-    /// Identified duplicate fd replacements for the FD with the given ID.
-    #[error("Multiple replacements defined for fd with ID {0}")]
-    VfioFdMultipleReplacements(String),
-    /// Identified a fd replacements for a FD not present in the VmConfig.
-    #[error("Replacement ID {0} in vfio_fds id does not match any device in the received VmConfig")]
-    VfioFdReplacementWithoutTarget(String),
     /// Multiple updates for the same memory zone were defined.
     #[error("More than one update was defined for at least one memory zone")]
     MultipleMemoryZoneUpdates,
     /// An update with an empty memory zone ID was specified.
     #[error("One or more memory zone updates contained an empty ID")]
     MemoryZoneUpdatesEmptyId,
+    /// A new console output is invalid.
+    #[error("Invalid console output for receive-migration")]
+    InvalidConsoleOutput(#[source] ConfigError),
 }
 
 impl VmReceiveMigrationData {
     pub const SYNTAX: &'static str = "VM receive migration parameters \
         \"<receiver_url>\" or \"receiver_url=<url>[,tls_dir=<path>]\
-        [,vfio_fds=<list_of_vfio_ids_with_their_associated_fd>][,iommufd_fd=<fd>]\
-        [,zone_updates=[<id@host_numa_node>]][,background_fetch_pages=on|off]\"";
+        [,external_fds=[net(<id>)@[<fd>,...],vfio(<id>)@[<fd>],iommu@[<fd>]]]\
+        [,zone_updates=[<id@host_numa_node>]][,background_fetch_pages=on|off]\
+        [,serial_file=<path>|serial_socket=<path>|serial_tcp=<ip>:<port>]\
+        [,console_file=<path>|console_socket=<path>|console_tcp=<ip>:<port>]\"\
+        \n`vfio_fds=<list_of_vfio_ids_with_their_associated_fd>` and \
+        `iommufd_fd=<fd>` are deprecated; use `external_fds` instead. \
+        Do not combine the two formats.";
 
-    pub fn parse(migration: &str) -> Result<Self, VmReceiveMigrationConfigError> {
+    /// # Safety
+    /// Live FDs named in the input must be exclusively owned by the caller.
+    /// Referenced descriptors may be consumed even if parsing fails.
+    pub unsafe fn parse(migration: &str) -> Result<Self, VmReceiveMigrationConfigError> {
+        validate_inherited_fds([migration])?;
         let mut parser = OptionParser::new();
         parser
             .add("receiver_url")
@@ -399,10 +411,18 @@ impl VmReceiveMigrationData {
             .add("vfio_fds")
             .add("iommufd_fd")
             .add("zone_updates")
-            .add("background_fetch_pages");
+            .add("background_fetch_pages")
+            .add_all(ConsoleOutput::UPDATE_OPTIONS)
+            .add("external_fds");
         parser
             .parse(migration)
             .map_err(VmReceiveMigrationConfigError::ParseError)?;
+
+        for field in ["vfio_fds", "iommufd_fd"] {
+            if parser.get(field).is_some() {
+                warn!("The '{field}' option is deprecated; use 'external_fds' instead");
+            }
+        }
 
         let receiver_url = parser.get("receiver_url").ok_or_else(|| {
             VmReceiveMigrationConfigError::ParseError(OptionParserError::InvalidSyntax(
@@ -413,38 +433,62 @@ impl VmReceiveMigrationData {
             .convert::<String>("tls_dir")
             .map_err(VmReceiveMigrationConfigError::ParseError)?
             .map(|path| PathBuf::from(&path));
-        let vfio_fds = parser
+        let mut vfio_fds = parser
             .convert::<TupleList<String, u64>>("vfio_fds")
             .map_err(VmReceiveMigrationConfigError::ParseError)?
             .map(|v| {
-                v.0.iter()
-                    .map(|Tuple(id, fd)| RestoredVfioConfig {
-                        id: id.clone(),
-                        fd: Some(*fd as i32),
+                v.0.into_iter()
+                    .map(|Tuple(id, fd)| {
+                        Ok(RestoredVfioConfig {
+                            id,
+                            // SAFETY: The caller transfers the inherited descriptor.
+                            fd: unsafe { take_inherited_fd(fd) }?,
+                        })
                     })
-                    .collect()
-            });
-        let iommufd_fd = parser
-            .convert::<i32>("iommufd_fd")
-            .map_err(VmReceiveMigrationConfigError::ParseError)?;
+                    .collect::<ConfigResult<Vec<_>>>()
+            })
+            .transpose()?;
+        let mut iommufd_fd = parser
+            .convert::<RawFd>("iommufd_fd")
+            .map_err(VmReceiveMigrationConfigError::ParseError)?
+            // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
+            .map(|fd| unsafe { take_inherited_fd(fd) })
+            .transpose()?
+            .unwrap_or_default();
 
         let zone_updates: Vec<VmMemoryZoneUpdateData> = parser
             .convert::<TupleList<String, u32>>("zone_updates")
             .map_err(VmReceiveMigrationConfigError::ParseError)?
             .map_or(Vec::new(), |v| {
-                v.0.iter()
-                    .map(|Tuple(id, host_numa_node)| VmMemoryZoneUpdateData {
-                        id: id.clone(),
-                        host_numa_node: *host_numa_node,
-                    })
+                v.0.into_iter()
+                    .map(|Tuple(id, host_numa_node)| VmMemoryZoneUpdateData { id, host_numa_node })
                     .collect()
             });
+        let mut external_fds: ExternalFds = parser
+            .convert::<TupleList<Target, Vec<u64>>>("external_fds")
+            .map_err(VmReceiveMigrationConfigError::ParseError)?
+            .map(|v| {
+                // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
+                unsafe { ExternalFds::from_cli(v) }
+            })
+            .transpose()?
+            .unwrap_or_default();
+        // TODO(fd): Remove after `vfio_fds` and `iommufd_fd` are deprecated and removed.
+        if !external_fds.is_empty() && (vfio_fds.is_some() || iommufd_fd.is_some()) {
+            return Err(VmReceiveMigrationConfigError::MixedFdFormats);
+        }
+        external_fds.import_restored_iommufd_fd(&mut iommufd_fd, false);
+        external_fds.import_restored_vfio_configs(&mut vfio_fds);
 
         let background_fetch_pages = parser
             .convert::<Toggle>("background_fetch_pages")
             .map_err(VmReceiveMigrationConfigError::ParseError)?
             .unwrap_or(Toggle(true))
             .0;
+        let serial = ConsoleOutput::parse_update(&parser, "serial")
+            .map_err(VmReceiveMigrationConfigError::InvalidConsoleOutput)?;
+        let console = ConsoleOutput::parse_update(&parser, "console")
+            .map_err(VmReceiveMigrationConfigError::InvalidConsoleOutput)?;
 
         let data = Self {
             receiver_url,
@@ -453,6 +497,9 @@ impl VmReceiveMigrationData {
             iommufd_fd,
             zone_updates,
             background_fetch_pages,
+            serial,
+            console,
+            external_fds,
         };
 
         data.validate()?;
@@ -491,68 +538,6 @@ impl VmReceiveMigrationData {
         }
         if unique_zones.contains("") {
             return Err(VmReceiveMigrationConfigError::MemoryZoneUpdatesEmptyId);
-        }
-
-        Ok(())
-    }
-
-    pub fn validate_vfio_fds(
-        &self,
-        vm_config: &VmConfig,
-    ) -> Result<(), VmReceiveMigrationConfigError> {
-        let vfio_fds = self.vfio_fds.as_deref().unwrap_or_default();
-
-        // A migrated VFIO device cannot reuse its source handle. Its fd is
-        // invalid across the migration and its path names the source host's
-        // topology, so every device needs a replacement in vfio_fds. This
-        // holds even when no vfio_fds are supplied at all.
-        let substituted: HashSet<&str> = vfio_fds.iter().map(|v| v.id.as_str()).collect();
-        for d in vm_config.devices.iter().flatten() {
-            if !d
-                .pci_common
-                .id
-                .as_deref()
-                .is_some_and(|id| substituted.contains(id))
-            {
-                return Err(VmReceiveMigrationConfigError::VfioDeviceNoReplacementFd(
-                    d.pci_common.id.as_deref().unwrap_or_default().to_owned(),
-                ));
-            }
-        }
-
-        if vfio_fds.is_empty() {
-            return Ok(());
-        }
-
-        // The supplied vfio_fds must be usable against the received VmConfig.
-        if self.iommufd_fd.is_none() {
-            return Err(VmReceiveMigrationConfigError::VfioFdRequiresIommufdFd);
-        }
-        if !vm_config.platform.as_ref().is_some_and(|p| p.iommufd) {
-            return Err(VmReceiveMigrationConfigError::IommufdFdRequiresIommufd);
-        }
-
-        let mut seen = HashSet::new();
-        for v in vfio_fds {
-            if !seen.insert(v.id.as_str()) {
-                return Err(VmReceiveMigrationConfigError::VfioFdMultipleReplacements(
-                    v.id.to_owned(),
-                ));
-            }
-        }
-
-        let known_ids: HashSet<&str> = vm_config
-            .devices
-            .iter()
-            .flatten()
-            .filter_map(|d| d.pci_common.id.as_deref())
-            .collect();
-        for v in vfio_fds {
-            if !known_ids.contains(v.id.as_str()) {
-                return Err(
-                    VmReceiveMigrationConfigError::VfioFdReplacementWithoutTarget(v.id.to_owned()),
-                );
-            }
         }
 
         Ok(())
@@ -648,7 +633,7 @@ impl VmSendMigrationData {
         downtime_ms=<milliseconds>,timeout_s=<seconds>,\
         timeout_strategy=cancel|ignore,connections=<amount>,\
         tls_dir=<path>,memory_mode=memfds|precopy|postcopy,\
-        local=on|off (deprecated; use memory_mode=memfds)]\"";
+        local=on|off (deprecated: use memory_mode=memfds)]\"";
 
     // Same as QEMU.
     pub const DEFAULT_DOWNTIME: Duration = Duration::from_millis(300);
@@ -693,7 +678,7 @@ impl VmSendMigrationData {
             .convert::<Toggle>("local")
             .map_err(VmSendMigrationConfigError::ParseError)?
             .is_some_and(|Toggle(v)| {
-                warn!("The 'local' option is deprecated: use 'memory_mode=memfds' instead");
+                warn!("'local' is deprecated: use 'memory_mode=memfds' instead");
                 v
             });
         let preserve_source = parser
@@ -2216,6 +2201,9 @@ mod tests {
     use std::{env, fs, process};
 
     use super::*;
+    use crate::external_fds::tests::vfio_target;
+    use crate::tests::test_fd;
+    use crate::vm_config::TcpConsoleConfig;
 
     struct TestDir {
         path: PathBuf,
@@ -2278,21 +2266,31 @@ mod tests {
 
     #[test]
     fn test_vm_receive_migration_data_background_fetch_pages() {
-        let data = VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock").unwrap();
+        // SAFETY: This test input contains no inherited descriptors.
+        let data = unsafe { VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock") }.unwrap();
         assert!(data.background_fetch_pages);
 
-        let data =
+        // SAFETY: This test input contains no inherited descriptors.
+        let data = unsafe {
             VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,background_fetch_pages=off")
-                .unwrap();
+        }
+        .unwrap();
         assert!(!data.background_fetch_pages);
 
-        let data =
+        // SAFETY: This test input contains no inherited descriptors.
+        let data = unsafe {
             VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,background_fetch_pages=on")
-                .unwrap();
+        }
+        .unwrap();
         assert!(data.background_fetch_pages);
 
-        VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,background_fetch_pages=maybe")
-            .unwrap_err();
+        // SAFETY: This test input contains no inherited descriptors.
+        unsafe {
+            VmReceiveMigrationData::parse(
+                "receiver_url=unix:/tmp/sock,background_fetch_pages=maybe",
+            )
+        }
+        .unwrap_err();
 
         let data: VmReceiveMigrationData =
             serde_json::from_str(r#"{"receiver_url":"unix:/tmp/sock"}"#).unwrap();
@@ -2300,37 +2298,69 @@ mod tests {
     }
 
     #[test]
+    fn test_vm_receive_migration_data_invalid_console_output() {
+        for options in [
+            "serial_file=/tmp/a,serial_tcp=127.0.0.1:4444",
+            "console_tcp=localhost:4444",
+        ] {
+            // SAFETY: This test input contains no inherited descriptors.
+            let result = unsafe {
+                VmReceiveMigrationData::parse(&format!("receiver_url=tcp:127.0.0.1:1234,{options}"))
+            };
+            assert!(matches!(
+                result,
+                Err(VmReceiveMigrationConfigError::InvalidConsoleOutput(_))
+            ));
+        }
+    }
+
+    #[test]
     fn test_vm_receive_migration_data_parse() {
-        let data = VmReceiveMigrationData::parse("receiver_url=tcp:192.168.1.1:8080").unwrap();
+        let data =
+            // SAFETY: This test input contains no inherited descriptors.
+            unsafe { VmReceiveMigrationData::parse("receiver_url=tcp:192.168.1.1:8080") }.unwrap();
         assert_eq!(
             data,
             VmReceiveMigrationData {
                 receiver_url: "tcp:192.168.1.1:8080".to_string(),
                 tls_dir: None,
                 vfio_fds: None,
-                iommufd_fd: None,
+                iommufd_fd: Default::default(),
                 zone_updates: vec![],
                 background_fetch_pages: true,
+                serial: None,
+                console: None,
+                external_fds: Default::default(),
             }
         );
 
-        let data = VmReceiveMigrationData::parse("receiver_url=tcp:[2001:db8::1]:8080").unwrap();
+        // SAFETY: This test input contains no inherited descriptors.
+        let data = unsafe { VmReceiveMigrationData::parse("receiver_url=tcp:[2001:db8::1]:8080") }
+            .unwrap();
         assert_eq!(data.receiver_url, "tcp:[2001:db8::1]:8080");
 
         let data =
-            VmReceiveMigrationData::parse("receiver_url=tcp:destination.example:8080").unwrap();
+            // SAFETY: This test input contains no inherited descriptors.
+            unsafe { VmReceiveMigrationData::parse("receiver_url=tcp:destination.example:8080") }
+                .unwrap();
         assert_eq!(data.receiver_url, "tcp:destination.example:8080");
 
-        let data = VmReceiveMigrationData::parse("receiver_url=unix:/tmp/ch=migrate.sock").unwrap();
+        let data =
+            // SAFETY: This test input contains no inherited descriptors.
+            unsafe { VmReceiveMigrationData::parse("receiver_url=unix:/tmp/ch=migrate.sock") }
+                .unwrap();
         assert_eq!(data.receiver_url, "unix:/tmp/ch=migrate.sock");
 
         let tls_dir = TestDir::new("receive-tls");
         tls_dir.add_receive_tls_files();
         let tls_dir_path = tls_dir.path.clone();
-        let data = VmReceiveMigrationData::parse(&format!(
-            "receiver_url=tcp:192.168.1.1:8080,tls_dir={}",
-            tls_dir_path.display()
-        ))
+        // SAFETY: This test input contains no inherited descriptors.
+        let data = unsafe {
+            VmReceiveMigrationData::parse(&format!(
+                "receiver_url=tcp:192.168.1.1:8080,tls_dir={},serial_tcp=1.2.3.4:6789,console_file=/tmp/c",
+                tls_dir_path.display()
+            ))
+        }
         .unwrap();
         assert_eq!(
             data,
@@ -2338,26 +2368,43 @@ mod tests {
                 receiver_url: "tcp:192.168.1.1:8080".to_string(),
                 tls_dir: Some(tls_dir_path),
                 vfio_fds: None,
-                iommufd_fd: None,
+                iommufd_fd: Default::default(),
                 zone_updates: vec![],
                 background_fetch_pages: true,
+                serial: Some(ConsoleOutput::Tcp {
+                    tcp: TcpConsoleConfig {
+                        address: "1.2.3.4:6789".parse().unwrap(),
+                        server: true,
+                    },
+                }),
+                console: Some(ConsoleOutput::File {
+                    file: PathBuf::from("/tmp/c"),
+                }),
+                external_fds: Default::default(),
             }
         );
 
         let tls_dir = TestDir::new("receive-empty-tls");
-        VmReceiveMigrationData::parse(&format!(
-            "receiver_url=tcp:192.168.1.1:8080,tls_dir={}",
-            tls_dir.path.display()
-        ))
+        // SAFETY: This test input contains no inherited descriptors.
+        unsafe {
+            VmReceiveMigrationData::parse(&format!(
+                "receiver_url=tcp:192.168.1.1:8080,tls_dir={}",
+                tls_dir.path.display()
+            ))
+        }
         .unwrap_err();
 
-        let e = VmReceiveMigrationData::parse("receiver_url=file:///tmp/migration").unwrap_err();
+        // SAFETY: This test input contains no inherited descriptors.
+        let e = unsafe { VmReceiveMigrationData::parse("receiver_url=file:///tmp/migration") }
+            .unwrap_err();
         assert!(
             matches!(e, VmReceiveMigrationConfigError::InvalidSocketPrefix),
             "Expected \"{:?}\"; got \"{e:?}\"",
             VmReceiveMigrationConfigError::InvalidSocketPrefix,
         );
-        let e = VmReceiveMigrationData::parse("receiver_url=tcp:192.168.1.1").unwrap_err();
+        let e =
+            // SAFETY: This test input contains no inherited descriptors.
+            unsafe { VmReceiveMigrationData::parse("receiver_url=tcp:192.168.1.1") }.unwrap_err();
         assert!(
             matches!(
                 e,
@@ -2368,7 +2415,9 @@ mod tests {
             "Expected \"{:?}\"; got \"{e:?}\"",
             VmReceiveMigrationConfigError::MalformedReceiverUrl(TcpAddressParseError::MissingPort),
         );
-        let e = VmReceiveMigrationData::parse("receiver_url=tcp:[2001:db8::1]").unwrap_err();
+        let e =
+            // SAFETY: This test input contains no inherited descriptors.
+            unsafe { VmReceiveMigrationData::parse("receiver_url=tcp:[2001:db8::1]") }.unwrap_err();
         assert!(
             matches!(
                 e,
@@ -2382,7 +2431,9 @@ mod tests {
             ),
         );
         let e =
-            VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,tls_dir=/tmp").unwrap_err();
+            // SAFETY: This test input contains no inherited descriptors.
+            unsafe { VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,tls_dir=/tmp") }
+                .unwrap_err();
         assert!(
             matches!(
                 e,
@@ -2392,52 +2443,95 @@ mod tests {
             VmReceiveMigrationConfigError::TlsEncryptionUsedForUnixSocket,
         );
 
-        VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,memory_mode=postcopy")
-            .unwrap_err();
+        // SAFETY: This test input contains no inherited descriptors.
+        unsafe {
+            VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,memory_mode=postcopy")
+        }
+        .unwrap_err();
 
         // Missing receiver_url in keyed form must fail.
-        let e = VmReceiveMigrationData::parse("tls_dir=/tmp/certs").unwrap_err();
+        // SAFETY: This test input contains no inherited descriptors.
+        let e = unsafe { VmReceiveMigrationData::parse("tls_dir=/tmp/certs") }.unwrap_err();
         assert!(
             matches!(e, VmReceiveMigrationConfigError::ParseError(_)),
             "Expected \"ParseError\"; got \"{e:?}\"",
         );
 
-        // vfio_fds without iommufd_fd parses fine now, the pairing is checked
-        // later against the received VmConfig by validate_vfio_fds.
-        let data =
-            VmReceiveMigrationData::parse("receiver_url=tcp:127.0.0.1:1234,vfio_fds=[vfio0@5]")
-                .unwrap();
+        use std::os::fd::{AsRawFd, IntoRawFd};
+        let cdev = test_fd();
+        let fd = cdev.into_raw_fd();
+        // SAFETY: The file transferred exclusive ownership to us.
+        let data = unsafe {
+            VmReceiveMigrationData::parse(&format!(
+                "receiver_url=tcp:127.0.0.1:1234,vfio_fds=[vfio0@{fd}]"
+            ))
+        }
+        .unwrap();
         assert!(data.iommufd_fd.is_none());
 
-        // vfio_fds entries with the iommufd FD.
-        let data = VmReceiveMigrationData::parse(
-            "receiver_url=tcp:127.0.0.1:1234,vfio_fds=[vfio0@5,vfio1@7],iommufd_fd=9",
-        )
+        let cdev0 = test_fd();
+        let cdev1 = test_fd();
+        let iommu = test_fd();
+        let raw_fds = [
+            cdev0.into_raw_fd(),
+            cdev1.into_raw_fd(),
+            iommu.into_raw_fd(),
+        ];
+        // SAFETY: Owned config fields receive exclusively transferred descriptors.
+        let data = unsafe {
+            VmReceiveMigrationData::parse(&format!(
+                "receiver_url=tcp:127.0.0.1:1234,vfio_fds=[vfio0@{},vfio1@{}],iommufd_fd={}",
+                raw_fds[0], raw_fds[1], raw_fds[2]
+            ))
+        }
         .unwrap();
-        let fds = data.vfio_fds.expect("vfio_fds populated");
-        assert_eq!(fds.len(), 2);
-        assert_eq!(fds[0].id, "vfio0");
-        assert_eq!(fds[0].fd, Some(5));
-        assert_eq!(fds[1].id, "vfio1");
-        assert_eq!(fds[1].fd, Some(7));
-        assert_eq!(data.iommufd_fd, Some(9));
+        assert_eq!(data.external_fds.entries().len(), 3);
+
+        assert!(data.vfio_fds.is_none());
+        assert!(data.iommufd_fd.is_none());
+        assert_eq!(
+            data.external_fds
+                .entries()
+                .into_iter()
+                .map(|(target, count, fds)| (
+                    target,
+                    count,
+                    fds.iter()
+                        .map(|fd| fd.as_ref().unwrap().as_raw_fd())
+                        .collect::<Vec<_>>()
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (&vfio_target("vfio0"), 1, vec![raw_fds[0]]),
+                (&vfio_target("vfio1"), 1, vec![raw_fds[1]]),
+                (&Target::Iommu, 1, vec![raw_fds[2]]),
+            ]
+        );
 
         // zone update tests
-        let e = VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,zone_updates=[]")
-            .unwrap_err();
+        let e =
+            // SAFETY: This test input contains no inherited descriptors.
+            unsafe { VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,zone_updates=[]") }
+                .unwrap_err();
         assert!(
             matches!(e, VmReceiveMigrationConfigError::ParseError(_)),
             "Expected \"ParseError\"; got \"{e:?}\"",
         );
-        let e = VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,zone_updates=[zone1 3]")
-            .unwrap_err();
+        // SAFETY: This test input contains no inherited descriptors.
+        let e = unsafe {
+            VmReceiveMigrationData::parse("receiver_url=unix:/tmp/sock,zone_updates=[zone1 3]")
+        }
+        .unwrap_err();
         assert!(
             matches!(e, VmReceiveMigrationConfigError::ParseError(_)),
             "Expected \"ParseError\"; got \"{e:?}\"",
         );
-        let e = VmReceiveMigrationData::parse(
-            "receiver_url=unix:/tmp/sock,zone_updates=[zone1@1,zone1@2]",
-        )
+        // SAFETY: This test input contains no inherited descriptors.
+        let e = unsafe {
+            VmReceiveMigrationData::parse(
+                "receiver_url=unix:/tmp/sock,zone_updates=[zone1@1,zone1@2]",
+            )
+        }
         .unwrap_err();
         assert!(
             matches!(e, VmReceiveMigrationConfigError::MultipleMemoryZoneUpdates),
@@ -2446,9 +2540,12 @@ mod tests {
         );
         //Mind the space before the second zone. If the whitespace isn't trimmed, we end up with two
         //different ID and the error does not trigger
-        let e = VmReceiveMigrationData::parse(
-            "receiver_url=unix:/tmp/sock,zone_updates=[zone1@1, zone1@2]",
-        )
+        // SAFETY: This test input contains no inherited descriptors.
+        let e = unsafe {
+            VmReceiveMigrationData::parse(
+                "receiver_url=unix:/tmp/sock,zone_updates=[zone1@1, zone1@2]",
+            )
+        }
         .unwrap_err();
         assert!(
             matches!(e, VmReceiveMigrationConfigError::MultipleMemoryZoneUpdates),

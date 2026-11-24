@@ -212,8 +212,20 @@ impl Serial {
         }
     }
 
-    fn thr_empty(&mut self) -> Result<()> {
-        if self.is_thr_intr_enabled() {
+    fn highest_pending_interrupt(&self) -> u8 {
+        // Received data stays pending until the guest has read all of it.
+        if self.is_recv_intr_enabled() && !self.in_buffer.is_empty() {
+            IIR_RECV_BIT
+        } else if self.interrupt_identification & IIR_THR_BIT != 0 && self.is_thr_intr_enabled() {
+            IIR_THR_BIT
+        } else {
+            IIR_NONE_BIT
+        }
+    }
+
+    fn raise_thr_empty_interrupt(&mut self) -> Result<()> {
+        let pending = (self.interrupt_identification & IIR_THR_BIT) != 0;
+        if self.is_thr_intr_enabled() && !pending {
             self.add_intr_bit(IIR_THR_BIT);
             self.trigger_interrupt()?;
         }
@@ -222,7 +234,6 @@ impl Serial {
 
     fn recv_data(&mut self) -> Result<()> {
         if self.is_recv_intr_enabled() {
-            self.add_intr_bit(IIR_RECV_BIT);
             self.trigger_interrupt()?;
         }
         self.line_status |= LSR_DATA_BIT;
@@ -231,10 +242,6 @@ impl Serial {
 
     fn trigger_interrupt(&mut self) -> io::Result<()> {
         self.interrupt.trigger(0)
-    }
-
-    fn iir_reset(&mut self) {
-        self.interrupt_identification = DEFAULT_INTERRUPT_IDENTIFICATION;
     }
 
     fn handle_write(&mut self, offset: u8, v: u8) -> Result<()> {
@@ -256,12 +263,24 @@ impl Serial {
                         .out
                         .as_mut()
                         .map_or(Ok(()), |out| out.write_all(&[v]).and_then(|()| out.flush()));
-                    let interrupt_result = self.thr_empty();
+                    let interrupt_result = self.raise_thr_empty_interrupt();
                     output_result?;
                     interrupt_result?;
                 }
             }
-            IER => self.interrupt_enable = v & IER_FIFO_BITS,
+            IER => {
+                let recv_was_enabled = self.is_recv_intr_enabled();
+                let thr_was_enabled = self.is_thr_intr_enabled();
+                self.interrupt_enable = v & IER_FIFO_BITS;
+                if !recv_was_enabled && self.is_recv_intr_enabled() && !self.in_buffer.is_empty() {
+                    self.recv_data()?;
+                }
+                if !self.is_thr_intr_enabled() {
+                    self.del_intr_bit(IIR_THR_BIT);
+                } else if !thr_was_enabled {
+                    self.raise_thr_empty_interrupt()?;
+                }
+            }
             LCR => self.line_control = v,
             MCR => self.modem_control = v,
             SCR => self.scratch = v,
@@ -295,7 +314,6 @@ impl BusDevice for Serial {
             DLAB_LOW if self.is_dlab_set() => self.baud_divisor as u8,
             DLAB_HIGH if self.is_dlab_set() => (self.baud_divisor >> 8) as u8,
             DATA => {
-                self.del_intr_bit(IIR_RECV_BIT);
                 if self.in_buffer.len() <= 1 {
                     self.line_status &= !LSR_DATA_BIT;
                 }
@@ -303,9 +321,12 @@ impl BusDevice for Serial {
             }
             IER => self.interrupt_enable,
             IIR => {
-                let v = self.interrupt_identification | IIR_FIFO_BITS;
-                self.iir_reset();
-                v
+                let highest_pending_interrupt = self.highest_pending_interrupt();
+                // Reading the IIR clears only THR empty, as on a 16550.
+                if highest_pending_interrupt == IIR_THR_BIT {
+                    self.del_intr_bit(IIR_THR_BIT);
+                }
+                highest_pending_interrupt | IIR_FIFO_BITS
             }
             LCR => self.line_control,
             MCR => self.modem_control,
@@ -346,7 +367,7 @@ mod tests {
     use std::sync::Mutex;
 
     use vm_device::interrupt::{InterruptIndex, InterruptSourceConfig};
-    use vmm_sys_util::eventfd::EventFd;
+    use vmm_sys_util::eventfd::{EFD_NONBLOCK, EventFd};
 
     use super::*;
 
@@ -372,8 +393,8 @@ mod tests {
         fn set_gsi(&self) -> io::Result<()> {
             Ok(())
         }
-        fn notifier(&self, _index: InterruptIndex) -> Option<EventFd> {
-            Some(self.event_fd.try_clone().unwrap())
+        fn notifier(&self, _index: InterruptIndex) -> io::Result<Option<EventFd>> {
+            self.event_fd.try_clone().map(Some)
         }
     }
 
@@ -474,6 +495,51 @@ mod tests {
     }
 
     #[test]
+    fn serial_recv_pending_until_read() {
+        let intr_evt = EventFd::new(0).unwrap();
+        let mut serial = Serial::new_sink(
+            String::from(SERIAL_NAME),
+            Arc::new(TestInterrupt::new(intr_evt.try_clone().unwrap())),
+            None,
+        );
+
+        serial.write(0, IER as u64, &[IER_RECV_BIT]);
+        serial.queue_input_bytes(b"ab").unwrap();
+
+        let mut data = [0u8];
+        serial.read(0, IIR as u64, &mut data[..]);
+        assert_ne!(data[0] & IIR_RECV_BIT, 0);
+        serial.read(0, DATA as u64, &mut data[..]);
+        assert_eq!(data[0], b'a');
+        serial.read(0, IIR as u64, &mut data[..]);
+        assert_ne!(data[0] & IIR_RECV_BIT, 0);
+        serial.read(0, DATA as u64, &mut data[..]);
+        assert_eq!(data[0], b'b');
+        serial.read(0, IIR as u64, &mut data[..]);
+        assert_ne!(data[0] & IIR_NONE_BIT, 0);
+    }
+
+    #[test]
+    fn serial_recv_raised_when_enabled() {
+        let intr_evt = EventFd::new(0).unwrap();
+        let mut serial = Serial::new_sink(
+            String::from(SERIAL_NAME),
+            Arc::new(TestInterrupt::new(intr_evt.try_clone().unwrap())),
+            None,
+        );
+
+        intr_evt.write(1).unwrap();
+        serial.queue_input_bytes(b"a").unwrap();
+        serial.write(0, IER as u64, &[IER_RECV_BIT]);
+        serial.write(0, IER as u64, &[IER_RECV_BIT]);
+
+        assert_eq!(intr_evt.read().unwrap(), 2);
+        let mut data = [0u8];
+        serial.read(0, IIR as u64, &mut data[..]);
+        assert_ne!(data[0] & IIR_RECV_BIT, 0);
+    }
+
+    #[test]
     fn serial_thr() {
         let intr_evt = EventFd::new(0).unwrap();
         let mut serial = Serial::new_sink(
@@ -494,6 +560,77 @@ mod tests {
         assert_eq!(data[0] & IER_FIFO_BITS, IER_THR_BIT);
         serial.read(0, IIR as u64, &mut data[..]);
         assert_ne!(data[0] & IIR_THR_BIT, 0);
+    }
+
+    #[test]
+    fn serial_thr_raised_once_until_iir_read() {
+        // Setup: THR interrupts enabled. `raised()` returns how often the
+        // device raised the interrupt since the last call.
+        let intr_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new_sink(
+            String::from(SERIAL_NAME),
+            Arc::new(TestInterrupt::new(intr_evt.try_clone().unwrap())),
+            None,
+        );
+        serial.write(0, IER as u64, &[IER_THR_BIT]);
+        let raised = || intr_evt.read().unwrap_or(0);
+
+        // The first byte raises the interrupt. The second byte finds it still
+        // pending, because the guest has not read IIR yet.
+        serial.write(0, DATA as u64, b"a");
+        assert_eq!(raised(), 1);
+        serial.write(0, DATA as u64, b"b");
+        assert_eq!(raised(), 0);
+
+        // Reading IIR acknowledges the interrupt, so the next byte raises it
+        // again.
+        let mut iir = [0u8];
+        serial.read(0, IIR as u64, &mut iir);
+        assert_ne!(iir[0] & IIR_THR_BIT, 0);
+        serial.write(0, DATA as u64, b"c");
+        assert_eq!(raised(), 1);
+    }
+
+    #[test]
+    fn serial_thr_raised_when_enabled() {
+        let intr_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new_sink(
+            String::from(SERIAL_NAME),
+            Arc::new(TestInterrupt::new(intr_evt.try_clone().unwrap())),
+            None,
+        );
+
+        // The transmitter is empty, so enabling the THR interrupt raises it.
+        serial.write(0, IER as u64, &[IER_THR_BIT]);
+        assert_eq!(intr_evt.read().unwrap_or(0), 1);
+        let mut data = [0u8];
+        serial.read(0, IIR as u64, &mut data[..]);
+        assert_eq!(data[0] & !IIR_FIFO_BITS, IIR_THR_BIT);
+    }
+
+    #[test]
+    fn serial_iir_reports_highest_priority() {
+        let intr_evt = EventFd::new(EFD_NONBLOCK).unwrap();
+        let mut serial = Serial::new_sink(
+            String::from(SERIAL_NAME),
+            Arc::new(TestInterrupt::new(intr_evt.try_clone().unwrap())),
+            None,
+        );
+
+        // Received data and THR empty pending at the same time.
+        serial.write(0, IER as u64, &[IER_RECV_BIT | IER_THR_BIT]);
+        serial.queue_input_bytes(b"a").unwrap();
+
+        // IIR reports received data first and leaves THR empty pending.
+        let mut data = [0u8];
+        serial.read(0, IIR as u64, &mut data[..]);
+        assert_eq!(data[0] & !IIR_FIFO_BITS, IIR_RECV_BIT);
+        serial.read(0, DATA as u64, &mut data[..]);
+        assert_eq!(data[0], b'a');
+        serial.read(0, IIR as u64, &mut data[..]);
+        assert_eq!(data[0] & !IIR_FIFO_BITS, IIR_THR_BIT);
+        serial.read(0, IIR as u64, &mut data[..]);
+        assert_eq!(data[0] & !IIR_FIFO_BITS, IIR_NONE_BIT);
     }
 
     #[test]

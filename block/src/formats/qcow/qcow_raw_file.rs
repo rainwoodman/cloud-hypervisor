@@ -9,7 +9,6 @@ use std::io::{self, Write};
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, RawFd};
 use std::os::unix::fs::FileExt;
 
-use byteorder::{BigEndian, WriteBytesExt};
 use vmm_sys_util::write_zeroes::WriteZeroesAt;
 
 use crate::aligned_file::AlignedFile;
@@ -37,7 +36,7 @@ impl BeUint for u8 {
     }
     #[inline(always)]
     fn write_be<W: Write>(w: &mut W, val: Self) -> io::Result<()> {
-        w.write_u8(val)
+        w.write_all(&val.to_be_bytes())
     }
 }
 
@@ -48,7 +47,7 @@ impl BeUint for u16 {
     }
     #[inline(always)]
     fn write_be<W: Write>(w: &mut W, val: Self) -> io::Result<()> {
-        w.write_u16::<BigEndian>(val)
+        w.write_all(&val.to_be_bytes())
     }
 }
 
@@ -59,7 +58,7 @@ impl BeUint for u32 {
     }
     #[inline(always)]
     fn write_be<W: Write>(w: &mut W, val: Self) -> io::Result<()> {
-        w.write_u32::<BigEndian>(val)
+        w.write_all(&val.to_be_bytes())
     }
 }
 
@@ -72,7 +71,7 @@ impl BeUint for u64 {
     }
     #[inline(always)]
     fn write_be<W: Write>(w: &mut W, val: Self) -> io::Result<()> {
-        w.write_u64::<BigEndian>(val)
+        w.write_all(&val.to_be_bytes())
     }
 }
 
@@ -103,7 +102,8 @@ where
     let bytes_per_entry = size_of::<T>();
     let mut buffer = Vec::with_capacity(table.len() * bytes_per_entry);
     for &val in table {
-        let converted = T::try_from(val).expect("refcount values are validated on increment");
+        let converted = T::try_from(val)
+            .map_err(|_| io::Error::other(format!("Refcount value out of range: {val}")))?;
         T::write_be(&mut buffer, converted)?;
     }
     file.write_all_at(&buffer, offset)
@@ -285,7 +285,7 @@ impl QcowRawFile {
         let declared_end = offset.saturating_add(total_entries.saturating_mul(entry_size));
         let tail_end = declared_end.min(self.file.metadata()?.len());
         if tail_end > tail_start {
-            let is_blkdev = is_block_device(self.file.as_raw_fd());
+            let is_blkdev = is_block_device(self.file.file());
             punch_hole(
                 self.file.file_mut(),
                 is_blkdev,
@@ -312,11 +312,15 @@ impl QcowRawFile {
         self.file.write_all_at(&buffer, offset)
     }
 
-    /// Read a refcount block from the file and returns a Vec containing the block.
-    /// Always returns a cluster's worth of data.
+    /// Reads `count` refcounts from the file.
+    pub(super) fn read_refcounts(&mut self, offset: u64, count: usize) -> io::Result<Vec<u64>> {
+        (self.read_refcount_fn)(&mut self.file, offset, count)
+    }
+
+    /// Reads one cluster of refcounts.
     #[inline]
     pub(super) fn read_refcount_block(&mut self, offset: u64) -> io::Result<Vec<u64>> {
-        (self.read_refcount_fn)(&mut self.file, offset, self.refcount_block_entries as usize)
+        self.read_refcounts(offset, self.refcount_block_entries as usize)
     }
 
     /// Writes a refcount block to the file.
@@ -333,13 +337,20 @@ impl QcowRawFile {
         // Determine where the new end of the file should be and set_len, which
         // translates to truncate(2).
         let file_end: u64 = self.physical_size()?;
-        let new_cluster_address: u64 = (file_end + self.cluster_size - 1) & !self.cluster_mask;
+        // Round the file end up to a cluster boundary.
+        let new_cluster_address: u64 = file_end
+            .div_ceil(self.cluster_size)
+            .checked_mul(self.cluster_size)
+            .ok_or_else(|| io::Error::other("Aligned file end overflow"))?;
 
         if new_cluster_address > max_valid_cluster_offset {
             return Ok(None);
         }
 
-        self.file.set_len(new_cluster_address + self.cluster_size)?;
+        let new_len = new_cluster_address
+            .checked_add(self.cluster_size)
+            .ok_or_else(|| io::Error::other("New cluster end overflow"))?;
+        self.file.set_len(new_len)?;
 
         Ok(Some(new_cluster_address))
     }
@@ -417,8 +428,7 @@ mod tests {
     use std::io::Read;
     use std::os::unix::fs::FileExt;
 
-    use vmm_sys_util::tempfile::TempFile;
-
+    use super::super::test_util::TestImage;
     use super::*;
 
     fn be_bytes(entries: &[u64]) -> Vec<u8> {
@@ -443,19 +453,14 @@ mod tests {
     const FAR_OFFSET: u64 = 0x9000; // where the callback reads (refcount block)
     const FILE_LEN: u64 = 0x40000; // 256 KiB filler so all offsets are valid
 
-    fn make_qcow_raw() -> (TempFile, QcowRawFile) {
+    fn make_qcow_raw() -> (TestImage, QcowRawFile) {
         make_qcow_raw_bits(16)
     }
 
-    fn make_qcow_raw_bits(refcount_bits: u64) -> (TempFile, QcowRawFile) {
-        let temp_file = TempFile::new().unwrap();
-        temp_file.as_file().set_len(FILE_LEN).unwrap();
-
-        let file = temp_file.as_file().try_clone().unwrap();
-        let raw = AlignedFile::new(file, false);
-        let qcow_raw =
-            QcowRawFile::from(raw, CLUSTER_SIZE, refcount_bits).expect("QcowRawFile::from");
-        (temp_file, qcow_raw)
+    fn make_qcow_raw_bits(refcount_bits: u64) -> (TestImage, QcowRawFile) {
+        let image = TestImage::from_bytes(&[], FILE_LEN);
+        let raw = image.qcow_raw(CLUSTER_SIZE, refcount_bits);
+        (image, raw)
     }
 
     #[test]

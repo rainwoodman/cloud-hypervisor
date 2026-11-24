@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, Command, Output, Stdio};
+use std::process::{Child, Command, Stdio};
 use std::string::String;
 use std::sync::mpsc;
 use std::sync::mpsc::Receiver;
@@ -16,6 +16,8 @@ use block::formats::qcow::ImageType as QcowImageType;
 use test_infra::*;
 use vmm_sys_util::tempdir::TempDir;
 use wait_timeout::ChildExt;
+
+use crate::common::QemuImgCommand;
 
 const QCOW2_INCOMPATIBLE_FEATURES_OFFSET: u64 = 72;
 // 10MB is our maximum accepted overhead.
@@ -800,18 +802,21 @@ pub(crate) fn get_counters(api_socket: &str) -> Counters {
     let (cmd_success, cmd_output, _) = remote_command_w_output(api_socket, "counters", None);
     assert!(cmd_success);
 
-    let counters: HashMap<&str, HashMap<&str, u64>> =
-        serde_json::from_slice(&cmd_output).unwrap_or_default();
+    let counters: HashMap<&str, HashMap<&str, serde_json::Value>> =
+        serde_json::from_slice(&cmd_output).unwrap();
 
-    let rx_bytes = *counters.get("_net2").unwrap().get("rx_bytes").unwrap();
-    let rx_frames = *counters.get("_net2").unwrap().get("rx_frames").unwrap();
-    let tx_bytes = *counters.get("_net2").unwrap().get("tx_bytes").unwrap();
-    let tx_frames = *counters.get("_net2").unwrap().get("tx_frames").unwrap();
+    assert_eq!(counters["_net2"]["device_type"], "net");
+    assert_eq!(counters["_disk0"]["device_type"], "block");
 
-    let read_bytes = *counters.get("_disk0").unwrap().get("read_bytes").unwrap();
-    let write_bytes = *counters.get("_disk0").unwrap().get("write_bytes").unwrap();
-    let read_ops = *counters.get("_disk0").unwrap().get("read_ops").unwrap();
-    let write_ops = *counters.get("_disk0").unwrap().get("write_ops").unwrap();
+    let rx_bytes = counters["_net2"]["rx_bytes"].as_u64().unwrap();
+    let rx_frames = counters["_net2"]["rx_frames"].as_u64().unwrap();
+    let tx_bytes = counters["_net2"]["tx_bytes"].as_u64().unwrap();
+    let tx_frames = counters["_net2"]["tx_frames"].as_u64().unwrap();
+
+    let read_bytes = counters["_disk0"]["read_bytes"].as_u64().unwrap();
+    let write_bytes = counters["_disk0"]["write_bytes"].as_u64().unwrap();
+    let read_ops = counters["_disk0"]["read_ops"].as_u64().unwrap();
+    let write_ops = counters["_disk0"]["write_ops"].as_u64().unwrap();
 
     Counters {
         rx_bytes,
@@ -976,7 +981,9 @@ pub(crate) fn disk_check_consistency(
     initial_backing_checksum: Option<(PathBuf, String, u32)>,
 ) {
     let path = resolve_disk_path(path_or_image_name);
-    let output = run_qemu_img(&path, &["check"], None);
+    let output = QemuImgCommand::new()
+        .check(path.to_str().unwrap())
+        .run("qemu-img check failed");
 
     assert!(
         output.status.success(),
@@ -994,7 +1001,9 @@ pub(crate) fn disk_check_consistency(
 
     if let Some((backing_path, format, initial_checksum)) = initial_backing_checksum {
         if format.parse::<QcowImageType>().ok() != Some(QcowImageType::Raw) {
-            let output = run_qemu_img(&backing_path, &["check"], None);
+            let output = QemuImgCommand::new()
+                .check(backing_path.to_str().unwrap())
+                .run("qemu-img check of backing file failed");
 
             assert!(
                 output.status.success(),
@@ -1012,21 +1021,11 @@ pub(crate) fn disk_check_consistency(
     }
 }
 
-pub(crate) fn run_qemu_img(path: &Path, args: &[&str], trailing_args: Option<&[&str]>) -> Output {
-    let mut cmd = Command::new("qemu-img");
-    cmd.arg(args[0])
-        .args(&args[1..])
-        .arg(path.to_str().unwrap());
-    if let Some(extra) = trailing_args {
-        cmd.args(extra);
-    }
-    cmd.output().unwrap()
-}
-
 fn get_image_info(path: &Path) -> Option<serde_json::Value> {
-    let output = run_qemu_img(path, &["info", "-U", "--output=json"], None);
+    let output = QemuImgCommand::new()
+        .info(path.to_str().unwrap())
+        .run("qemu-img info failed");
 
-    output.status.success().then_some(())?;
     serde_json::from_slice(&output.stdout).ok()
 }
 

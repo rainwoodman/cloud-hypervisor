@@ -80,19 +80,21 @@
 //             it thinks its peer's information is out of date.
 //          Our implementation uses the proactive approach.
 //
-use std::io::{ErrorKind, Read, Write};
+use std::io;
+use std::io::ErrorKind;
 use std::num::Wrapping;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
-use std::{cmp, io};
 
 use log::{debug, error, info, warn};
-use vm_memory::{ReadVolatile, WriteVolatile};
 
 use super::super::defs::uapi;
 use super::super::packet::VsockPacket;
-use super::super::{Result as VsockResult, VsockChannel, VsockEpollListener, VsockError};
-use super::txbuf::{TxBuf, TxBufSource};
+use super::super::{
+    Result as VsockResult, SocketType, VsockChannel, VsockEpollListener, VsockError,
+};
+use super::transport::{RxState, Transport, TxState};
+use super::txbuf::TxBufSource;
 use super::{ConnState, Error, PendingRx, PendingRxSet, Result, defs};
 
 impl TxBufSource for VsockPacket {
@@ -104,8 +106,7 @@ impl TxBufSource for VsockPacket {
 
 /// A self-managing connection object, that handles communication between a guest-side AF_VSOCK
 /// socket and a host-side `Read + Write + AsRawFd` stream.
-///
-pub(crate) struct VsockConnection<S: Read + ReadVolatile + Write + WriteVolatile + AsRawFd> {
+pub(crate) struct VsockConnection<S: Transport + ?Sized> {
     /// The current connection state.
     state: ConnState,
     /// The local CID. Most of the time this will be the constant `2` (the vsock host CID).
@@ -117,11 +118,9 @@ pub(crate) struct VsockConnection<S: Read + ReadVolatile + Write + WriteVolatile
     /// The peer (guest) port.
     peer_port: u32,
     /// The (connected) host-side stream.
-    stream: S,
-    /// The TX buffer for this connection.
-    tx_buf: TxBuf,
+    stream: Box<S>,
     /// Total number of bytes that have been successfully written to `self.stream`, either
-    /// directly, or flushed from `self.tx_buf`.
+    /// directly, or flushed from the transport's TX buffer.
     fwd_cnt: Wrapping<u32>,
     /// The amount of buffer space that the peer (guest) has allocated for this connection.
     peer_buf_alloc: u32,
@@ -148,7 +147,7 @@ pub(crate) struct VsockConnection<S: Read + ReadVolatile + Write + WriteVolatile
 
 impl<S> VsockChannel for VsockConnection<S>
 where
-    S: Read + ReadVolatile + Write + WriteVolatile + AsRawFd,
+    S: Transport + ?Sized,
 {
     /// Fill in a vsock packet, to be delivered to our peer (the guest driver).
     ///
@@ -166,7 +165,6 @@ where
     ///   packet;
     /// - `Err(VsockError::PktBufMissing)`: the packet would've been filled in with data, but
     ///   it is missing the data buffer.
-    ///
     fn recv_pkt(&mut self, pkt: &mut VsockPacket) -> VsockResult<()> {
         // Perform some generic initialization that is the same for any packet operation (e.g.
         // source, destination, credit, etc).
@@ -227,16 +225,19 @@ where
                 return Ok(());
             }
 
-            let buf_capacity = pkt.buf_capacity().ok_or(VsockError::PktBufMissing)?;
+            if self.stream.socket_type() == SocketType::Stream && !pkt.has_buf() {
+                return Err(VsockError::PktBufMissing);
+            }
+            let credit = self.peer_avail_credit();
+            match self.stream.receive(pkt, credit, self.peer_buf_alloc) {
+                Ok(read) => {
+                    if read.waiting_credit {
+                        pkt.set_op(uapi::VSOCK_OP_CREDIT_REQUEST);
+                        return Ok(());
+                    }
 
-            // The maximum amount of data we can read in is limited by both the RX buffer size and
-            // the peer available buffer space.
-            let max_len = cmp::min(buf_capacity, self.peer_avail_credit());
-
-            // Read data from the stream straight to the RX buffer, for maximum throughput.
-            match pkt.read_volatile_from(&mut self.stream, max_len) {
-                Ok(read_cnt) => {
-                    if read_cnt == 0 {
+                    let read_cnt = read.len;
+                    if read.eof {
                         if self.host_hung_up {
                             // A 0-length read with EPOLLHUP is a full host close: we can neither
                             // send nor receive any more data.
@@ -253,7 +254,7 @@ where
                             // side: nothing can flow either way. Terminate once the TX buffer
                             // drains, rather than reopening the connection for guest writes.
                             self.state = ConnState::PeerClosed(true, true);
-                            if self.tx_buf.is_empty() {
+                            if self.stream.tx_state() == TxState::Empty {
                                 pkt.set_op(uapi::VSOCK_OP_RST);
                             } else {
                                 self.expiry = Some(
@@ -274,20 +275,17 @@ where
                         // On a successful data read, we fill in the packet with the RW op, and
                         // length of the read data.
                         pkt.set_op(uapi::VSOCK_OP_RW).set_len(read_cnt as u32);
+                        // A full buffer means the stream likely has more, so stay due for RX.
+                        if read.more {
+                            self.pending_rx.insert(PendingRx::Rw);
+                        }
                     }
                     self.rx_cnt += Wrapping(pkt.len());
                     self.last_fwd_cnt_to_peer = self.fwd_cnt;
                     return Ok(());
                 }
-                Err(err) if err.kind() == ErrorKind::WouldBlock => {
-                    // This shouldn't actually happen (receiving EWOULDBLOCK after EPOLLIN), but
-                    // apparently it does, so we need to handle it gracefully.
-                    warn!(
-                        "vsock: unexpected EWOULDBLOCK while reading from backing stream: \
-                         lp={}, pp={}, err={:?}",
-                        self.local_port, self.peer_port, err
-                    );
-                }
+                // A batched read ends here once the stream is drained.
+                Err(err) if err.kind() == ErrorKind::WouldBlock => {}
                 Err(err) => {
                     // We are not expecting any other errors when reading from the underlying
                     // stream. If any show up, we'll immediately kill this connection.
@@ -323,11 +321,15 @@ where
     ///
     /// Returns:
     /// always `Ok(())`: the packet has been consumed;
-    ///
     fn send_pkt(&mut self, pkt: &VsockPacket) -> VsockResult<()> {
         // Update the peer credit information.
         self.peer_buf_alloc = pkt.buf_alloc();
         self.peer_fwd_cnt = Wrapping(pkt.fwd_cnt());
+
+        if pkt.op() == uapi::VSOCK_OP_SHUTDOWN && pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0
+        {
+            self.stream.finish_send();
+        }
 
         match self.state {
             // Most frequent case: this is an established connection that needs to forward some
@@ -338,7 +340,7 @@ where
             | ConnState::LocalClosed(false, _)
                 if pkt.op() == uapi::VSOCK_OP_RW =>
             {
-                if !pkt.has_buf() {
+                if !pkt.has_buf() && self.stream.socket_type() == SocketType::Stream {
                     info!(
                         "vsock: dropping empty data packet from guest (lp={}, pp={}",
                         self.local_port, self.peer_port
@@ -382,7 +384,7 @@ where
                 let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
                 self.state = ConnState::PeerClosed(recv_off, send_off);
                 if recv_off && send_off {
-                    if self.tx_buf.is_empty() {
+                    if self.stream.tx_state() == TxState::Empty {
                         self.pending_rx.insert(PendingRx::Rst);
                     } else {
                         self.expiry = Some(
@@ -401,7 +403,7 @@ where
                 let recv_off = recv_off || (pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_RCV != 0);
                 let new_send_off = send_off || (pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0);
                 self.state = ConnState::PeerClosed(recv_off, new_send_off);
-                if recv_off && new_send_off && self.tx_buf.is_empty() {
+                if recv_off && new_send_off && self.stream.tx_state() == TxState::Empty {
                     self.pending_rx.insert(PendingRx::Rst);
                 } else if new_send_off && !send_off {
                     self.shutdown_host_write_side();
@@ -414,7 +416,7 @@ where
                 let send_off = pkt.flags() & uapi::VSOCK_FLAGS_SHUTDOWN_SEND != 0;
                 if send_off {
                     self.state = ConnState::PeerClosed(true, true);
-                    if self.tx_buf.is_empty() {
+                    if self.stream.tx_state() == TxState::Empty {
                         self.pending_rx.insert(PendingRx::Rst);
                     } else {
                         self.expiry = Some(
@@ -452,11 +454,26 @@ where
             }
         }
 
+        if pkt.op() == uapi::VSOCK_OP_SHUTDOWN
+            && matches!(self.state, ConnState::PeerClosed(true, _))
+            && !self.host_hung_up
+        {
+            self.pending_rx.remove(PendingRx::Rw);
+        }
+
+        if self.stream.rx_state(self.peer_avail_credit()) == RxState::Buffered
+            && matches!(
+                self.state,
+                ConnState::Established | ConnState::PeerClosed(false, _)
+            )
+        {
+            self.pending_rx.insert(PendingRx::Rw);
+        }
+
         Ok(())
     }
 
     /// Check if the connection has any pending packet addressed to the peer.
-    ///
     fn has_pending_rx(&self) -> bool {
         !self.pending_rx.is_empty()
     }
@@ -464,13 +481,12 @@ where
 
 impl<S> VsockEpollListener for VsockConnection<S>
 where
-    S: Read + ReadVolatile + Write + WriteVolatile + AsRawFd,
+    S: Transport + ?Sized,
 {
     /// Get the file descriptor that this connection wants polled.
     ///
     /// The connection is interested in being notified about EPOLLIN / EPOLLOUT events on the
     /// host stream.
-    ///
     fn get_polled_fd(&self) -> RawFd {
         self.stream.as_raw_fd()
     }
@@ -481,10 +497,9 @@ where
     /// - data is available to be read from the host stream, so that it can store an RW pending
     ///   RX indication; and
     /// - data can be written to the host stream, and the TX buffer needs to be flushed.
-    ///
     fn get_polled_evset(&self) -> epoll::Events {
         let mut evset = epoll::Events::empty();
-        if !self.tx_buf.is_empty() {
+        if self.stream.tx_state() == TxState::Pending {
             // There's data waiting in the TX buffer, so we are interested in being notified
             // when writing to the host stream wouldn't block.
             evset.insert(epoll::Events::EPOLLOUT);
@@ -502,6 +517,7 @@ where
                     evset.insert(epoll::Events::EPOLLHUP);
                 }
             }
+            ConnState::LocalInit | ConnState::PeerInit => (),
             _ if self.need_credit_update_from_peer() => (),
             _ => evset.insert(epoll::Events::EPOLLIN),
         }
@@ -509,7 +525,6 @@ where
     }
 
     /// Notify the connection about an event (or set of events) that it was interested in.
-    ///
     fn notify(&mut self, evset: epoll::Events) {
         if evset.contains(epoll::Events::EPOLLHUP) {
             self.host_hung_up = true;
@@ -525,34 +540,34 @@ where
         if evset.contains(epoll::Events::EPOLLOUT) {
             // Data can be written to the host stream. Time to flush out the TX buffer.
             //
-            if self.tx_buf.is_empty() {
+            if self.stream.tx_state() != TxState::Pending {
                 info!("vsock: connection received unexpected EPOLLOUT event");
                 return;
             }
-            let flushed = self
-                .tx_buf
-                .flush_to(&mut self.stream)
-                .unwrap_or_else(|err| {
-                    warn!(
-                        "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
-                        self.local_port, self.peer_port, err
-                    );
-                    match err {
-                        Error::TxBufFlush(inner) if inner.kind() == ErrorKind::WouldBlock => {
-                            // This should never happen (EWOULDBLOCK after EPOLLOUT), but
-                            // it does, so let's absorb it.
-                        }
-                        _ => self.kill(),
+            let flushed = self.stream.flush().unwrap_or_else(|err| {
+                warn!(
+                    "vsock: error flushing TX buf for (lp={}, pp={}): {:?}",
+                    self.local_port, self.peer_port, err
+                );
+                match err {
+                    Error::TxBufFlush(inner) if inner.kind() == ErrorKind::WouldBlock => {
+                        // This should never happen (EWOULDBLOCK after EPOLLOUT), but
+                        // it does, so let's absorb it.
                     }
-                    0
-                });
+                    _ => self.kill(),
+                }
+                0
+            });
             self.fwd_cnt += Wrapping(flushed as u32);
 
             // If this connection was shutting down, but is waiting to drain the TX buffer
             // before forceful termination, the wait might be over.
-            if self.state == ConnState::PeerClosed(true, true) && self.tx_buf.is_empty() {
+            if self.state == ConnState::PeerClosed(true, true)
+                && self.stream.tx_state() == TxState::Empty
+            {
                 self.pending_rx.insert(PendingRx::Rst);
-            } else if matches!(self.state, ConnState::PeerClosed(_, true)) && self.tx_buf.is_empty()
+            } else if matches!(self.state, ConnState::PeerClosed(_, true))
+                && self.stream.tx_state() == TxState::Empty
             {
                 // A deferred guest send-side half-close: now that the TX buffer is drained, we can
                 // surface the EOF to the host.
@@ -568,12 +583,11 @@ where
 
 impl<S> VsockConnection<S>
 where
-    S: Read + ReadVolatile + Write + WriteVolatile + AsRawFd,
+    S: Transport + ?Sized,
 {
     /// Create a new guest-initiated connection object.
-    ///
     pub(crate) fn new_peer_init(
-        stream: S,
+        stream: Box<S>,
         local_cid: u64,
         peer_cid: u64,
         local_port: u32,
@@ -587,7 +601,6 @@ where
             peer_port,
             stream,
             state: ConnState::PeerInit,
-            tx_buf: TxBuf::new(),
             fwd_cnt: Wrapping(0),
             peer_buf_alloc,
             peer_fwd_cnt: Wrapping(0),
@@ -601,9 +614,8 @@ where
     }
 
     /// Create a new host-initiated connection object.
-    ///
     pub(crate) fn new_local_init(
-        stream: S,
+        stream: Box<S>,
         local_cid: u64,
         peer_cid: u64,
         local_port: u32,
@@ -616,7 +628,6 @@ where
             peer_port,
             stream,
             state: ConnState::LocalInit,
-            tx_buf: TxBuf::new(),
             fwd_cnt: Wrapping(0),
             peer_buf_alloc: 0,
             peer_fwd_cnt: Wrapping(0),
@@ -631,7 +642,6 @@ where
 
     /// Check if there is an expiry (kill) timer set for this connection, sometime in the
     /// future.
-    ///
     pub(crate) fn will_expire(&self) -> bool {
         match self.expiry {
             None => false,
@@ -641,7 +651,6 @@ where
 
     /// Check if this connection needs to be scheduled for forceful termination, due to its
     /// kill timer having expired.
-    ///
     pub(crate) fn has_expired(&self) -> bool {
         match self.expiry {
             None => false,
@@ -650,21 +659,18 @@ where
     }
 
     /// Get the kill timer value, if one is set.
-    ///
     pub(crate) fn expiry(&self) -> Option<Instant> {
         self.expiry
     }
 
     /// Schedule the connection to be forcefully terminated ASAP (i.e. the next time the
     /// connection is asked to yield a packet, via `recv_pkt()`).
-    ///
     pub(crate) fn kill(&mut self) {
         self.state = ConnState::Killed;
         self.pending_rx.insert(PendingRx::Rst);
     }
 
     /// Return the connections state.
-    ///
     pub(crate) fn state(&self) -> ConnState {
         self.state
     }
@@ -675,62 +681,30 @@ where
     /// Warning: this will bypass the connection state machine and write directly to the
     /// underlying stream. No account of this write is kept, which includes bypassing
     /// vsock flow control.
-    ///
     pub(crate) fn send_bytes_raw(&mut self, buf: &[u8]) -> Result<usize> {
-        self.stream.write(buf).map_err(Error::StreamWrite)
+        self.stream.write_control(buf).map_err(Error::StreamWrite)
     }
 
     /// Send packet data to the host stream.
     ///
     /// Packet data can either be sent straight to the host stream, or to our TX buffer, if the
     /// former fails.
-    ///
     fn send_pkt_bytes(&mut self, pkt: &VsockPacket) -> Result<()> {
-        let len = pkt.len() as usize;
-
-        // If there is data in the TX buffer, that means we're already registered for EPOLLOUT
-        // events on the underlying stream. Therefore, there's no point in attempting a write
-        // at this point. `self.notify()` will get called when EPOLLOUT arrives, and it will
-        // attempt to drain the TX buffer then.
-        if !self.tx_buf.is_empty() {
-            return self.buffer_pkt_bytes(pkt, 0, len);
-        }
-
-        // The TX buffer is empty, so we can try to write straight to the host stream.
-        let written = match pkt.write_volatile_to(&mut self.stream, 0, len) {
-            Ok(cnt) => cnt,
-            Err(e) => {
-                // Absorb any would-block errors, since we can always try again later.
-                if e.kind() == ErrorKind::WouldBlock {
-                    0
-                } else {
-                    // We don't know how to handle any other write error, so we'll send it up
-                    // the call chain.
-                    return Err(Error::StreamWrite(e));
-                }
-            }
+        let (written, result) = match self.stream.send(pkt) {
+            Ok(written) => (written, Ok(())),
+            Err((written, error)) => (written, Err(error)),
         };
-        // Move the "forwarded bytes" counter ahead by how much we were able to send out.
         self.fwd_cnt += Wrapping(written as u32);
-
-        // If we couldn't write the whole packet, we'll need to push the remaining data to our
-        // buffer.
-        if written < len {
-            self.buffer_pkt_bytes(pkt, written, len - written)?;
-        }
-
-        Ok(())
-    }
-
-    fn buffer_pkt_bytes(&mut self, pkt: &VsockPacket, offset: usize, len: usize) -> Result<()> {
-        self.tx_buf.push_from(pkt, offset, len)
+        result
     }
 
     /// Propagate a guest send-side half-close to the host stream, so the host peer reads an EOF.
     /// This is deferred while the TX buffer still holds guest data, since shutting down the write
     /// half now would drop those not-yet-flushed bytes; `notify()` retries once the buffer drains.
     fn shutdown_host_write_side(&mut self) {
-        if self.host_write_shutdown || !self.tx_buf.is_empty() {
+        let tx_state = self.stream.tx_state();
+        if self.host_write_shutdown || tx_state == TxState::Partial || tx_state == TxState::Pending
+        {
             return;
         }
         // SAFETY: the stream owns the socket fd by construction and `shutdown` doesn't touch process
@@ -747,8 +721,11 @@ where
     }
 
     /// Check if the credit information the peer has last received from us is outdated.
-    ///
     fn peer_needs_credit_update(&self) -> bool {
+        if self.stream.socket_type() == SocketType::SeqPacket {
+            return self.fwd_cnt != self.last_fwd_cnt_to_peer;
+        }
+
         let peer_seen_free_buf =
             Wrapping(defs::CONN_TX_BUF_SIZE) - (self.fwd_cnt - self.last_fwd_cnt_to_peer);
         peer_seen_free_buf < Wrapping(defs::CONN_CREDIT_UPDATE_THRESHOLD)
@@ -756,20 +733,17 @@ where
 
     /// Check if we need to ask the peer for a credit update before sending any more data its
     /// way.
-    ///
     fn need_credit_update_from_peer(&self) -> bool {
-        self.peer_avail_credit() == 0
+        self.stream.rx_state(self.peer_avail_credit()) == RxState::WaitingForCredit
     }
 
     /// Get the maximum number of bytes that we can send to our peer, without overflowing its
     /// buffer.
-    ///
     fn peer_avail_credit(&self) -> usize {
         (Wrapping(self.peer_buf_alloc) - (self.rx_cnt - self.peer_fwd_cnt)).0 as usize
     }
 
     /// Prepare a packet header for transmission to our peer.
-    ///
     fn init_pkt<'a>(&self, pkt: &'a mut VsockPacket) -> &'a mut VsockPacket {
         // Make sure the header is zeroed-out first.
         // This looks sub-optimal, but it is actually optimized-out in the compiled code to be
@@ -782,7 +756,7 @@ where
             .set_dst_cid(self.peer_cid)
             .set_src_port(self.local_port)
             .set_dst_port(self.peer_port)
-            .set_type(uapi::VSOCK_TYPE_STREAM)
+            .set_type(self.stream.socket_type().into())
             .set_buf_alloc(defs::CONN_TX_BUF_SIZE)
             .set_fwd_cnt(self.fwd_cnt.0)
     }
@@ -790,17 +764,19 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::io::{Error as IoError, Result as IoResult};
-    use std::{result, thread};
+    use std::io::{Error as IoError, Read, Result as IoResult, Write};
+    use std::os::fd::AsRawFd;
+    use std::{cmp, result, thread};
 
     use libc::EFD_NONBLOCK;
     use virtio_queue::QueueOwnedT;
     use vm_memory::bitmap::BitmapSlice;
-    use vm_memory::{VolatileMemoryError, VolatileSlice};
+    use vm_memory::{ReadVolatile, VolatileMemoryError, VolatileSlice, WriteVolatile};
     use vmm_sys_util::eventfd::EventFd;
 
     use super::super::super::tests::TestContext;
     use super::super::defs as csm_defs;
+    use super::super::stream::StreamTransport;
     use super::*;
 
     const LOCAL_CID: u64 = 2;
@@ -908,7 +884,7 @@ mod tests {
 
     impl<S> VsockConnection<S>
     where
-        S: Read + ReadVolatile + Write + WriteVolatile + AsRawFd,
+        S: Transport + ?Sized,
     {
         /// Get the fwd_cnt value from the connection.
         pub(crate) fn fwd_cnt(&self) -> Wrapping<u32> {
@@ -947,7 +923,7 @@ mod tests {
     struct CsmTestContext {
         _vsock_test_ctx: TestContext,
         pkt: VsockPacket,
-        conn: VsockConnection<TestStream>,
+        conn: VsockConnection<StreamTransport<TestStream>>,
     }
 
     impl CsmTestContext {
@@ -958,7 +934,7 @@ mod tests {
         fn new(conn_state: ConnState) -> Self {
             let vsock_test_ctx = TestContext::new();
             let mut handler_ctx = vsock_test_ctx.create_epoll_handler_context();
-            let stream = TestStream::new();
+            let stream = Box::new(StreamTransport::from(TestStream::new()));
             let mut pkt = VsockPacket::from_rx_virtq_head(
                 &mut handler_ctx.handler.queues[0]
                     .iter(&vsock_test_ctx.mem)
@@ -969,19 +945,23 @@ mod tests {
             )
             .unwrap();
             let conn = match conn_state {
-                ConnState::PeerInit => VsockConnection::<TestStream>::new_peer_init(
-                    stream,
-                    LOCAL_CID,
-                    PEER_CID,
-                    LOCAL_PORT,
-                    PEER_PORT,
-                    PEER_BUF_ALLOC,
-                ),
-                ConnState::LocalInit => VsockConnection::<TestStream>::new_local_init(
-                    stream, LOCAL_CID, PEER_CID, LOCAL_PORT, PEER_PORT,
-                ),
+                ConnState::PeerInit => {
+                    VsockConnection::<StreamTransport<TestStream>>::new_peer_init(
+                        stream,
+                        LOCAL_CID,
+                        PEER_CID,
+                        LOCAL_PORT,
+                        PEER_PORT,
+                        PEER_BUF_ALLOC,
+                    )
+                }
+                ConnState::LocalInit => {
+                    VsockConnection::<StreamTransport<TestStream>>::new_local_init(
+                        stream, LOCAL_CID, PEER_CID, LOCAL_PORT, PEER_PORT,
+                    )
+                }
                 ConnState::Established => {
-                    let mut conn = VsockConnection::<TestStream>::new_peer_init(
+                    let mut conn = VsockConnection::<StreamTransport<TestStream>>::new_peer_init(
                         stream,
                         LOCAL_CID,
                         PEER_CID,
@@ -1005,7 +985,7 @@ mod tests {
         }
 
         fn set_stream(&mut self, stream: TestStream) {
-            self.conn.stream = stream;
+            self.conn.stream.stream = stream;
         }
 
         fn set_peer_credit(&mut self, credit: u32) {
@@ -1112,7 +1092,7 @@ mod tests {
         let mut ctx = CsmTestContext::new_established();
         let data = &[1, 2, 3, 4];
         ctx.set_stream(TestStream::new_with_read_buf(data));
-        assert_eq!(ctx.conn.get_polled_fd(), ctx.conn.stream.as_raw_fd());
+        assert_eq!(ctx.conn.get_polled_fd(), ctx.conn.stream.stream.as_raw_fd());
         ctx.notify_epollin();
         ctx.recv();
         assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RW);
@@ -1130,6 +1110,91 @@ mod tests {
         ctx.notify_epollin();
         ctx.recv();
         assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RST);
+    }
+
+    #[test]
+    fn test_peer_recv_shutdown_drops_stale_rx() {
+        let mut ctx = CsmTestContext::new_established();
+        // A full read leaves RX pending while the host stream cannot take writes.
+        let cap = ctx.pkt.buf_capacity().unwrap();
+        let mut stream = TestStream::new_with_read_buf(&vec![7u8; cap]);
+        stream.write_state = StreamState::WouldBlock;
+        ctx.set_stream(stream);
+        ctx.notify_epollin();
+        ctx.recv();
+        assert!(ctx.conn.has_pending_rx());
+
+        // The guest data is buffered, then the guest shuts down both directions.
+        ctx.init_data_pkt(&[1, 2, 3, 4]);
+        ctx.send();
+        ctx.init_pkt(uapi::VSOCK_OP_SHUTDOWN, 0)
+            .set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_RCV | uapi::VSOCK_FLAGS_SHUTDOWN_SEND);
+        ctx.send();
+        assert_eq!(ctx.conn.state, ConnState::PeerClosed(true, true));
+        // The shutdown drops the pending RX, but the buffered guest data still reaches the host.
+        match ctx.conn.recv_pkt(&mut ctx.pkt) {
+            Err(VsockError::NoData) => (),
+            other => panic!("{other:?}"),
+        }
+
+        ctx.conn.stream.stream.write_state = StreamState::Ready;
+        ctx.notify_epollout();
+        assert_eq!(ctx.conn.stream.stream.write_buf.as_slice(), &[1, 2, 3, 4]);
+        ctx.recv();
+        assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RST);
+    }
+
+    #[test]
+    fn test_peer_recv_shutdown_keeps_host_hangup() {
+        let mut ctx = CsmTestContext::new_established();
+        ctx.set_stream(TestStream::new());
+        // The host hangs up before the guest shuts down its receive side.
+        ctx.notify_epollin_hup();
+        ctx.init_pkt(uapi::VSOCK_OP_SHUTDOWN, 0)
+            .set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_RCV);
+        ctx.send();
+        // The hang-up still reaches the guest as an RST.
+        assert_eq!(ctx.conn.state, ConnState::PeerClosed(true, false));
+        assert!(ctx.conn.has_pending_rx());
+        ctx.recv();
+        assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RST);
+    }
+
+    #[test]
+    fn test_rx_data_full_buffer_stays_pending() {
+        let mut ctx = CsmTestContext::new_established();
+        let cap = ctx.pkt.buf_capacity().unwrap();
+        let data: Vec<u8> = (0..cap * 2 + 7).map(|i| i as u8).collect();
+        ctx.set_stream(TestStream::new_with_read_buf(&data));
+        ctx.notify_epollin();
+
+        // Full reads keep the connection due until the stream runs dry.
+        for chunk in data.chunks(cap) {
+            ctx.recv();
+            assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RW);
+            assert_eq!(ctx.pkt_data().as_slice(), chunk);
+        }
+        assert!(!ctx.conn.has_pending_rx());
+
+        // A read that exactly fills the buffer stays due, and the next read clears it.
+        ctx.set_stream(TestStream::new_with_read_buf(&data[..cap]));
+        ctx.notify_epollin();
+        ctx.recv();
+        assert!(ctx.conn.has_pending_rx());
+        match ctx.conn.recv_pkt(&mut ctx.pkt) {
+            Err(VsockError::NoData) => (),
+            other => panic!("{other:?}"),
+        }
+        assert!(!ctx.conn.has_pending_rx());
+        assert_eq!(ctx.conn.state, ConnState::Established);
+
+        ctx.set_stream(TestStream::new_with_read_buf(&data));
+        // With credit for only one buffer, the connection is not kept due.
+        ctx.set_peer_credit(cap as u32);
+        ctx.notify_epollin();
+        ctx.recv();
+        assert_eq!(ctx.pkt.len() as usize, cap);
+        assert!(!ctx.conn.has_pending_rx());
     }
 
     #[test]
@@ -1203,7 +1268,7 @@ mod tests {
         let data = &[5, 6, 7, 8];
         ctx.init_data_pkt(data);
         ctx.send();
-        assert_eq!(ctx.conn.stream.write_buf, data.to_vec());
+        assert_eq!(ctx.conn.stream.stream.write_buf, data.to_vec());
     }
 
     #[test]
@@ -1280,7 +1345,7 @@ mod tests {
         let data = &[1, 2, 3, 4];
         ctx.init_data_pkt(data);
         ctx.send();
-        assert!(ctx.conn.stream.write_buf.is_empty());
+        assert!(ctx.conn.stream.stream.write_buf.is_empty());
 
         ctx.recv();
         assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RST);
@@ -1297,7 +1362,7 @@ mod tests {
         let data = &[1, 2, 3, 4];
         ctx.init_data_pkt(data);
         ctx.send();
-        assert!(!ctx.conn.tx_buf.is_empty());
+        assert!(!ctx.conn.stream.tx_buf.is_empty());
 
         // The host has already half-closed its send side.
         ctx.conn.state = ConnState::LocalClosed(false, true);
@@ -1312,7 +1377,7 @@ mod tests {
         // Once the buffer drains, an RST is queued.
         ctx.set_stream(TestStream::new());
         ctx.notify_epollout();
-        assert!(ctx.conn.tx_buf.is_empty());
+        assert!(ctx.conn.stream.tx_buf.is_empty());
         assert!(ctx.conn.has_pending_rx());
         ctx.recv();
         assert_eq!(ctx.pkt.op(), uapi::VSOCK_OP_RST);
@@ -1373,8 +1438,8 @@ mod tests {
 
             ctx.init_data_pkt(data);
             ctx.send();
-            assert_eq!(ctx.conn.stream.write_buf.len(), 0);
-            assert!(ctx.conn.tx_buf.is_empty());
+            assert_eq!(ctx.conn.stream.stream.write_buf.len(), 0);
+            assert!(ctx.conn.stream.tx_buf.is_empty());
         }
 
         // Test case:
@@ -1388,7 +1453,7 @@ mod tests {
             let data = &[1, 2, 3, 4];
             ctx.init_data_pkt(data);
             ctx.send();
-            assert_eq!(ctx.conn.stream.write_buf, data.to_vec());
+            assert_eq!(ctx.conn.stream.stream.write_buf, data.to_vec());
 
             ctx.notify_epollin();
             ctx.recv();
@@ -1420,7 +1485,7 @@ mod tests {
         let data = &[1, 2, 3, 4];
         ctx.init_data_pkt(data);
         ctx.send();
-        assert!(!ctx.conn.tx_buf.is_empty());
+        assert!(!ctx.conn.stream.tx_buf.is_empty());
 
         ctx.init_pkt(uapi::VSOCK_OP_SHUTDOWN, 0)
             .set_flags(uapi::VSOCK_FLAGS_SHUTDOWN_SEND);
@@ -1431,7 +1496,7 @@ mod tests {
         // Once the buffer drains, the shutdown is issued.
         ctx.set_stream(TestStream::new());
         ctx.notify_epollout();
-        assert!(ctx.conn.tx_buf.is_empty());
+        assert!(ctx.conn.stream.tx_buf.is_empty());
         assert!(ctx.conn.host_write_shutdown);
     }
 
@@ -1527,14 +1592,14 @@ mod tests {
                     .get_polled_evset()
                     .contains(epoll::Events::EPOLLOUT)
             );
-            assert_eq!(ctx.conn.tx_buf.len(), data.len());
+            assert_eq!(ctx.conn.stream.tx_buf.len(), data.len());
 
             // Unlock the write stream and notify the connection it can now write its buffered
             // data.
             ctx.set_stream(TestStream::new());
             ctx.conn.notify(epoll::Events::EPOLLOUT);
-            assert!(ctx.conn.tx_buf.is_empty());
-            assert_eq!(ctx.conn.stream.write_buf, data);
+            assert!(ctx.conn.stream.tx_buf.is_empty());
+            assert_eq!(ctx.conn.stream.stream.write_buf, data);
         }
     }
 

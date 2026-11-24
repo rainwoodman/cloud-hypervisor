@@ -42,6 +42,7 @@ impl From<GicState> for MshvGicV2MState {
             GicState::MshvGicV2M(state) => state,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("GicState is not valid"),
         }
     }
@@ -101,6 +102,20 @@ impl Vgic for MshvGicV2M {
             self.redists_addr,
             self.redists_size,
         ]
+    }
+
+    fn config(&self) -> VgicConfig {
+        VgicConfig {
+            vcpu_count: self.vcpu_count,
+            dist_addr: self.dist_addr,
+            dist_size: self.dist_size,
+            redists_addr: self.redists_addr,
+            redists_size: self.redists_size,
+            msi_addr: self.gits_addr,
+            msi_size: self.gits_size,
+            nr_irqs: 0,
+            maintenance_irq: None,
+        }
     }
 
     fn state(&self) -> Result<GicState> {

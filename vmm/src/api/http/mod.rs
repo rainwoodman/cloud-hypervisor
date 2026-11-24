@@ -37,6 +37,7 @@ use crate::api::{
 };
 use crate::config::ValidationError;
 use crate::device_manager::DeviceManagerError;
+use crate::external_fds::{ScmRightsError, UpdateFdsError};
 use crate::landlock::Landlock;
 use crate::locked_unix_listener::{LockedUnixListener, LockedUnixListenerError};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
@@ -80,13 +81,24 @@ pub enum HttpError {
     /// Error from internal API
     #[error("Error from API")]
     ApiError(#[source] ApiError),
+
+    /// Error from SCM_RIGHTS file descriptors
+    #[error("Error from SCM_RIGHTS file descriptors")]
+    ScmRightsError(#[from] ScmRightsError),
+
+    /// Error updating file descriptors
+    #[error("Error updating file descriptors")]
+    FdError(#[from] UpdateFdsError),
 }
 
 impl HttpError {
     /// Returns the HTTP status code that best matches this error.
     fn status_code(&self) -> StatusCode {
         match self {
-            HttpError::SerdeJsonDeserialize(_) | HttpError::BadRequest => StatusCode::BadRequest,
+            HttpError::SerdeJsonDeserialize(_)
+            | HttpError::BadRequest
+            | HttpError::ScmRightsError(_)
+            | HttpError::FdError(_) => StatusCode::BadRequest,
             HttpError::NotFound => StatusCode::NotFound,
             HttpError::TooManyRequests => StatusCode::TooManyRequests,
             HttpError::InternalServerError => StatusCode::InternalServerError,
@@ -167,11 +179,10 @@ pub trait EndpointHandler {
         api_notifier: EventFd,
         api_sender: Sender<ApiRequest>,
     ) -> Response {
-        // Cloning the files here is very important as it dup() the file
-        // descriptors, leaving open the one that was received. This way,
-        // rebooting the VM will work since the VM will be created from the
-        // original file descriptors.
-        let files = req.files.iter().map(|f| f.try_clone().unwrap()).collect();
+        // Obtain ownership independently of the borrowed HTTP request.
+        let Ok(files) = req.files.iter().map(File::try_clone).collect() else {
+            return error_response(HttpError::InternalServerError);
+        };
         let res = match req.method() {
             Method::Put => self.put_handler(api_notifier, api_sender, &req.body, files),
             Method::Get => self.get_handler(api_notifier, api_sender, &req.body),

@@ -14,6 +14,9 @@ use std::{convert, io, ptr, result};
 
 use thiserror::Error;
 
+const BUS_DEFAULT_READ_VALUE: u8 = 0x00;
+const BUS_UNASSIGNED_READ_VALUE: u8 = 0xff;
+
 /// Trait for devices that respond to reads or writes in an arbitrary address space.
 ///
 /// The device does not care where it exists in address space as each method is only given an offset
@@ -61,9 +64,9 @@ pub enum Error {
     /// Failed to operate on zero sized range.
     #[error("Failed to operate on zero sized range")]
     ZeroSizedRange,
-    /// Failed to find address range.
-    #[error("Failed to find address range")]
-    MissingAddressRange,
+    /// Failed to find unassigned address range.
+    #[error("No device assigned to address {0:#x}")]
+    UnassignedAddressRange(u64),
 }
 
 pub(crate) type Result<T> = result::Result<T, Error>;
@@ -158,21 +161,17 @@ impl Bus {
             return Err(Error::Overlap);
         }
 
+        let mut devices = self.devices.write().unwrap();
+
         // Reject all cases where the new device's range overlaps with an existing device.
-        if self
-            .devices
-            .read()
-            .unwrap()
+        if devices
             .iter()
             .any(|(range, _dev)| range.overlaps(base, len))
         {
             return Err(Error::Overlap);
         }
 
-        if self
-            .devices
-            .write()
-            .unwrap()
+        if devices
             .insert(BusRange { base, len }, Arc::downgrade(&device))
             .is_some()
         {
@@ -194,7 +193,7 @@ impl Bus {
         let bus_range = BusRange { base, len };
 
         if self.devices.write().unwrap().remove(&bus_range).is_none() {
-            return Err(Error::MissingAddressRange);
+            return Err(Error::UnassignedAddressRange(base));
         }
 
         Ok(())
@@ -231,7 +230,7 @@ impl Bus {
         let device = if let Some((_, _, dev)) = self.resolve(old_base) {
             Arc::clone(&dev)
         } else {
-            return Err(Error::MissingAddressRange);
+            return Err(Error::UnassignedAddressRange(old_base));
         };
 
         // Remove the old address range
@@ -242,15 +241,19 @@ impl Bus {
     }
 
     /// Reads data from the device that owns the range containing `addr` and puts it into `data`.
+    ///
+    /// Fills the buffer with BUS_DEFAULT_READ_VALUE before dispatching the read to the owning
+    /// device. Fills the buffer with BUS_UNASSIGNED_READ_VALUE if no device owns the range.
     pub fn read(&self, addr: u64, data: &mut [u8]) -> Result<()> {
-        // The Linux kernel, quite reasonably, doesn't zero the memory it gives us.
-        data.fill(0);
         if let Some((base, offset, dev)) = self.resolve(addr) {
+            // The Linux kernel doesn't zero the memory it gives us.
+            data.fill(BUS_DEFAULT_READ_VALUE);
             // OK to unwrap as lock() failing is a serious error condition and should panic.
             dev.read(base, offset, data);
             Ok(())
         } else {
-            Err(Error::MissingAddressRange)
+            data.fill(BUS_UNASSIGNED_READ_VALUE);
+            Err(Error::UnassignedAddressRange(addr))
         }
     }
 
@@ -262,7 +265,7 @@ impl Bus {
             // OK to unwrap as lock() failing is a serious error condition and should panic.
             Ok(dev.write(base, offset, data))
         } else {
-            Err(Error::MissingAddressRange)
+            Err(Error::UnassignedAddressRange(addr))
         }
     }
 }
@@ -394,5 +397,16 @@ mod tests {
         // Range where base + len overflows u64 (equals 2^64).
         let res = bus.insert(dev, 0xffff_0000_0000_0000, 0x0001_0000_0000_0000);
         assert!(res.is_err(), "Overflowing address range must be rejected");
+    }
+
+    #[test]
+    fn bus_read_unassigned() {
+        let bus = Bus::new();
+        let mut values = [0, 1, 2, 3];
+        assert!(matches!(
+            bus.read(0x10, &mut values).unwrap_err(),
+            Error::UnassignedAddressRange(addr) if addr == 0x10
+        ));
+        assert_eq!(values, [BUS_UNASSIGNED_READ_VALUE; 4]);
     }
 }

@@ -17,7 +17,7 @@ In this exercise, [WinDbg](https://docs.microsoft.com/en-us/windows-hardware/dri
 
 ## Debuggee VM configuration
 
-The debuggee VM is the one that we've learned to configure and run in the first section. There might be various reasons to debug. For example, there could be an issue in the Windows guest with an emulated device or an included driver. Or, we might want to develop a custom feature like a kernel driver to be available in the guest.
+There might be various reasons to debug. For example, there could be an issue in the Windows guest with an emulated device or an included driver. Or, we might want to develop a custom feature like a kernel driver to be available in the guest.
 
 Note, that there are several ways to debug Windows, not all of them need to be enabled at the same time. For example, if developing a kernel module, the only useful options would be to configure for the serial debugging and enable the kernel debug. In that case, any crash or misbehavior in the boot loader or kernel would be ignored. The commands below must be run as administrator on the debuggee guest VM.
 
@@ -63,9 +63,9 @@ Run the Windows guest under Cloud Hypervisor and expose the guest serial port on
 
 ```shell
 sudo ./target/release/cloud-hypervisor \
-	--cpus boot=4 \
+	--cpus boot=4,kvm_hyperv=on \
 	--memory size=8192M \
-	--kernel ./$OVMF_DIR/CLOUDHV.fd \
+	--firmware ./$OVMF_DIR/CLOUDHV.fd \
 	--disk path=./$IMG_FILE,image_type=raw \
 	--console off \
 	--serial socket=/tmp/serial.sock \

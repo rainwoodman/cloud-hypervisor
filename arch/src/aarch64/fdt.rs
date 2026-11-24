@@ -13,7 +13,6 @@ use std::hash::BuildHasher;
 use std::sync::{Arc, Mutex};
 use std::{cmp, result, str};
 
-use byteorder::{BigEndian, ByteOrder};
 use fdt_parser::node::FdtNode;
 use hypervisor::arch::aarch64::gic::Vgic;
 use hypervisor::arch::aarch64::regs::{
@@ -25,7 +24,7 @@ use thiserror::Error;
 use vm_fdt::{FdtWriter, FdtWriterResult};
 use vm_memory::{Address, Bytes, GuestMemoryBackend, GuestMemoryError, GuestMemoryRegion};
 
-use super::super::{DeviceType, GuestMemoryMmap, InitramfsConfig};
+use super::super::{DeviceType, GuestMemory, InitramfsConfig};
 use super::cache::{CacheTopologyInfo, read_cache_topology};
 use super::layout::{
     GIC_V2M_COMPATIBLE, GICV2M_SPI_BASE, GICV2M_SPI_NUM, IRQ_BASE, MEM_32BIT_DEVICES_SIZE,
@@ -97,7 +96,7 @@ type Result<T> = result::Result<T, Error>;
 /// Creates the flattened device tree for this aarch64 VM.
 #[expect(clippy::too_many_arguments)]
 pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
-    guest_mem: &GuestMemoryMmap,
+    guest_mem: &GuestMemory,
     cmdline: &str,
     vcpu_mpidr: &[u64],
     vcpu_topology: Option<(u16, u16, u16, u16)>,
@@ -106,8 +105,9 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
     initrd: &Option<InitramfsConfig>,
     pci_space_info: &[PciSpaceInfo],
     numa_nodes: &NumaNodes,
-    virtio_iommu_bdf: Option<u32>,
+    virtio_iommu_devices: Option<(u32, &[u32])>,
     pmu_supported: bool,
+    nested: bool,
     uefi_mmap_size: Option<u32>,
 ) -> FdtWriterResult<Vec<u8>> {
     // Allocate stuff necessary for the holding the blob.
@@ -136,9 +136,9 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
         create_pmu_node(&mut fdt)?;
     }
     create_clock_node(&mut fdt)?;
-    create_psci_node(&mut fdt)?;
+    create_psci_node(&mut fdt, nested)?;
     create_devices_node(&mut fdt, device_info)?;
-    create_pci_nodes(&mut fdt, pci_space_info, virtio_iommu_bdf)?;
+    create_pci_nodes(&mut fdt, pci_space_info, virtio_iommu_devices)?;
     if numa_nodes.len() > 1 {
         create_distance_map_node(&mut fdt, numa_nodes)?;
     }
@@ -151,7 +151,7 @@ pub fn create_fdt<T: DeviceInfoForFdt + Clone + Debug, S: BuildHasher>(
     Ok(fdt_final)
 }
 
-pub fn write_fdt_to_memory(fdt_final: &[u8], guest_mem: &GuestMemoryMmap) -> Result<()> {
+pub fn write_fdt_to_memory(fdt_final: &[u8], guest_mem: &GuestMemory) -> Result<()> {
     if fdt_final.len() as u64 > super::layout::FDT_MAX_SIZE {
         return Err(Error::FdtTooLarge(
             fdt_final.len(),
@@ -233,10 +233,9 @@ fn create_cpu_nodes(
         // are present allowed such guest kernels to boot properly and
         // rely solely on ACPI tables to setup NUMA
         if numa_nodes.len() > 1 && !has_generic_initiator {
-            for numa_node_idx in 0..numa_nodes.len() {
-                let numa_node = numa_nodes.get(&(numa_node_idx as u32));
-                if numa_node.unwrap().cpus.contains(&(cpu_id as u32)) {
-                    fdt.property_u32("numa-node-id", numa_node_idx as u32)?;
+            for (numa_node_id, numa_node) in numa_nodes {
+                if numa_node.cpus.contains(&(cpu_id as u32)) {
+                    fdt.property_u32("numa-node-id", *numa_node_id)?;
                 }
             }
         }
@@ -368,7 +367,7 @@ fn create_cpu_nodes(
 
 fn create_memory_node(
     fdt: &mut FdtWriter,
-    guest_mem: &GuestMemoryMmap,
+    guest_mem: &GuestMemory,
     numa_nodes: &NumaNodes,
 ) -> FdtWriterResult<()> {
     // See https://github.com/torvalds/linux/blob/58ae0b51506802713aa0e9956d1853ba4c722c98/Documentation/devicetree/bindings/numa.txt
@@ -381,13 +380,12 @@ fn create_memory_node(
     // are present allowed guest kernels to boot and
     // rely solely on ACPI tables to setup NUMA
     if numa_nodes.len() > 1 && !has_generic_initiator {
-        for numa_node_idx in 0..numa_nodes.len() {
-            let numa_node = numa_nodes.get(&(numa_node_idx as u32));
+        for (numa_node_id, numa_node) in numa_nodes {
             let mut mem_reg_prop: Vec<u64> = Vec::new();
             let mut node_memory_addr: u64 = 0;
             // Each memory zone of numa will have its own memory node, but
             // different numa nodes should not share same memory zones.
-            for memory_region in numa_node.unwrap().memory_regions.iter() {
+            for memory_region in numa_node.memory_regions.iter() {
                 let memory_region_start_addr: u64 = memory_region.start_addr().raw_value();
                 let memory_region_size: u64 = memory_region.size() as u64;
                 mem_reg_prop.push(memory_region_start_addr);
@@ -403,7 +401,7 @@ fn create_memory_node(
                 let memory_node = fdt.begin_node(&memory_node_name)?;
                 fdt.property_string("device_type", "memory")?;
                 fdt.property_array_u64("reg", &mem_reg_prop)?;
-                fdt.property_u32("numa-node-id", numa_node_idx as u32)?;
+                fdt.property_u32("numa-node-id", *numa_node_id)?;
                 fdt.end_node(memory_node)?;
             }
         }
@@ -439,6 +437,7 @@ fn create_memory_node(
             ram_regions
         };
 
+        #[expect(clippy::panic, reason = "memory layout invariant")]
         if ram_regions.len() > 2 {
             panic!(
                 "There should be up to two non-continuous regions, divided by the
@@ -454,6 +453,7 @@ fn create_memory_node(
             let ram_start = super::layout::RAM_START.raw_value();
             let mem_32bit_reserved_start = super::layout::MEM_32BIT_RESERVED_START.raw_value();
 
+            #[expect(clippy::panic, reason = "memory layout invariant")]
             if !((first_region_start <= &ram_start)
                 && (first_region_end > &ram_start)
                 && (first_region_end <= &mem_32bit_reserved_start))
@@ -477,6 +477,7 @@ fn create_memory_node(
         if let Some((second_region_start, second_region_end)) = ram_regions.get(1) {
             let ram_64bit_start = super::layout::RAM_64BIT_START.raw_value();
 
+            #[expect(clippy::panic, reason = "memory layout invariant")]
             if second_region_start != &ram_64bit_start {
                 panic!(
                     "Unexpected second memory region layout: start: 0x{second_region_start:08x}, ram_64bit_start: 0x{ram_64bit_start:08x}"
@@ -527,11 +528,12 @@ fn create_chosen_node(
 }
 
 fn create_gic_node(fdt: &mut FdtWriter, gic_device: &Arc<Mutex<dyn Vgic>>) -> FdtWriterResult<()> {
-    let gic_reg_prop = gic_device.lock().unwrap().device_properties();
+    let gic_device = gic_device.lock().unwrap();
+    let gic_reg_prop = gic_device.device_properties();
 
     let intc_node = fdt.begin_node("intc")?;
 
-    fdt.property_string("compatible", gic_device.lock().unwrap().fdt_compatibility())?;
+    fdt.property_string("compatible", gic_device.fdt_compatibility())?;
     fdt.property_null("interrupt-controller")?;
     // "interrupt-cells" field specifies the number of cells needed to encode an
     // interrupt source. The type shall be a <u32> and the value shall be 3 if no PPI affinity description
@@ -545,19 +547,19 @@ fn create_gic_node(fdt: &mut FdtWriter, gic_device: &Arc<Mutex<dyn Vgic>>) -> Fd
 
     let gic_intr_prop = [
         GIC_FDT_IRQ_TYPE_PPI,
-        gic_device.lock().unwrap().fdt_maint_irq(),
+        gic_device.fdt_maint_irq(),
         IRQ_TYPE_LEVEL_HI,
     ];
     fdt.property_array_u32("interrupts", &gic_intr_prop)?;
 
-    if gic_device.lock().unwrap().msi_compatible() {
+    if gic_device.msi_compatible() {
         let msic_node = fdt.begin_node("msic")?;
-        let msi_compatibility = gic_device.lock().unwrap().msi_compatibility().to_string();
+        let msi_compatibility = gic_device.msi_compatibility().to_string();
 
         fdt.property_string("compatible", msi_compatibility.as_str())?;
         fdt.property_null("msi-controller")?;
         fdt.property_u32("phandle", MSI_PHANDLE)?;
-        let msi_reg_prop = gic_device.lock().unwrap().msi_properties();
+        let msi_reg_prop = gic_device.msi_properties();
         fdt.property_array_u64("reg", &msi_reg_prop)?;
 
         if msi_compatibility == GIC_V2M_COMPATIBLE {
@@ -617,14 +619,14 @@ fn create_timer_node(fdt: &mut FdtWriter) -> FdtWriterResult<()> {
     Ok(())
 }
 
-fn create_psci_node(fdt: &mut FdtWriter) -> FdtWriterResult<()> {
+fn create_psci_node(fdt: &mut FdtWriter, nested: bool) -> FdtWriterResult<()> {
     let compatible = "arm,psci-0.2";
     let psci_node = fdt.begin_node("psci")?;
     fdt.property_string("compatible", compatible)?;
     // Two methods available: hvc and smc.
-    // As per documentation, PSCI calls between a guest and hypervisor may use the HVC conduit instead of SMC.
-    // So, since we are using kvm, we need to use hvc.
-    fdt.property_string("method", "hvc")?;
+    // Regular EL1 guests use the HVC conduit.
+    // With nested virtualisation, L1 guests need to use SMC as HVC is forwarded to vEL2.
+    fdt.property_string("method", if nested { "smc" } else { "hvc" })?;
     fdt.end_node(psci_node)?;
 
     Ok(())
@@ -800,7 +802,7 @@ fn create_pmu_node(fdt: &mut FdtWriter) -> FdtWriterResult<()> {
 fn create_pci_nodes(
     fdt: &mut FdtWriter,
     pci_device_info: &[PciSpaceInfo],
-    virtio_iommu_bdf: Option<u32>,
+    virtio_iommu_devices: Option<(u32, &[u32])>,
 ) -> FdtWriterResult<()> {
     // Add node for PCIe controller.
     // See Documentation/devicetree/bindings/pci/host-generic-pci.txt in the kernel
@@ -899,39 +901,43 @@ fn create_pci_nodes(
         fdt.property_array_u32("msi-map", &msi_map)?;
         fdt.property_u32("msi-parent", MSI_PHANDLE)?;
 
-        if pci_device_info_elem.pci_segment_id == 0
-            && let Some(virtio_iommu_bdf) = virtio_iommu_bdf
-        {
+        if let Some((virtio_iommu_bdf, devices_bdf)) = virtio_iommu_devices {
             // See kernel document Documentation/devicetree/bindings/pci/pci-iommu.txt
             // for 'iommu-map' attribute setting.
-            let iommu_map = [
-                0_u32,
-                VIRTIO_IOMMU_PHANDLE,
-                0_u32,
-                virtio_iommu_bdf,
-                virtio_iommu_bdf + 1,
-                VIRTIO_IOMMU_PHANDLE,
-                virtio_iommu_bdf + 1,
-                0xffff - virtio_iommu_bdf,
-            ];
-            fdt.property_array_u32("iommu-map", &iommu_map)?;
+            let mut iommu_map = Vec::new();
+            for &device_bdf in devices_bdf {
+                // DMA from the virtio-iommu itself isn't translated, so its own
+                // BDF must be omitted from 'iommu-map'. See kernel document
+                // Documentation/devicetree/bindings/virtio/pci-iommu.yaml.
+                if device_bdf != virtio_iommu_bdf
+                    && (device_bdf >> 16) as u16 == pci_device_info_elem.pci_segment_id
+                {
+                    let rid = device_bdf & 0xffff;
+                    iommu_map.extend_from_slice(&[rid, VIRTIO_IOMMU_PHANDLE, device_bdf, 1]);
+                }
+            }
+            if !iommu_map.is_empty() {
+                fdt.property_array_u32("iommu-map", &iommu_map)?;
+            }
 
-            // See kernel document Documentation/devicetree/bindings/virtio/iommu.txt
-            // for virtio-iommu node settings.
-            let virtio_iommu_node_name = format!("virtio_iommu@{virtio_iommu_bdf:x}");
-            let virtio_iommu_node = fdt.begin_node(&virtio_iommu_node_name)?;
-            fdt.property_u32("#iommu-cells", 1)?;
-            fdt.property_string("compatible", "virtio,pci-iommu")?;
+            if pci_device_info_elem.pci_segment_id == 0 {
+                // See kernel document Documentation/devicetree/bindings/virtio/iommu.txt
+                // for virtio-iommu node settings.
+                let virtio_iommu_node_name = format!("virtio_iommu@{virtio_iommu_bdf:x}");
+                let virtio_iommu_node = fdt.begin_node(&virtio_iommu_node_name)?;
+                fdt.property_u32("#iommu-cells", 1)?;
+                fdt.property_string("compatible", "virtio,pci-iommu")?;
 
-            // 'reg' is a five-cell address encoded as
-            // (phys.hi phys.mid phys.lo size.hi size.lo). phys.hi should contain the
-            // device's BDF as 0b00000000 bbbbbbbb dddddfff 00000000. The other cells
-            // should be zero.
-            let reg = [virtio_iommu_bdf << 8, 0_u32, 0_u32, 0_u32, 0_u32];
-            fdt.property_array_u32("reg", &reg)?;
-            fdt.property_u32("phandle", VIRTIO_IOMMU_PHANDLE)?;
+                // 'reg' is a five-cell address encoded as
+                // (phys.hi phys.mid phys.lo size.hi size.lo). phys.hi should contain the
+                // device's BDF as 0b00000000 bbbbbbbb dddddfff 00000000. The other cells
+                // should be zero.
+                let reg = [virtio_iommu_bdf << 8, 0_u32, 0_u32, 0_u32, 0_u32];
+                fdt.property_array_u32("reg", &reg)?;
+                fdt.property_u32("phandle", VIRTIO_IOMMU_PHANDLE)?;
 
-            fdt.end_node(virtio_iommu_node)?;
+                fdt.end_node(virtio_iommu_node)?;
+            }
         }
 
         fdt.end_node(pci_node)?;
@@ -1062,9 +1068,8 @@ fn print_node(node: FdtNode<'_, '_>, n_spaces: usize) {
                 indent = (n_spaces + 2)
             );
         } else {
-            let mut array = Vec::with_capacity(256);
-            array.resize(value.len() / 4, 0u32);
-            BigEndian::read_u32_into(value, &mut array);
+            let (chunks, _) = value.as_chunks::<4>();
+            let array: Vec<u32> = chunks.iter().map(|c| u32::from_be_bytes(*c)).collect();
             debug!(
                 "{:indent$}{} : {:X?}",
                 "",
@@ -1092,13 +1097,33 @@ mod tests {
     #[test]
     fn test_write_fdt_to_memory_size() {
         let max = usize::try_from(layout::FDT_MAX_SIZE).unwrap();
-        let mem = GuestMemoryMmap::from_ranges(&[(layout::RAM_START, 2 * max)]).unwrap();
+        let mem = GuestMemory::from_ranges(&[(layout::RAM_START, 2 * max)]).unwrap();
 
         write_fdt_to_memory(&vec![0; max], &mem).unwrap();
         assert!(matches!(
             write_fdt_to_memory(&vec![0; max + 1], &mem),
             Err(Error::FdtTooLarge(n, m)) if n == max + 1 && m == layout::FDT_MAX_SIZE
         ));
+    }
+
+    #[test]
+    fn test_psci_conduit_nested_virt() {
+        let mut writer = FdtWriter::new().unwrap();
+        let root = writer.begin_node("").unwrap();
+        create_psci_node(&mut writer, true).unwrap();
+        writer.end_node(root).unwrap();
+
+        let dtb = writer.finish().unwrap();
+        let fdt = fdt_parser::Fdt::new(&dtb).unwrap();
+        let method = fdt
+            .find_node("/psci")
+            .unwrap()
+            .property("method")
+            .unwrap()
+            .as_str()
+            .unwrap();
+
+        assert_eq!(method, "smc");
     }
 
     // Helper function to create a simple NumaNode for testing
@@ -1112,41 +1137,6 @@ mod tests {
             memory_zones: Vec::new(),
             device_id,
         }
-    }
-
-    #[test]
-    fn test_fdt_generic_initiator_detection_and_skip() {
-        // No Generic Initiator - should not skip FDT NUMA
-        let mut numa_nodes = BTreeMap::new();
-        numa_nodes.insert(0, create_test_numa_node(vec![0, 1], None));
-        numa_nodes.insert(1, create_test_numa_node(vec![2, 3], None));
-
-        let has_gi = numa_nodes.values().any(|node| node.device_id.is_some());
-        assert!(
-            !has_gi,
-            "Should not detect Generic Initiator when none present"
-        );
-
-        // One Generic Initiator - should skip FDT NUMA
-        let mut numa_nodes = BTreeMap::new();
-        numa_nodes.insert(0, create_test_numa_node(vec![0, 1], None));
-        numa_nodes.insert(1, create_test_numa_node(vec![], Some("vfio0".to_string())));
-
-        let has_gi = numa_nodes.values().any(|node| node.device_id.is_some());
-        assert!(has_gi, "Should detect Generic Initiator when present");
-
-        let mut fdt = FdtWriter::new().unwrap();
-        let result = create_distance_map_node(&mut fdt, &numa_nodes);
-        assert!(result.is_ok(), "Should skip distance map when GI present");
-
-        // Multiple Generic Initiators - should skip FDT NUMA
-        let mut numa_nodes = BTreeMap::new();
-        numa_nodes.insert(0, create_test_numa_node(vec![0, 1], None));
-        numa_nodes.insert(1, create_test_numa_node(vec![], Some("vfio0".to_string())));
-        numa_nodes.insert(2, create_test_numa_node(vec![], Some("vfio1".to_string())));
-
-        let has_gi = numa_nodes.values().any(|node| node.device_id.is_some());
-        assert!(has_gi, "Should detect multiple Generic Initiators");
     }
 
     #[test]

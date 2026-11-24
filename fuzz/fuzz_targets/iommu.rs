@@ -8,20 +8,19 @@ use std::io;
 use std::mem::size_of;
 use std::sync::Arc;
 
+use cloud_hypervisor_fuzz::FuzzCursor;
 use libfuzzer_sys::{fuzz_target, Corpus};
 use seccompiler::SeccompAction;
 use virtio_devices::{
     AccessPlatformMapping, DmaRemapping, VirtioDevice, VirtioInterrupt, VirtioInterruptType,
 };
 use virtio_queue::{Queue, QueueT};
-use vm_device::dma_mapping::ExternalDmaMapping;
-use vm_memory::bitmap::AtomicBitmap;
+use vm_allocator::GuestMemory;
+use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryAtomic};
 use vm_migration::{Pausable, Snapshottable};
-use vm_virtio::AccessPlatform;
+use vm_virtio::{AccessPlatform, AccessType};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
-
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 
 macro_rules! align {
     ($n:expr, $align:expr) => {{
@@ -160,7 +159,7 @@ struct FuzzPlan {
 
 impl FuzzPlan {
     fn new(bytes: &[u8]) -> Self {
-        let mut stream = ByteStream::new(bytes);
+        let mut stream = FuzzCursor::new(bytes);
         let address_width_bits = if (stream.next_u8() & 1) == 0 {
             IOMMU_ADDR_WIDTH_BITS
         } else {
@@ -209,45 +208,6 @@ impl FuzzPlan {
     }
 }
 
-struct ByteStream<'a> {
-    bytes: &'a [u8],
-    cursor: usize,
-}
-
-impl<'a> ByteStream<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, cursor: 0 }
-    }
-
-    fn next_u8(&mut self) -> u8 {
-        let value = self.bytes[self.cursor % self.bytes.len()];
-        self.cursor = self.cursor.wrapping_add(1);
-        value
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        u32::from_le_bytes([
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-        ])
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        u64::from_le_bytes([
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-        ])
-    }
-}
-
 #[derive(Copy, Clone)]
 struct VirtqDesc {
     addr: u64,
@@ -271,17 +231,26 @@ impl FuzzExternalMapping {
 }
 
 impl ExternalDmaMapping for FuzzExternalMapping {
-    fn map(&self, _iova: u64, _gpa: u64, _size: u64) -> io::Result<()> {
+    fn map(&self, iova: u64, gpa: u64, size: u64) -> Result<(), ExternalDmaMappingError> {
         if self.fail_on_map {
-            Err(io::Error::other("fuzz map failure"))
+            Err(ExternalDmaMappingError::Map {
+                iova,
+                gpa,
+                size,
+                source: io::Error::from_raw_os_error(libc::EIO).into(),
+            })
         } else {
             Ok(())
         }
     }
 
-    fn unmap(&self, _iova: u64, _size: u64) -> io::Result<()> {
+    fn unmap(&self, iova: u64, size: u64) -> Result<(), ExternalDmaMappingError> {
         if self.fail_on_unmap {
-            Err(io::Error::other("fuzz unmap failure"))
+            Err(ExternalDmaMappingError::Unmap {
+                iova,
+                size,
+                source: io::Error::from_raw_os_error(libc::EIO).into(),
+            })
         } else {
             Ok(())
         }
@@ -317,11 +286,11 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
     iommu.write_config(IOMMU_BYPASS_CONFIG_OFFSET, &[1]);
     iommu.ack_features(VIRTIO_IOMMU_F_BYPASS_CONFIG_BIT);
     iommu.write_config(IOMMU_BYPASS_CONFIG_OFFSET, &[0]);
-    let _ = mapping.translate_gva(u32::MAX, 0x1000, 0x100);
+    let _ = mapping.translate_gva(u32::MAX, 0x1000, 0x100, AccessType::Read);
     iommu.write_config(IOMMU_BYPASS_CONFIG_OFFSET, &[1]);
-    let _ = mapping.translate_gva(u32::MAX, 0x1000, 0x100);
+    let _ = mapping.translate_gva(u32::MAX, 0x1000, 0x100, AccessType::Read);
     let _ = mapping.translate_gpa(u32::MAX, 0x1000, 0x100);
-    let _ = mapping.translate_gva(u32::MAX, 0x1000, 0);
+    let _ = mapping.translate_gva(u32::MAX, 0x1000, 0, AccessType::Read);
 
     install_external_mappings(&mut iommu, &fuzz_plan);
 
@@ -331,7 +300,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
     // with exactly the same shape as the 'request_queue'.
     let event_queue = setup_virt_queue();
 
-    let mem = GuestMemoryMmap::from_ranges(&[
+    let mem = GuestMemory::from_ranges(&[
         (GuestAddress(0), MEM_SIZE),
         (GuestAddress(DESC_TABLE_ADDR), QUEUE_BYTES_SIZE),
     ])
@@ -366,7 +335,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
     exercise_translation_paths(&mapping, &fuzz_plan);
 
     let access_mapping = AccessPlatformMapping::new(21, mapping.clone());
-    let _ = access_mapping.translate_gva(0x28100, 0x80);
+    let _ = access_mapping.translate_gva(0x28100, 0x80, AccessType::Read);
     let _ = access_mapping.translate_gpa(0x38100, 0x80);
 
     let _ = iommu.id();
@@ -395,6 +364,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
                 fuzz_plan.trans_ep_b,
                 fuzz_plan.trans_virt + PAGE_SIZE - 0x80,
                 0x100,
+                AccessType::Read,
             );
             let _ = restored.snapshot();
         }
@@ -664,7 +634,7 @@ fn baseline_chains() -> Vec<ChainSpec> {
 }
 
 fn append_fuzz_chains(chains: &mut Vec<ChainSpec>, bytes: &[u8], plan: &FuzzPlan) {
-    let mut stream = ByteStream::new(bytes);
+    let mut stream = FuzzCursor::new(bytes);
     append_guided_chains(chains, plan);
     let extra_chains = 1 + (stream.next_u8() as usize % 24);
     for _ in 0..extra_chains {
@@ -856,7 +826,7 @@ fn append_guided_chains(chains: &mut Vec<ChainSpec>, plan: &FuzzPlan) {
     ]);
 }
 
-fn next_fuzz_chain(stream: &mut ByteStream) -> ChainSpec {
+fn next_fuzz_chain(stream: &mut FuzzCursor) -> ChainSpec {
     let domain = stream.next_u32() % 64;
     let endpoint = stream.next_u32() % 128;
     let virt_start = pick_guest_page(stream.next_u64());
@@ -1006,7 +976,7 @@ fn append_u64(vec: &mut Vec<u8>, value: u64) {
     vec.extend_from_slice(&value.to_le_bytes());
 }
 
-fn write_request_queue(mem: &GuestMemoryMmap, chains: &[ChainSpec]) -> Result<(), ()> {
+fn write_request_queue(mem: &GuestMemory, chains: &[ChainSpec]) -> Result<(), ()> {
     let mut next_desc: u16 = 0;
     let mut next_payload_addr = PAYLOAD_ADDR_START;
     let mut avail_count: u16 = 0;
@@ -1110,7 +1080,7 @@ fn allocate_payload(next_payload_addr: &mut u64, len: u32) -> Option<u64> {
     Some(start)
 }
 
-fn write_desc(mem: &GuestMemoryMmap, desc_index: u16, desc: VirtqDesc) -> Result<(), ()> {
+fn write_desc(mem: &GuestMemory, desc_index: u16, desc: VirtqDesc) -> Result<(), ()> {
     let mut raw = [0u8; 16];
     raw[..8].copy_from_slice(&desc.addr.to_le_bytes());
     raw[8..12].copy_from_slice(&desc.len.to_le_bytes());
@@ -1123,7 +1093,7 @@ fn write_desc(mem: &GuestMemoryMmap, desc_index: u16, desc: VirtqDesc) -> Result
     .map_err(|_| ())
 }
 
-fn write_u16(mem: &GuestMemoryMmap, addr: u64, value: u16) -> Result<(), ()> {
+fn write_u16(mem: &GuestMemory, addr: u64, value: u16) -> Result<(), ()> {
     mem.write_slice(&value.to_le_bytes(), GuestAddress(addr))
         .map_err(|_| ())
 }
@@ -1164,19 +1134,39 @@ fn install_external_mappings(iommu: &mut virtio_devices::Iommu, plan: &FuzzPlan)
 }
 
 fn exercise_translation_paths(mapping: &Arc<virtio_devices::IommuMapping>, plan: &FuzzPlan) {
-    let _ = mapping.translate_gva(21, 0x28100, 0x100);
-    let _ = mapping.translate_gva(21, 0x28f00, 0x200);
+    let _ = mapping.translate_gva(21, 0x28100, 0x100, AccessType::Read);
+    let _ = mapping.translate_gva(21, 0x28f00, 0x200, AccessType::Read);
     let _ = mapping.translate_gpa(21, 0x38100, 0x100);
     let _ = mapping.translate_gpa(21, 0x38f00, 0x200);
-    let _ = mapping.translate_gva(21, 0x28100, 0);
-    let _ = mapping.translate_gva(plan.trans_ep_b, plan.trans_virt + PAGE_SIZE - 0x80, 0x100);
-    let _ = mapping.translate_gva(plan.trans_ep_b, plan.trans_virt + PAGE_SIZE, 2 * PAGE_SIZE);
-    let _ = mapping.translate_gva(plan.trans_ep_b, plan.trans_virt - PAGE_SIZE, 0x100);
-    let _ = mapping.translate_gva(plan.trans_ep_b, plan.trans_virt + 5 * PAGE_SIZE, 0x100);
-    let _ = mapping.translate_gva(plan.gap_ep, plan.gap_virt, 2 * PAGE_SIZE);
+    let _ = mapping.translate_gva(21, 0x28100, 0, AccessType::Read);
+    let _ = mapping.translate_gva(
+        plan.trans_ep_b,
+        plan.trans_virt + PAGE_SIZE - 0x80,
+        0x100,
+        AccessType::Read,
+    );
+    let _ = mapping.translate_gva(
+        plan.trans_ep_b,
+        plan.trans_virt + PAGE_SIZE,
+        2 * PAGE_SIZE,
+        AccessType::Read,
+    );
+    let _ = mapping.translate_gva(
+        plan.trans_ep_b,
+        plan.trans_virt - PAGE_SIZE,
+        0x100,
+        AccessType::Read,
+    );
+    let _ = mapping.translate_gva(
+        plan.trans_ep_b,
+        plan.trans_virt + 5 * PAGE_SIZE,
+        0x100,
+        AccessType::Read,
+    );
+    let _ = mapping.translate_gva(plan.gap_ep, plan.gap_virt, 2 * PAGE_SIZE, AccessType::Read);
     let _ = mapping.translate_gpa(plan.trans_ep_b, plan.trans_phys + 0x80, 0x100);
     let _ = mapping.translate_gpa(plan.trans_ep_b, plan.trans_phys + PAGE_SIZE - 0x80, 0x100);
-    let _ = mapping.translate_gva(plan.bypass_ep, plan.trans_virt, 0x100);
+    let _ = mapping.translate_gva(plan.bypass_ep, plan.trans_virt, 0x100, AccessType::Read);
     let _ = mapping.translate_gpa(plan.bypass_ep, plan.trans_phys, 0x100);
-    let _ = mapping.translate_gva(plan.trans_ep_b, u64::MAX - 0x10, 0x100);
+    let _ = mapping.translate_gva(plan.trans_ep_b, u64::MAX - 0x10, 0x100, AccessType::Read);
 }

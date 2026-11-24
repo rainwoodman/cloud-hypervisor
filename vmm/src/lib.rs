@@ -6,6 +6,7 @@
 use std::collections::{HashMap, HashSet};
 use std::fs::File;
 use std::io::{Read, Write, stdout};
+use std::net::TcpListener;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::panic::AssertUnwindSafe;
 #[cfg(feature = "guest_debug")]
@@ -37,7 +38,7 @@ use serde::{Deserialize, Serialize};
 use signal_hook::iterator::{Handle, Signals};
 use thiserror::Error;
 use tracer::trace_scoped;
-use vm_memory::bitmap::AtomicBitmap;
+use vm_allocator::{GuestMemory, GuestRegion};
 use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic};
 use vm_migration::protocol::*;
 use vm_migration::{
@@ -62,7 +63,8 @@ use crate::memory_manager::{MemoryManager, MemoryRangePolicy};
 #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
 use crate::migration::get_vm_snapshot;
 use crate::migration::transport::{
-    self, ReceiveAdditionalConnections, ReceiveListener, SendAdditionalConnections, SocketStream,
+    self, CONNECTION_SETUP_TIMEOUT, ReceiveAdditionalConnections, ReceiveListener,
+    SendAdditionalConnections, SocketStream,
 };
 use crate::migration::worker::{
     MigrationSeccompFilters, MigrationWorker, MigrationWorkerHandle, MigrationWorkerResult,
@@ -72,8 +74,8 @@ use crate::seccomp_filters::{Thread, get_seccomp_filter};
 use crate::util::flatten_error_chain_to_string;
 use crate::vm::{Error as VmError, Vm, VmState};
 use crate::vm_config::{
-    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, NetConfig, PmemConfig,
-    UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
+    DeviceConfig, DiskConfig, FsConfig, GenericVhostUserConfig, HotplugMethod, NetConfig,
+    PmemConfig, UserDeviceConfig, VdpaConfig, VmConfig, VsockConfig,
 };
 
 mod acpi;
@@ -86,6 +88,7 @@ mod coredump;
 pub mod cpu;
 pub mod device_manager;
 pub mod device_tree;
+pub mod external_fds;
 #[cfg(feature = "guest_debug")]
 mod gdb;
 #[cfg(feature = "igvm")]
@@ -109,9 +112,6 @@ mod uffd;
 mod userfaultfd;
 pub mod vm;
 pub mod vm_config;
-
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
-type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
 
 /// Errors associated with VMM management
 #[derive(Debug, Error)]
@@ -152,7 +152,7 @@ pub enum Error {
     /// Cannot start D-Bus session
     #[cfg(feature = "dbus_api")]
     #[error("Error starting D-Bus session")]
-    CreateDBusSession(#[source] zbus::Error),
+    CreateDBusSession(#[source] Box<zbus::Error>),
 
     /// Cannot create `event-monitor` thread
     #[error("Error spawning `event-monitor` thread")]
@@ -476,7 +476,8 @@ pub fn start_vmm_thread(
     exit_event: EventFd,
     seccomp_action: &SeccompAction,
     hypervisor: Arc<dyn hypervisor::Hypervisor>,
-    no_shutdown: bool,
+    shutdown_action: GuestShutdownAction,
+    reset_action: GuestResetAction,
     landlock_enable: bool,
 ) -> Result<VmmThreadHandle> {
     #[cfg(feature = "guest_debug")]
@@ -516,7 +517,8 @@ pub fn start_vmm_thread(
                     vmm_seccomp_action,
                     hypervisor,
                     exit_event,
-                    no_shutdown,
+                    shutdown_action,
+                    reset_action,
                 )?;
 
                 vmm.setup_signal_handler(landlock_enable)?;
@@ -693,6 +695,28 @@ impl VmOwnership {
     }
 }
 
+/// Action to take when the guest requests shutdown.
+#[derive(Default, Clone, Copy)]
+pub enum GuestShutdownAction {
+    /// Shut down the VM and exit the VMM.
+    #[default]
+    ExitVmm,
+    /// Shut down the VM while keeping the VMM running.
+    ShutdownVm,
+}
+
+/// Action to take when the guest requests a reset.
+#[derive(Default, Clone, Copy)]
+pub enum GuestResetAction {
+    /// Reset the VM.
+    #[default]
+    ResetVm,
+    /// Shut down the VM and exit the VMM.
+    ExitVmm,
+    /// Shut down the VM while keeping the VMM running.
+    ShutdownVm,
+}
+
 pub struct Vmm {
     epoll: EpollContext,
     exit_evt: EventFd,
@@ -716,7 +740,10 @@ pub struct Vmm {
     console_info: Option<ConsoleInfo>,
     serial_socket_listener: Option<Arc<LockedUnixListener>>,
     console_socket_listener: Option<Arc<LockedUnixListener>>,
-    no_shutdown: bool,
+    serial_tcp_listener: Option<Arc<TcpListener>>,
+    console_tcp_listener: Option<Arc<TcpListener>>,
+    shutdown_action: GuestShutdownAction,
+    reset_action: GuestResetAction,
     check_migration_evt: EventFd,
 }
 
@@ -727,7 +754,7 @@ const FAULT_CONNECTION_ACCEPT_TIMEOUT: Duration = Duration::from_secs(30);
 /// [`ReceiveMigrationState::Configured`]
 struct ReceiveMigrationConfiguredData {
     memory_manager: Arc<Mutex<MemoryManager>>,
-    guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
+    guest_memory: GuestMemoryAtomic<GuestMemory>,
     connections: ReceiveAdditionalConnections,
     shared_backing: bool,
     fault_rx: Receiver<SocketStream>,
@@ -881,7 +908,8 @@ impl Vmm {
         seccomp_action: SeccompAction,
         hypervisor: Arc<dyn hypervisor::Hypervisor>,
         exit_evt: EventFd,
-        no_shutdown: bool,
+        shutdown_action: GuestShutdownAction,
+        reset_action: GuestResetAction,
     ) -> Result<Self> {
         let mut epoll = EpollContext::new().map_err(Error::Epoll)?;
         let reset_evt = EventFd::new(EFD_NONBLOCK).map_err(Error::EventFdCreate)?;
@@ -941,7 +969,10 @@ impl Vmm {
             console_info: None,
             serial_socket_listener: None,
             console_socket_listener: None,
-            no_shutdown,
+            serial_tcp_listener: None,
+            console_tcp_listener: None,
+            shutdown_action,
+            reset_action,
             check_migration_evt,
         })
     }
@@ -976,7 +1007,7 @@ impl Vmm {
         listener: &ReceiveListener,
         state: ReceiveMigrationState,
         req: &Request,
-        receive_data_migration: &VmReceiveMigrationData,
+        receive_data_migration: &mut VmReceiveMigrationData,
     ) -> result::Result<ReceiveMigrationState, MigratableError> {
         use ReceiveMigrationState::*;
 
@@ -1113,11 +1144,16 @@ impl Vmm {
     fn vm_receive_migration_protocol(
         &mut self,
         mut listener: ReceiveListener,
-        receive_data_migration: &VmReceiveMigrationData,
+        receive_data_migration: &mut VmReceiveMigrationData,
     ) -> result::Result<(), MigratableError> {
         event!("vm", "migration-receive-ready");
         // Accept the connection and get the socket
         let mut socket = listener.accept()?;
+        // The sender sends its first request right after connecting. Without
+        // a timeout, a peer that stays silent blocks the receiver forever.
+        socket
+            .set_read_timeout(Some(CONNECTION_SETUP_TIMEOUT))
+            .map_err(MigratableError::MigrateSocket)?;
 
         event!("vm", "migration-receive-starting");
         let mut state = ReceiveMigrationState::Established;
@@ -1138,6 +1174,14 @@ impl Vmm {
                 )))
             })?;
             debug!("Command '{:?}' received", req.command());
+
+            if matches!(state, ReceiveMigrationState::Established) {
+                // Later requests can take long, e.g. while the memory goes over
+                // the additional connections.
+                socket
+                    .set_read_timeout(None)
+                    .map_err(MigratableError::MigrateSocket)?;
+            }
 
             state = self
                 .vm_receive_migration_step(
@@ -1195,24 +1239,19 @@ impl Vmm {
                         "Timed out waiting for postcopy fault connection: {e}"
                     ))
                 })?;
-            let mm = Arc::clone(&config_data.memory_manager);
-            let saved_regions = mm
-                .lock()
-                .unwrap()
-                .memory_range_table(MemoryRangePolicy::Full)?;
-            mm.lock()
-                .unwrap()
-                .start_postcopy_serving(
-                    &saved_regions,
-                    shared_backing,
-                    config_data.background_fetch_pages,
-                    fault_stream,
-                    &self.exit_evt,
-                )
-                .map_err(|e| {
-                    config_data.connections.cleanup().ok();
-                    MigratableError::MigrateReceive(anyhow!("start_postcopy_serving: {e:?}"))
-                })?;
+            let mut mm = config_data.memory_manager.lock().unwrap();
+            let saved_regions = mm.memory_range_table(MemoryRangePolicy::Full)?;
+            mm.start_postcopy_serving(
+                &saved_regions,
+                shared_backing,
+                config_data.background_fetch_pages,
+                fault_stream,
+                &self.exit_evt,
+            )
+            .map_err(|e| {
+                config_data.connections.cleanup().ok();
+                MigratableError::MigrateReceive(anyhow!("start_postcopy_serving: {e:?}"))
+            })?;
         }
 
         // The fault connection is in hand, so stop the accept thread.
@@ -1236,7 +1275,7 @@ impl Vmm {
         req: &Request,
         socket: &mut T,
         existing_memory_files: HashMap<u32, File>,
-        receive_data_migration: &VmReceiveMigrationData,
+        receive_data_migration: &mut VmReceiveMigrationData,
     ) -> result::Result<(Arc<Mutex<MemoryManager>>, MigrationMode), MigratableError>
     where
         T: Read,
@@ -1254,15 +1293,19 @@ impl Vmm {
             .context("Error deserialising config")
             .map_err(MigratableError::MigrateReceive)?;
 
-        let mode = vm_migration_config.memory_mode();
+        {
+            let mut vm_config = vm_migration_config.vm_config.lock().unwrap();
 
-        // Mirrors the vm_restore handling of RestoreConfig.vfio_fds. The
-        // received VmConfig carries the source's device paths or stale FDs,
-        // neither of which is usable on this host.
-        receive_data_migration
-            .validate_vfio_fds(&vm_migration_config.vm_config.lock().unwrap())
-            .map_err(|e| MigratableError::MigrateReceive(e.into()))?;
-        apply_vfio_fds_to_vm_config(receive_data_migration, &vm_migration_config.vm_config);
+            // Device paths are invalid on the target host.
+            if let Some(devices) = vm_config.devices.as_mut() {
+                devices.iter_mut().for_each(|device| device.path = None);
+            }
+            vm_config
+                .update_fds(mem::take(&mut receive_data_migration.external_fds))
+                .map_err(|e| MigratableError::MigrateReceive(e.into()))?;
+        }
+
+        let mode = vm_migration_config.memory_mode();
 
         // Eager prefault populates memory before UFFD is registered, so those
         // pages never fault and are never served. Reject postcopy+prefault
@@ -1298,47 +1341,49 @@ impl Vmm {
 
         let config = Arc::clone(&vm_migration_config.vm_config);
         self.vm_config = Some(vm_migration_config.vm_config);
-        self.console_info = Some(
-            pre_create_console_devices(self)
-                .context("Error creating console devices")
-                .map_err(MigratableError::MigrateReceive)?,
-        );
 
-        if self
-            .vm_config
-            .as_ref()
-            .unwrap()
-            .lock()
-            .unwrap()
-            .landlock_enable
+        // Console setup
         {
-            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
-            apply_landlock(&mut config)
+            config
+                .lock()
+                .unwrap()
+                .update_console_outputs(
+                    receive_data_migration.serial.as_ref(),
+                    receive_data_migration.console.as_ref(),
+                )
+                .context("Error updating console outputs")
+                .map_err(MigratableError::MigrateReceive)?;
+
+            self.console_info = Some(
+                pre_create_console_devices(self)
+                    .context("Error creating console devices")
+                    .map_err(MigratableError::MigrateReceive)?,
+            );
+        }
+
+        let mut vm_config = config.lock().unwrap();
+
+        if vm_config.landlock_enable {
+            apply_landlock(&mut vm_config)
                 .context("Error applying landlock")
                 .map_err(MigratableError::MigrateReceive)?;
         }
 
-        let vm = Vm::create_hypervisor_vm(
-            self.hypervisor.as_ref(),
-            (&*self.vm_config.as_ref().unwrap().lock().unwrap()).into(),
-        )
-        .map_err(|e| {
-            MigratableError::MigrateReceive(anyhow!(
-                "Error creating hypervisor VM from snapshot: {e:?}"
-            ))
-        })?;
+        let vm = Vm::create_hypervisor_vm(self.hypervisor.as_ref(), (&*vm_config).into()).map_err(
+            |e| {
+                MigratableError::MigrateReceive(anyhow!(
+                    "Error creating hypervisor VM from snapshot: {e:?}"
+                ))
+            },
+        )?;
 
         #[cfg(all(feature = "kvm", target_arch = "x86_64"))]
-        if config.lock().unwrap().max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
+        if vm_config.max_apic_id() > arch::x86_64::MAX_SUPPORTED_CPUS_LEGACY {
             vm.enable_x2apic_api().unwrap();
         }
 
-        let phys_bits = vm::physical_bits(
-            self.hypervisor.as_ref(),
-            config.lock().unwrap().cpus.max_phys_bits,
-        );
+        let phys_bits = vm::physical_bits(self.hypervisor.as_ref(), vm_config.cpus.max_phys_bits);
 
-        let vm_config = config.lock().unwrap();
         let memory_manager = MemoryManager::new(
             vm,
             &vm_config.memory.clone(),
@@ -1383,6 +1428,10 @@ impl Vmm {
                 .context("Error deserialising snapshot")
                 .map_err(MigratableError::MigrateReceive)
         })?;
+
+        if let Some(memory_snapshot) = snapshot.snapshots.get(MEMORY_MANAGER_SNAPSHOT_ID) {
+            mm.lock().unwrap().restore_state(memory_snapshot)?;
+        }
 
         let exit_evt = self
             .exit_evt
@@ -1676,7 +1725,7 @@ impl Vmm {
         let memory_mode = send_data_migration.effective_memory_mode();
 
         // Set up the socket connection
-        let mut socket = transport::send_migration_socket(
+        let mut socket = transport::connect_and_setup_socket(
             &send_data_migration.destination_url,
             send_data_migration.tls_dir.as_deref(),
         )?;
@@ -1851,6 +1900,12 @@ impl Vmm {
         } else {
             Request::complete_paused()
         };
+        // The destination may already run the VM once it got this request.
+        // Giving up would resume the source as well, so wait for the answer.
+        // This needs a more careful investigation, see #9208.
+        socket
+            .set_read_timeout(None)
+            .map_err(MigratableError::MigrateSocket)?;
         let (_, complete_duration) = measure_ok(|| {
             // We might lose an ACK, but this is preferable to an inconsistent
             // source VM or both VMs running. This is a known postcopy tradeoff.
@@ -1906,7 +1961,7 @@ impl Vmm {
     fn serve_postcopy(
         seccomp_filter: &BpfProgram,
         mut socket: SocketStream,
-        guest_memory: GuestMemoryAtomic<GuestMemoryMmap>,
+        guest_memory: GuestMemoryAtomic<GuestMemory>,
     ) -> result::Result<(), MigratableError> {
         // Apply the dedicated seccomp filter for this thread. It is empty when
         // seccomp is disabled (SeccompAction::Allow), in which case there is
@@ -1977,8 +2032,9 @@ impl Vmm {
     ) -> result::Result<(), MigratableError> {
         // We check the `CPUID` compatibility of between the source vm and destination, which is
         // mostly about feature compatibility.
-        let dest_cpuid = &{
+        let (dest_cpuid, nested) = {
             let vm_config = &src_vm_config.lock().unwrap();
+            let nested = vm_config.cpus.nested;
 
             if vm_config.cpus.features.amx {
                 // Need to enable AMX tile state components before generating common cpuid
@@ -1991,20 +2047,25 @@ impl Vmm {
             let phys_bits =
                 vm::physical_bits(self.hypervisor.as_ref(), vm_config.cpus.max_phys_bits);
 
-            arch::generate_common_cpuid(
-                self.hypervisor.as_ref(),
-                &arch::CpuidConfig {
-                    phys_bits,
-                    kvm_hyperv: vm_config.cpus.kvm_hyperv,
-                    amx: vm_config.cpus.features.amx,
-                    cpuid_overrides: vm_config.cpus.cpuid_overrides.clone(),
-                },
-                None,
+            (
+                arch::generate_common_cpuid(
+                    self.hypervisor.as_ref(),
+                    &arch::CpuidConfig {
+                        phys_bits,
+                        kvm_hyperv: vm_config.cpus.kvm_hyperv,
+                        kvm_hint_realtime: vm_config.cpus.kvm_hint_realtime,
+                        amx: vm_config.cpus.features.amx,
+                        nested: vm_config.cpus.nested,
+                        cpuid_overrides: vm_config.cpus.cpuid_overrides.clone(),
+                    },
+                    None,
+                )
+                .context("Error generating common cpuid")
+                .map_err(MigratableError::MigrateReceive)?,
+                nested,
             )
-            .context("Error generating common cpuid")
-            .map_err(MigratableError::MigrateReceive)?
         };
-        arch::CpuidFeatureEntry::check_cpuid_compatibility(src_vm_cpuid, dest_cpuid)
+        arch::CpuidFeatureEntry::check_cpuid_compatibility(src_vm_cpuid, &dest_cpuid, nested)
             .context("Error checking cpu feature compatibility")
             .map_err(MigratableError::MigrateReceive)
     }
@@ -2069,16 +2130,11 @@ impl Vmm {
                     Some(memory_restore_mode),
                 )?;
 
-                if self
-                    .vm_config
-                    .as_ref()
-                    .unwrap()
-                    .lock()
-                    .unwrap()
-                    .landlock_enable
                 {
                     let mut config = self.vm_config.as_ref().unwrap().lock().unwrap();
-                    apply_landlock(&mut config).map_err(VmError::ApplyLandlock)?;
+                    if config.landlock_enable {
+                        apply_landlock(&mut config).map_err(VmError::ApplyLandlock)?;
+                    }
                 }
 
                 // Now we can restore the rest of the VM.
@@ -2092,6 +2148,7 @@ impl Vmm {
 
     /// Handles the outcome of the migration worker thread.
     fn check_migration(&mut self) {
+        #[expect(clippy::panic, reason = "only called during a migration")]
         let VmOwnership::Migration {
             migration_worker_handle,
             ..
@@ -2153,12 +2210,7 @@ impl Vmm {
 
                 // Since the VMM explicitly no longer owns the VM, the exit
                 // event won't call the shutdown path automatically.
-                if let Err(e) = vm.shutdown() {
-                    error!(
-                        "Failed shutting down the VM after migration: {}",
-                        flatten_error_chain_to_string(&e)
-                    );
-                }
+                vm.shutdown();
 
                 if let Err(e) = self.exit_evt.write(1) {
                     error!("Failed exiting the VMM after migration: {e}");
@@ -2178,12 +2230,7 @@ impl Vmm {
                     );
                     self.vm = VmOwnership::None;
                     let mut vm = vm;
-                    if let Err(e) = vm.shutdown() {
-                        warn!(
-                            "Failed tearing down the VM after failed postcopy migration: {}",
-                            flatten_error_chain_to_string(&e)
-                        );
-                    }
+                    vm.shutdown();
                 } else {
                     try_resume_vm_after_failed_migration(vm);
                 }
@@ -2240,17 +2287,31 @@ impl Vmm {
                         // Consume the event.
                         self.reset_evt.read().map_err(Error::EventFdRead)?;
                         // TODO: Future follow-up must resolve lifecycle handling while migrating.
-                        self.vm_reboot().map_err(Error::VmReboot)?;
+                        match self.reset_action {
+                            GuestResetAction::ResetVm => {
+                                self.vm_reboot().map_err(Error::VmReboot)?;
+                            }
+                            GuestResetAction::ExitVmm => {
+                                self.vmm_shutdown().map_err(Error::VmmShutdown)?;
+                                break 'outer;
+                            }
+                            GuestResetAction::ShutdownVm => {
+                                self.vm_shutdown().map_err(Error::VmShutdown)?;
+                            }
+                        }
                     }
                     EpollDispatch::GuestExit => {
                         info!("VM guest exit event");
                         self.guest_exit_evt.read().map_err(Error::EventFdRead)?;
                         // TODO: Future follow-up must resolve lifecycle handling while migrating.
-                        if self.no_shutdown {
-                            self.vm_shutdown().map_err(Error::VmShutdown)?;
-                        } else {
-                            self.vmm_shutdown().map_err(Error::VmmShutdown)?;
-                            break 'outer;
+                        match self.shutdown_action {
+                            GuestShutdownAction::ExitVmm => {
+                                self.vmm_shutdown().map_err(Error::VmmShutdown)?;
+                                break 'outer;
+                            }
+                            GuestShutdownAction::ShutdownVm => {
+                                self.vm_shutdown().map_err(Error::VmShutdown)?;
+                            }
                         }
                     }
                     EpollDispatch::ActivateVirtioDevices => {
@@ -2343,45 +2404,6 @@ fn apply_landlock(vm_config: &mut VmConfig) -> result::Result<(), LandlockError>
     Ok(())
 }
 
-// For each matched DeviceConfig.id, swap the saved path or stale FD for the
-// cdev FD received with the request, and install the fresh iommufd FD backing
-// them. The values in the migrated VmConfig are stale. validate_vfio_fds has
-// already confirmed the ids match and the iommufd FD is present.
-fn apply_vfio_fds_to_vm_config(
-    receive_data_migration: &VmReceiveMigrationData,
-    vm_config: &Arc<Mutex<VmConfig>>,
-) {
-    let vfio_fds = receive_data_migration
-        .vfio_fds
-        .as_deref()
-        .unwrap_or_default();
-    if vfio_fds.is_empty() {
-        return;
-    }
-
-    let mut config = vm_config.lock().unwrap();
-    if let Some(devices) = config.devices.as_mut() {
-        for v in vfio_fds {
-            for device in devices.iter_mut() {
-                if device.pci_common.id.as_deref() == Some(v.id.as_str()) {
-                    device.path = None;
-                    device.fd = v.fd;
-                }
-            }
-        }
-    }
-
-    let iommufd_fd = receive_data_migration
-        .iommufd_fd
-        .expect("receive-migration validated an iommufd FD accompanies vfio_fds");
-    config
-        .platform
-        .as_mut()
-        .expect("receive-migration validated iommufd=on, so a platform exists")
-        .iommufd_fd = Some(iommufd_fd);
-}
-
-#[allow(unused)]
 fn update_memory_zones(
     zone_updates: &[VmMemoryZoneUpdateData],
     vm_config: &Arc<Mutex<VmConfig>>,
@@ -2581,7 +2603,7 @@ impl RequestHandler for Vmm {
         }
     }
 
-    fn vm_restore(&mut self, restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
+    fn vm_restore(&mut self, mut restore_cfg: RestoreConfig) -> result::Result<(), VmError> {
         match &self.vm {
             VmOwnership::Owned(_) => Err(VmError::VmAlreadyCreated),
             VmOwnership::Migration { .. } => Err(VmError::VmMigrating),
@@ -2590,12 +2612,9 @@ impl RequestHandler for Vmm {
                     return Err(VmError::VmAlreadyCreated);
                 }
 
-                let source_url = restore_cfg.source_url.as_path().to_str();
-                if source_url.is_none() {
+                let Some(source_url) = restore_cfg.source_url.as_path().to_str() else {
                     return Err(VmError::InvalidRestoreSourceUrl);
-                }
-                // Safe to unwrap as we checked it was Some(&str).
-                let source_url = source_url.unwrap();
+                };
 
                 let vm_config = Arc::new(Mutex::new(
                     recv_vm_config(source_url).map_err(VmError::Restore)?,
@@ -2604,46 +2623,19 @@ impl RequestHandler for Vmm {
                     .validate(&vm_config.lock().unwrap().clone())
                     .map_err(VmError::ConfigValidation)?;
 
-                // Update VM's net configurations with new fds received for restore operation
-                if let (Some(restored_nets), Some(vm_net_configs)) =
-                    (restore_cfg.net_fds, &mut vm_config.lock().unwrap().net)
-                {
-                    for net in restored_nets.iter() {
-                        for net_config in vm_net_configs.iter_mut() {
-                            // update only if the net dev is backed by FDs
-                            if net_config.pci_common.id.as_ref() == Some(&net.id)
-                                && net_config.fds.is_some()
-                            {
-                                net_config.fds.clone_from(&net.fds);
-                            }
-                        }
-                    }
-                }
+                vm_config
+                    .lock()
+                    .unwrap()
+                    .update_console_outputs(
+                        restore_cfg.serial.as_ref(),
+                        restore_cfg.console.as_ref(),
+                    )
+                    .map_err(VmError::ConfigValidation)?;
 
-                // Swap each VFIO device's saved path or stale FD for the cdev
-                // FD received with the restore request, and install the fresh
-                // iommufd FD backing them. The one saved in the snapshot is
-                // stale, and validate() has confirmed both accompany vfio_fds.
-                if let Some(restored_vfios) = restore_cfg.vfio_fds {
-                    let mut config = vm_config.lock().unwrap();
-                    if let Some(vm_device_configs) = config.devices.as_mut() {
-                        for v in restored_vfios.iter() {
-                            for device_config in vm_device_configs.iter_mut() {
-                                if device_config.pci_common.id.as_ref() == Some(&v.id) {
-                                    device_config.path = None;
-                                    device_config.fd = v.fd;
-                                }
-                            }
-                        }
-                    }
-                    let iommufd_fd = restore_cfg
-                        .iommufd_fd
-                        .expect("restore validated an iommufd FD accompanies vfio_fds");
-                    config
-                        .platform
-                        .as_mut()
-                        .expect("restore validated iommufd=on, so a platform exists")
-                        .iommufd_fd = Some(iommufd_fd);
+                // Update VM's configurations with new fds received for restore operation.
+                if !restore_cfg.external_fds.is_empty() {
+                    let external_fds = mem::take(&mut restore_cfg.external_fds);
+                    vm_config.lock().unwrap().update_fds(external_fds)?;
                 }
 
                 update_memory_zones(&restore_cfg.zone_updates, &vm_config).map_err(|e| {
@@ -2695,13 +2687,9 @@ impl RequestHandler for Vmm {
         let mut vm = self.vm.take_owned_or(VmError::VmNotRunning)?;
         // Drain console_info so that the FDs are not reused
         let _ = self.console_info.take();
-        let r = vm.shutdown();
-
-        if r.is_ok() {
-            event!("vm", "shutdown");
-        }
-
-        r
+        vm.shutdown();
+        event!("vm", "shutdown");
+        Ok(())
     }
 
     fn vm_reboot(&mut self) -> result::Result<(), VmError> {
@@ -2713,7 +2701,7 @@ impl RequestHandler for Vmm {
             let mut vm = self.vm.take_owned_or(VmError::VmNotCreated)?;
             let config = vm.get_config();
             // First we stop the current VM
-            vm.shutdown()?;
+            vm.shutdown();
             config
         };
 
@@ -2855,6 +2843,8 @@ impl RequestHandler for Vmm {
         self.console_info = None;
         self.serial_socket_listener = None;
         self.console_socket_listener = None;
+        self.serial_tcp_listener = None;
+        self.console_tcp_listener = None;
         self.vm_config = None;
         event!("vm", "deleted");
 
@@ -2874,6 +2864,30 @@ impl RequestHandler for Vmm {
         desired_balloon: Option<u64>,
     ) -> result::Result<(), VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+
+        {
+            // Validate the configuration change in a cloned configuration
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            if let Some(desired_vcpus) = desired_vcpus {
+                config.cpus.boot_vcpus = desired_vcpus;
+            }
+            if let Some(desired_ram) = desired_ram {
+                // A running VM stores the hotplugged virtio-mem memory separately
+                if matches!(self.vm, VmOwnership::Owned(_))
+                    && config.memory.hotplug_method == HotplugMethod::VirtioMem
+                {
+                    config.memory.hotplugged_size = desired_ram.checked_sub(config.memory.size);
+                } else {
+                    config.memory.size = desired_ram;
+                }
+            }
+            if let Some(desired_balloon) = desired_balloon
+                && let Some(balloon_config) = &mut config.balloon
+            {
+                balloon_config.size = desired_balloon;
+            }
+            config.validate().map_err(VmError::ConfigValidation)?;
+        }
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => vm
@@ -2911,6 +2925,26 @@ impl RequestHandler for Vmm {
 
     fn vm_resize_zone(&mut self, id: String, desired_ram: u64) -> result::Result<(), VmError> {
         self.vm_config.as_ref().ok_or(VmError::VmNotCreated)?;
+
+        {
+            // Validate the configuration change in a cloned configuration
+            let mut config = self.vm_config.as_ref().unwrap().lock().unwrap().clone();
+            if let Some(zone) = config
+                .memory
+                .zones
+                .iter_mut()
+                .flatten()
+                .find(|zone| zone.id == id)
+            {
+                // A running VM stores the hotplugged zone memory separately
+                if matches!(self.vm, VmOwnership::Owned(_)) {
+                    zone.hotplugged_size = desired_ram.checked_sub(zone.size);
+                } else {
+                    zone.size = desired_ram;
+                }
+            }
+            config.validate().map_err(VmError::ConfigValidation)?;
+        }
 
         match self.vm {
             VmOwnership::Owned(ref mut vm) => {
@@ -3280,7 +3314,7 @@ impl RequestHandler for Vmm {
 
     fn vm_receive_migration(
         &mut self,
-        receive_data_migration: VmReceiveMigrationData,
+        mut receive_data_migration: VmReceiveMigrationData,
     ) -> result::Result<(), MigratableError> {
         match &self.vm {
             VmOwnership::Owned(_vm) => {
@@ -3325,7 +3359,7 @@ impl RequestHandler for Vmm {
             warn!("The existing VM config will be overwritten");
         }
 
-        self.vm_receive_migration_protocol(listener, &receive_data_migration)
+        self.vm_receive_migration_protocol(listener, &mut receive_data_migration)
             .inspect(|_| {
                 // Serving and resume already happened in the protocol loop.
                 event!("vm", "migration-receive-finished");
@@ -3337,13 +3371,8 @@ impl RequestHandler for Vmm {
                 );
                 event!("vm", "migration-receive-failed");
                 let vm = self.vm.take_owned_or(VmError::VmNotCreated);
-                if let Ok(mut vm) = vm
-                    && let Err(err) = vm.shutdown()
-                {
-                    error!(
-                        "Failed shutting down the VM after failed receive migration: {}",
-                        flatten_error_chain_to_string(&err)
-                    );
+                if let Ok(mut vm) = vm {
+                    vm.shutdown();
                 }
                 self.vm_config = None;
             })
@@ -3559,19 +3588,19 @@ mod util {
     }
 }
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::path::PathBuf;
 
     use arch::CpuProfileConfig;
 
     use super::*;
-    use crate::config::RestoredVfioConfig;
+    use crate::config::ValidationError;
     #[cfg(target_arch = "x86_64")]
     use crate::vm_config::DebugConsoleConfig;
     use crate::vm_config::{
-        CommonConsoleConfig, ConsoleConfig, ConsoleOutputMode, CoreScheduling, CpuFeatures,
-        CpusConfig, DeviceConfig, HotplugMethod, MemoryConfig, MemoryZoneConfig, PayloadConfig,
-        PciDeviceCommonConfig, PlatformConfig, RngConfig, SerialConfig,
+        BalloonConfig, ConsoleConfig, ConsoleOutput, CoreScheduling, CpuFeatures, CpusConfig,
+        DeviceConfig, MemoryConfig, MemoryZoneConfig, PayloadConfig, PciDeviceCommonConfig,
+        RngConfig, SerialConfig,
     };
 
     fn create_dummy_vmm() -> Vmm {
@@ -3585,18 +3614,21 @@ mod tests {
             SeccompAction::Allow,
             hypervisor::new().unwrap(),
             EventFd::new(EFD_NONBLOCK).unwrap(),
-            false,
+            GuestShutdownAction::default(),
+            GuestResetAction::default(),
         )
         .unwrap()
     }
 
-    fn create_dummy_vm_config() -> Box<VmConfig> {
+    pub(crate) fn create_dummy_vm_config() -> Box<VmConfig> {
         Box::new(VmConfig {
             cpus: CpusConfig {
                 boot_vcpus: 1,
                 max_vcpus: 1,
                 topology: None,
                 kvm_hyperv: false,
+                #[cfg(target_arch = "x86_64")]
+                kvm_hint_realtime: false,
                 max_phys_bits: 46,
                 affinity: None,
                 features: CpuFeatures::default(),
@@ -3644,19 +3676,11 @@ mod tests {
             generic_vhost_user: None,
             pmem: None,
             serial: SerialConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Null,
-                    socket: None,
-                },
+                output: ConsoleOutput::Null,
             },
             console: ConsoleConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    // Caution: Don't use `Tty` to not mess with users terminal
-                    mode: ConsoleOutputMode::Off,
-                    socket: None,
-                },
+                // Caution: Don't use `Tty` to not mess with users terminal
+                output: ConsoleOutput::Off,
                 pci_common: PciDeviceCommonConfig::default(),
             },
             #[cfg(target_arch = "x86_64")]
@@ -3677,12 +3701,52 @@ mod tests {
             pci_segments: None,
             platform: None,
             tpm: None,
-            preserved_fds: None,
             landlock_enable: false,
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
             ivshmem: None,
         })
+    }
+
+    pub(crate) fn test_fd() -> File {
+        File::open("/dev/null").unwrap()
+    }
+
+    #[test]
+    fn test_update_console_outputs() {
+        let file = |path: &str| ConsoleOutput::File {
+            file: PathBuf::from(path),
+        };
+        let mut config = create_dummy_vm_config();
+        config.serial.output = file("/tmp/serial-old");
+        config.console.output = file("/tmp/console-old");
+
+        // `None` must keep the output of the respective console.
+        config
+            .update_console_outputs(Some(&file("/tmp/serial-new")), None)
+            .expect("should update only the serial console");
+        assert_eq!(config.serial.output, file("/tmp/serial-new"));
+        assert_eq!(config.console.output, file("/tmp/console-old"));
+
+        config
+            .update_console_outputs(None, Some(&file("/tmp/console-new")))
+            .expect("should update only the virtio console");
+        assert_eq!(config.serial.output, file("/tmp/serial-new"));
+        assert_eq!(config.console.output, file("/tmp/console-new"));
+
+        config
+            .update_console_outputs(Some(&file("/tmp/s")), Some(&file("/tmp/c")))
+            .expect("should update both consoles");
+        assert_eq!(config.serial.output, file("/tmp/s"));
+        assert_eq!(config.console.output, file("/tmp/c"));
+
+        assert_eq!(
+            config.update_console_outputs(None, Some(&ConsoleOutput::Null)),
+            Err(ValidationError::ConsoleOutputUpdateModeMismatch(
+                file("/tmp/c"),
+                ConsoleOutput::Null
+            ))
+        );
     }
 
     #[test]
@@ -3717,7 +3781,8 @@ mod tests {
     #[test]
     fn test_vmm_vm_cold_add_device() {
         let mut vmm = create_dummy_vmm();
-        let device_config = DeviceConfig::parse("path=/path/to/device").unwrap();
+        // SAFETY: This test input contains no inherited descriptors.
+        let device_config = unsafe { DeviceConfig::parse("path=/path/to/device") }.unwrap();
 
         assert!(matches!(
             vmm.vm_add_device(device_config.clone()),
@@ -3809,6 +3874,73 @@ mod tests {
                 .clone()
                 .unwrap()[0],
             user_device_config
+        );
+    }
+
+    #[test]
+    fn test_vmm_vm_cold_resize_validates_config() {
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.cpus.boot_vcpus = 2;
+        config.cpus.max_vcpus = 4;
+        config.disks = Some(vec![
+            DiskConfig::parse("path=/path/to_file,image_type=raw,num_queues=2").unwrap(),
+        ]);
+        config.balloon = Some(BalloonConfig::parse("size=128M").unwrap());
+        let _ = vmm.vm_create(config);
+        let config = vmm.vm_config.clone().unwrap();
+
+        assert!(matches!(
+            vmm.vm_resize(Some(1), None, None),
+            Err(VmError::ConfigValidation(ValidationError::TooManyQueues(
+                2, 1
+            )))
+        ));
+        assert_eq!(config.lock().unwrap().cpus.boot_vcpus, 2);
+
+        assert!(matches!(
+            vmm.vm_resize(None, None, Some(512 << 20)),
+            Err(VmError::ConfigValidation(
+                ValidationError::BalloonLargerThanRam(_, _)
+            ))
+        ));
+        assert_eq!(
+            config.lock().unwrap().balloon.as_ref().unwrap().size,
+            128 << 20
+        );
+
+        vmm.vm_resize(Some(4), None, Some(256 << 20)).unwrap();
+        assert_eq!(config.lock().unwrap().cpus.boot_vcpus, 4);
+        assert_eq!(
+            config.lock().unwrap().balloon.as_ref().unwrap().size,
+            256 << 20
+        );
+    }
+
+    #[test]
+    fn test_vmm_vm_cold_resize_zone_validates_config() {
+        let mut vmm = create_dummy_vmm();
+        let mut config = create_dummy_vm_config();
+        config.memory = MemoryConfig::parse("size=0", Some(vec!["id=mem0,size=512M"])).unwrap();
+        config.balloon = Some(BalloonConfig::parse("size=256M").unwrap());
+        let _ = vmm.vm_create(config);
+        let config = vmm.vm_config.clone().unwrap();
+
+        assert!(matches!(
+            vmm.vm_resize_zone("mem0".to_string(), 256 << 20),
+            Err(VmError::ConfigValidation(
+                ValidationError::BalloonLargerThanRam(_, _)
+            ))
+        ));
+        assert_eq!(
+            config.lock().unwrap().memory.zones.as_ref().unwrap()[0].size,
+            512 << 20
+        );
+
+        vmm.vm_resize_zone("mem0".to_string(), 1 << 30).unwrap();
+        assert_eq!(
+            config.lock().unwrap().memory.zones.as_ref().unwrap()[0].size,
+            1 << 30
         );
     }
 
@@ -4001,9 +4133,12 @@ mod tests {
     #[test]
     fn test_vmm_vm_cold_add_net() {
         let mut vmm = create_dummy_vmm();
-        let net_config = NetConfig::parse(
-            "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,vhost_user=true,socket=/tmp/sock",
-        )
+        // SAFETY: This test input contains no inherited descriptors.
+        let net_config = unsafe {
+            NetConfig::parse(
+                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,vhost_user=true,socket=/tmp/sock",
+            )
+        }
         .unwrap();
 
         assert!(matches!(
@@ -4128,144 +4263,6 @@ mod tests {
                 .unwrap(),
             vsock_config
         );
-    }
-
-    fn vm_config_with_vfio_devices(ids: &[&str], iommufd: bool) -> Arc<Mutex<VmConfig>> {
-        let mut config = *create_dummy_vm_config();
-        let platform = if iommufd { "iommufd=on" } else { "iommufd=off" };
-        config.platform = Some(PlatformConfig::parse(platform).unwrap());
-        config.devices = Some(
-            ids.iter()
-                .map(|id| DeviceConfig {
-                    pci_common: PciDeviceCommonConfig {
-                        id: Some((*id).to_owned()),
-                        ..Default::default()
-                    },
-                    path: Some(PathBuf::from(format!("/sys/bus/pci/devices/{id}"))),
-                    fd: None,
-                    x_nv_gpudirect_clique: None,
-                    x_exclude_mmap_bars: Vec::new(),
-                    iommufd_dev_id: None,
-                })
-                .collect(),
-        );
-        Arc::new(Mutex::new(config))
-    }
-
-    fn receive_data(
-        vfio_fds: Option<Vec<RestoredVfioConfig>>,
-        iommufd_fd: Option<i32>,
-    ) -> VmReceiveMigrationData {
-        VmReceiveMigrationData {
-            receiver_url: "tcp:127.0.0.1:4321".to_string(),
-            tls_dir: None,
-            vfio_fds,
-            iommufd_fd,
-            zone_updates: vec![],
-            background_fetch_pages: true,
-        }
-    }
-
-    fn vfio_fd(id: &str, fd: i32) -> RestoredVfioConfig {
-        RestoredVfioConfig {
-            id: id.to_owned(),
-            fd: Some(fd),
-        }
-    }
-
-    #[test]
-    fn test_apply_vfio_fds_empty_is_noop() {
-        let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        apply_vfio_fds_to_vm_config(&receive_data(None, None), &vm_config);
-        let config = vm_config.lock().unwrap();
-        let device = &config.devices.as_ref().unwrap()[0];
-        assert!(device.path.is_some());
-        assert!(device.fd.is_none());
-    }
-
-    #[test]
-    fn test_apply_vfio_fds_swaps_path_for_fd() {
-        let vm_config = vm_config_with_vfio_devices(&["vfio0", "vfio1"], true);
-        let data = receive_data(Some(vec![vfio_fd("vfio1", 5)]), Some(6));
-        apply_vfio_fds_to_vm_config(&data, &vm_config);
-        let config = vm_config.lock().unwrap();
-        let devices = config.devices.as_ref().unwrap();
-        assert!(devices[0].path.is_some());
-        assert!(devices[0].fd.is_none());
-        assert!(devices[1].path.is_none());
-        assert_eq!(devices[1].fd, Some(5));
-        assert_eq!(config.platform.as_ref().unwrap().iommufd_fd, Some(6));
-    }
-
-    #[test]
-    fn test_validate_vfio_fds_requires_iommufd_fd() {
-        let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        let data = receive_data(Some(vec![vfio_fd("vfio0", 5)]), None);
-        data.validate_vfio_fds(&vm_config.lock().unwrap())
-            .unwrap_err();
-    }
-
-    #[test]
-    fn test_validate_vfio_fds_unknown_id_fails() {
-        // vfio0 is covered so coverage passes, the extra bogus id is what the
-        // id match must reject.
-        let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        let data = receive_data(
-            Some(vec![vfio_fd("vfio0", 5), vfio_fd("missing", 6)]),
-            Some(7),
-        );
-        data.validate_vfio_fds(&vm_config.lock().unwrap())
-            .unwrap_err();
-    }
-
-    #[test]
-    fn test_validate_vfio_fds_duplicate_id_fails() {
-        let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        let data = receive_data(
-            Some(vec![vfio_fd("vfio0", 5), vfio_fd("vfio0", 6)]),
-            Some(7),
-        );
-        data.validate_vfio_fds(&vm_config.lock().unwrap())
-            .unwrap_err();
-    }
-
-    #[test]
-    fn test_validate_vfio_fds_requires_iommufd_backend() {
-        let vm_config = vm_config_with_vfio_devices(&["vfio0"], false);
-        let data = receive_data(Some(vec![vfio_fd("vfio0", 5)]), Some(6));
-        data.validate_vfio_fds(&vm_config.lock().unwrap())
-            .unwrap_err();
-    }
-
-    #[test]
-    fn test_validate_vfio_fds_stale_fd_needs_replacement() {
-        let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        {
-            let mut config = vm_config.lock().unwrap();
-            let device = &mut config.devices.as_mut().unwrap()[0];
-            device.path = None;
-            device.fd = Some(-1);
-        }
-        receive_data(None, None)
-            .validate_vfio_fds(&vm_config.lock().unwrap())
-            .unwrap_err();
-    }
-
-    #[test]
-    fn test_validate_vfio_fds_path_based_needs_replacement() {
-        // A path based device carries its source path, which is unusable on
-        // the destination, so it must be replaced in vfio_fds as well.
-        let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        receive_data(None, None)
-            .validate_vfio_fds(&vm_config.lock().unwrap())
-            .unwrap_err();
-    }
-
-    #[test]
-    fn test_validate_vfio_fds_all_substituted_ok() {
-        let vm_config = vm_config_with_vfio_devices(&["vfio0"], true);
-        let data = receive_data(Some(vec![vfio_fd("vfio0", 5)]), Some(6));
-        data.validate_vfio_fds(&vm_config.lock().unwrap()).unwrap();
     }
 
     #[test]

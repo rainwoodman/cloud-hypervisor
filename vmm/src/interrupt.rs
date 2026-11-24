@@ -28,27 +28,28 @@ type Result<T> = io::Result<T>;
 struct InterruptRoute {
     gsi: Option<u32>,
     irq_fd: Option<EventFd>,
+    external_notifier: bool,
     registered: bool,
     allocator: Arc<Mutex<SystemAllocator>>,
 }
 
 impl InterruptRoute {
-    fn new(allocator: Arc<Mutex<SystemAllocator>>) -> Result<Self> {
-        // The irq_fd must be created eagerly because external components
-        // (say, VFIO) need the fd at device initialization time via notifier().
-        Self::new_with_fd(Some(EventFd::new(libc::EFD_NONBLOCK)?), allocator)
-    }
-
-    fn new_with_fd(
-        irq_fd: Option<EventFd>,
-        allocator: Arc<Mutex<SystemAllocator>>,
-    ) -> Result<Self> {
-        Ok(InterruptRoute {
+    fn new(allocator: Arc<Mutex<SystemAllocator>>) -> Self {
+        InterruptRoute {
             gsi: None,
-            irq_fd,
+            irq_fd: None,
+            external_notifier: false,
             registered: false,
             allocator,
-        })
+        }
+    }
+
+    fn allocate_irqfd(&mut self) -> Result<()> {
+        // A notifier cleared by set_notifier(None) must stay disconnected.
+        if self.irq_fd.is_none() && !self.external_notifier {
+            self.irq_fd = Some(EventFd::new(libc::EFD_NONBLOCK)?);
+        }
+        Ok(())
     }
 
     /// Allocates a GSI, if non was allocated yet.
@@ -78,6 +79,7 @@ impl InterruptRoute {
         };
 
         if !self.registered {
+            self.allocate_irqfd()?;
             if let Some(ref irq_fd) = self.irq_fd {
                 vm.register_irqfd(irq_fd, gsi)
                     .map_err(|e| io::Error::other(format!("Failed registering irq_fd: {e}")))?;
@@ -111,22 +113,20 @@ impl InterruptRoute {
     }
 
     fn trigger(&mut self) -> Result<()> {
+        self.allocate_irqfd()?;
         match self.irq_fd {
             Some(ref fd) => fd.write(1),
             None => Ok(()),
         }
     }
 
-    fn notifier(&mut self) -> Option<EventFd> {
-        Some(
-            self.irq_fd
-                .as_ref()?
-                .try_clone()
-                .expect("Failed cloning interrupt's EventFd"),
-        )
+    fn notifier(&mut self) -> Result<Option<EventFd>> {
+        self.allocate_irqfd()?;
+        self.irq_fd.as_ref().map(EventFd::try_clone).transpose()
     }
 
     fn set_notifier(&mut self, eventfd: Option<EventFd>, vm: &dyn hypervisor::Vm) -> Result<()> {
+        self.external_notifier = true;
         let old_irqfd = replace(&mut self.irq_fd, eventfd);
         if self.registered {
             // A registered route must have a GSI allocated, since enable()
@@ -257,12 +257,12 @@ impl InterruptSourceGroup for MsiInterruptGroup {
         )))
     }
 
-    fn notifier(&self, index: InterruptIndex) -> Option<EventFd> {
+    fn notifier(&self, index: InterruptIndex) -> Result<Option<EventFd>> {
         if let Some(route) = self.irq_routes.get(&index) {
             return route.lock().unwrap().notifier();
         }
 
-        None
+        Ok(None)
     }
 
     fn update(
@@ -376,7 +376,7 @@ impl InterruptSourceGroup for LegacyUserspaceInterruptGroup {
         Ok(())
     }
 
-    fn notifier(&self, _index: InterruptIndex) -> Option<EventFd> {
+    fn notifier(&self, _index: InterruptIndex) -> Result<Option<EventFd>> {
         self.ioapic.lock().unwrap().notifier(self.irq as usize)
     }
 }
@@ -432,32 +432,28 @@ impl InterruptManager for LegacyUserspaceInterruptManager {
             config.irq,
         )))
     }
-
-    fn destroy_group(&self, _group: Arc<dyn InterruptSourceGroup>) -> Result<()> {
-        Ok(())
-    }
 }
 
 impl MsiInterruptManager {
     fn create_group_raw(
         &self,
         config: <Self as InterruptManager>::GroupConfig,
-    ) -> Result<MsiInterruptGroup> {
+    ) -> MsiInterruptGroup {
         let mut irq_routes: HashMap<InterruptIndex, Mutex<InterruptRoute>> =
             HashMap::with_capacity(config.count as usize);
         for i in config.base..config.base + config.count {
             irq_routes.insert(
                 i,
-                Mutex::new(InterruptRoute::new(Arc::clone(&self.allocator))?),
+                Mutex::new(InterruptRoute::new(Arc::clone(&self.allocator))),
             );
         }
 
-        Ok(MsiInterruptGroup::new(
+        MsiInterruptGroup::new(
             Arc::clone(&self.vm),
             Arc::clone(&self.gsi_msi_routes),
             irq_routes,
             Arc::clone(&self.interrupt_remapper),
-        ))
+        )
     }
 }
 
@@ -470,7 +466,7 @@ impl InterruptManager for MsiInterruptManager {
         for i in config.base..config.base + config.count {
             irq_routes.insert(
                 i,
-                Mutex::new(InterruptRoute::new(Arc::clone(&self.allocator))?),
+                Mutex::new(InterruptRoute::new(Arc::clone(&self.allocator))),
             );
         }
 
@@ -486,12 +482,8 @@ impl InterruptManager for MsiInterruptManager {
         &self,
         config: Self::GroupConfig,
     ) -> interrupt::Result<Arc<Mutex<dyn InterruptSourceGroup>>> {
-        let r = self.create_group_raw(config)?;
+        let r = self.create_group_raw(config);
         Ok(Arc::new(Mutex::new(r)))
-    }
-
-    fn destroy_group(&self, _group: Arc<dyn InterruptSourceGroup>) -> Result<()> {
-        Ok(())
     }
 }
 
@@ -515,15 +507,46 @@ mod tests {
                     0x1000_0000,
                     #[cfg(target_arch = "x86_64")]
                     &[GsiApic::new(5, 19)],
+                    #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
+                    arch::IRQ_BASE,
                 )
                 .unwrap(),
             ))
         }
 
         #[test]
+        fn test_eventfd_is_allocated_on_first_use() {
+            let mut route = InterruptRoute::new(make_allocator());
+            assert!(route.irq_fd.is_none());
+            assert!(route.gsi.is_none());
+
+            let notifier = route.notifier().unwrap().unwrap();
+            assert!(route.gsi.is_none());
+            route.trigger().unwrap();
+            assert_eq!(notifier.read().unwrap(), 1);
+            route.notifier().unwrap().unwrap().write(2).unwrap();
+            assert_eq!(notifier.read().unwrap(), 2);
+
+            let mut route = InterruptRoute::new(make_allocator());
+            route.trigger().unwrap();
+            assert_eq!(route.notifier().unwrap().unwrap().read().unwrap(), 1);
+        }
+
+        #[test]
+        fn test_disconnected_external_notifier_stays_disconnected() {
+            let mut route = InterruptRoute::new(make_allocator());
+            // State left by set_notifier(None).
+            route.external_notifier = true;
+            route.allocate_irqfd().unwrap();
+            route.trigger().unwrap();
+            assert!(route.notifier().unwrap().is_none());
+            assert!(route.irq_fd.is_none());
+        }
+
+        #[test]
         fn test_allocate_gsi_on_same_route_is_idempotent() {
             let allocator = make_allocator();
-            let mut route = InterruptRoute::new(Arc::clone(&allocator)).unwrap();
+            let mut route = InterruptRoute::new(Arc::clone(&allocator));
             let gsi1 = route.allocate_gsi().unwrap();
             let gsi2 = route.allocate_gsi().unwrap();
             assert_eq!(
@@ -535,8 +558,8 @@ mod tests {
         #[test]
         fn test_allocated_gsis_are_distinct_for_different_routes() {
             let allocator = make_allocator();
-            let mut route1 = InterruptRoute::new(Arc::clone(&allocator)).unwrap();
-            let mut route2 = InterruptRoute::new(Arc::clone(&allocator)).unwrap();
+            let mut route1 = InterruptRoute::new(Arc::clone(&allocator));
+            let mut route2 = InterruptRoute::new(Arc::clone(&allocator));
             let gsi1 = route1.allocate_gsi().unwrap();
             let gsi2 = route2.allocate_gsi().unwrap();
             assert_ne!(gsi1, gsi2, "two routes must receive distinct GSIs");
@@ -548,10 +571,10 @@ mod tests {
         fn test_drop_frees_gsi() {
             let allocator = make_allocator();
             let gsi = {
-                let mut route = InterruptRoute::new(Arc::clone(&allocator)).unwrap();
+                let mut route = InterruptRoute::new(Arc::clone(&allocator));
                 route.allocate_gsi().unwrap()
             }; // Drop reclaims the GSI.
-            let mut route2 = InterruptRoute::new(Arc::clone(&allocator)).unwrap();
+            let mut route2 = InterruptRoute::new(Arc::clone(&allocator));
             let gsi2 = route2.allocate_gsi().unwrap();
             assert_eq!(gsi, gsi2, "dropped GSI should be reclaimed");
         }
@@ -559,14 +582,14 @@ mod tests {
         #[test]
         fn test_drop_without_gsi_does_not_panic() {
             // A route that never had a GSI allocated must drop cleanly.
-            drop(InterruptRoute::new(make_allocator()).unwrap());
+            drop(InterruptRoute::new(make_allocator()));
         }
 
         #[test]
         fn test_doesnt_run_out_of_gsis() {
             // Would be exhausted at 4072 if GSIs are not freed
             for _ in 0..5_000 {
-                let mut route = InterruptRoute::new(make_allocator()).unwrap();
+                let mut route = InterruptRoute::new(make_allocator());
                 route.allocate_gsi().expect("should allocate");
             }
         }

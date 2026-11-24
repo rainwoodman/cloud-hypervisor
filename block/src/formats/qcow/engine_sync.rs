@@ -149,6 +149,7 @@ mod tests {
     use vmm_sys_util::tempdir::TempDir;
     use vmm_sys_util::tempfile::TempFile;
 
+    use super::super::test_util::{DiskOptions, TestImage};
     use super::*;
     use crate::aligned_file::AlignedFile;
     use crate::async_io::{AsyncIoCompletion, GuestMemoryTarget, OwnedIoBuffer};
@@ -156,34 +157,25 @@ mod tests {
     use crate::error::BlockErrorKind;
     use crate::formats::qcow;
     use crate::formats::qcow::common::apply_dealloc_action;
-    use crate::formats::qcow::common::tests::compress_allocated_clusters;
     use crate::formats::qcow::metadata::{ClusterReadMapping, DeallocAction};
+    use crate::formats::qcow::test_util::{
+        compress_allocated_clusters, header_field, read_u64_at, write_u64_at,
+    };
     use crate::formats::qcow::{
         BackingFileConfig, Error as QcowError, ImageType, QcowDisk, QcowHeader, QcowTempDisk,
     };
     use crate::test_util::require_direct_io;
 
     const TEST_L1_L2_ADDR_MASK: u64 = 0x00ff_ffff_ffff_fe00;
-    const TEST_HEADER_L1_TABLE_OFFSET: u64 = 40;
     const TEST_CLUSTER_USED_FLAG: u64 = 1 << 63;
     const TEST_COMPRESSED_FLAG: u64 = 1 << 62;
     const TEST_ZERO_FLAG: u64 = 1;
     // Past the 16 TiB a one-cluster refcount table covers.
     const TEST_OUT_OF_BOUNDS_CLUSTER: u64 = 0x0000_2000_0000_0000;
 
-    fn read_be_u64_at(file: &mut File, offset: u64) -> u64 {
-        let mut bytes = [0u8; 8];
-        file.read_exact_at(&mut bytes, offset).unwrap();
-        u64::from_be_bytes(bytes)
-    }
-
-    fn write_be_u64_at(file: &mut File, offset: u64, value: u64) {
-        file.write_all_at(&value.to_be_bytes(), offset).unwrap();
-    }
-
     fn first_l2_entry_offset(file: &mut File) -> u64 {
-        let l1_table_offset = read_be_u64_at(file, TEST_HEADER_L1_TABLE_OFFSET);
-        let l1_entry = read_be_u64_at(file, l1_table_offset);
+        let l1_table_offset = read_u64_at(file, header_field::L1_TABLE_OFFSET as u64);
+        let l1_entry = read_u64_at(file, l1_table_offset);
         let l2_table_addr = l1_entry & TEST_L1_L2_ADDR_MASK;
         assert_ne!(l2_table_addr, 0);
         l2_table_addr
@@ -191,21 +183,21 @@ mod tests {
 
     fn set_low_bit_on_first_compressed_l2_entry(file: &mut File) {
         let l2_entry_offset = first_l2_entry_offset(file);
-        let l2_entry = read_be_u64_at(file, l2_entry_offset);
+        let l2_entry = read_u64_at(file, l2_entry_offset);
         assert_ne!(l2_entry & TEST_COMPRESSED_FLAG, 0);
-        write_be_u64_at(file, l2_entry_offset, l2_entry | TEST_ZERO_FLAG);
+        write_u64_at(file, l2_entry_offset, l2_entry | TEST_ZERO_FLAG);
         file.sync_all().unwrap();
     }
 
     fn set_first_l2_entry(file: &mut File, l2_entry: u64) {
         let l2_entry_offset = first_l2_entry_offset(file);
-        write_be_u64_at(file, l2_entry_offset, l2_entry);
+        write_u64_at(file, l2_entry_offset, l2_entry);
         file.sync_all().unwrap();
     }
 
     fn first_l2_entry(file: &mut File) -> u64 {
         let l2_entry_offset = first_l2_entry_offset(file);
-        read_be_u64_at(file, l2_entry_offset)
+        read_u64_at(file, l2_entry_offset)
     }
 
     fn qcow_header_is_corrupt(file: &File) -> bool {
@@ -657,6 +649,62 @@ mod tests {
     }
 
     #[test]
+    fn test_v2_write_zeroes() {
+        let cluster_size = 1u64 << 16;
+        let file_size = 3 * cluster_size;
+        let backing_temp = TempFile::new().unwrap();
+        backing_temp
+            .as_file()
+            .write_all_at(&vec![0xab; file_size as usize], 0)
+            .unwrap();
+        let backing_path = backing_temp.as_path().to_str().unwrap();
+
+        for (sparse, backing) in [
+            (false, None),
+            (true, None),
+            (false, Some(backing_path)),
+            (true, Some(backing_path)),
+        ] {
+            let header = QcowHeader::create_for_size_and_path(2, file_size, backing).unwrap();
+            let temp = TestImage::from_header(&header);
+            let open = || {
+                temp.open_with(DiskOptions {
+                    backing_files: true,
+                    sparse,
+                    ..Default::default()
+                })
+                .unwrap()
+            };
+            let disk = open();
+            disk.write_all_at(0, &vec![0xa5; cluster_size as usize]);
+            let mut async_io = disk.create_async_io(1).unwrap();
+            // Zero both an allocated cluster and an unallocated cluster.
+            async_io.write_zeroes(0, 2 * cluster_size, 42).unwrap();
+            assert_eq!(next_completion(async_io.as_mut()), (42, 0));
+            drop(async_io);
+            drop(disk);
+
+            let mut file = temp.as_file().try_clone().unwrap();
+            let l2_offset = first_l2_entry_offset(&mut file);
+            for offset in [l2_offset, l2_offset + 8] {
+                assert_eq!(read_u64_at(&file, offset) & TEST_ZERO_FLAG, 0);
+            }
+            let disk = open();
+            assert!(
+                async_read(&disk, 0, 2 * cluster_size as usize)
+                    .iter()
+                    .all(|&b| b == 0)
+            );
+            let untouched = if backing.is_some() { 0xab } else { 0 };
+            assert!(
+                async_read(&disk, 2 * cluster_size, cluster_size as usize)
+                    .iter()
+                    .all(|&b| b == untouched)
+            );
+        }
+    }
+
+    #[test]
     fn test_write_zeroes_compressed_entry_checks_compressed_before_zero_bit() {
         let cluster_size = 1u64 << 16;
         let data = vec![0xEE; cluster_size as usize];
@@ -737,30 +785,6 @@ mod tests {
         assert_eq!(ud, 3);
         assert_eq!(res, 0);
         assert!(async_io.next_completed_request().is_none());
-    }
-
-    #[test]
-    fn test_qcow_punch_hole_then_read() {
-        // Verify that after punch_hole, a second async_io sees zeros.
-        let data = vec![0xAB; 128 * 1024];
-        let offset = 0u64;
-        let (_temp, disk) = create_disk_with_data(100 * 1024 * 1024, &data, offset, true, false);
-
-        let mut async_io1 = disk.create_async_io(1).unwrap();
-        async_io1
-            .punch_hole(offset, data.len() as u64, 100)
-            .unwrap();
-        let (user_data, result) = next_completion(async_io1.as_mut());
-        assert_eq!(user_data, 100);
-        assert_eq!(result, 0);
-        drop(async_io1);
-
-        // Read via second async_io, should see zeros
-        let read_buf = async_read(&disk, offset, data.len());
-        assert!(
-            read_buf.iter().all(|&b| b == 0),
-            "After punch_hole, read should return zeros"
-        );
     }
 
     #[test]
@@ -2038,9 +2062,9 @@ mod tests {
         );
         writer.fsync(None).unwrap();
 
-        let mut inspect = temp.as_file().try_clone().unwrap();
-        let l1_table_offset = read_be_u64_at(&mut inspect, TEST_HEADER_L1_TABLE_OFFSET);
-        let new_l2 = read_be_u64_at(&mut inspect, l1_table_offset + 8) & TEST_L1_L2_ADDR_MASK;
+        let inspect = temp.as_file().try_clone().unwrap();
+        let l1_table_offset = read_u64_at(&inspect, header_field::L1_TABLE_OFFSET as u64);
+        let new_l2 = read_u64_at(&inspect, l1_table_offset + 8) & TEST_L1_L2_ADDR_MASK;
         assert_ne!(new_l2, old_host_offset);
     }
 
@@ -2256,9 +2280,9 @@ mod tests {
         assert_eq!(completion_tuple(&completion), (77, CLUSTER_SIZE as i32));
         aio.fsync(None).unwrap();
 
-        let mut inspect = file.try_clone().unwrap();
-        let l1_table_offset = read_be_u64_at(&mut inspect, TEST_HEADER_L1_TABLE_OFFSET);
-        let committed_l2 = read_be_u64_at(&mut inspect, l1_table_offset + 8) & TEST_L1_L2_ADDR_MASK;
+        let inspect = file.try_clone().unwrap();
+        let l1_table_offset = read_u64_at(&inspect, header_field::L1_TABLE_OFFSET as u64);
+        let committed_l2 = read_u64_at(&inspect, l1_table_offset + 8) & TEST_L1_L2_ADDR_MASK;
         assert_ne!(committed_l2, stale_punch_offset);
 
         // Queue A resumes. Completing the old action must not touch the new

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::Vm;
 use crate::arch::aarch64::gic::{Error, GicState, Result, Vgic, VgicConfig};
+use crate::arch::aarch64::regs::AARCH64_GIC_MAINT_PPI_INDEX;
 use crate::device::HypervisorDeviceError;
 use crate::kvm::KvmVm;
 
@@ -109,7 +110,7 @@ pub struct KvmGicV3Its {
 pub struct Gicv3ItsState {
     dist: Vec<u32>,
     rdist: Vec<u32>,
-    icc: Vec<u32>,
+    icc: Vec<u64>,
     // special register that enables interrupts and affinity routing
     gicd_ctlr: u32,
     its_ctlr: u64,
@@ -118,6 +119,14 @@ pub struct Gicv3ItsState {
     its_cwriter: u64,
     its_creadr: u64,
     its_baser: [u64; 8],
+    #[serde(default)]
+    dist_addr: Option<u64>,
+}
+
+impl Gicv3ItsState {
+    pub fn dist_addr(&self) -> Option<u64> {
+        self.dist_addr
+    }
 }
 
 impl From<GicState> for Gicv3ItsState {
@@ -126,6 +135,7 @@ impl From<GicState> for Gicv3ItsState {
             GicState::Kvm(state) => state,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("GicState is not valid"),
         }
     }
@@ -138,16 +148,18 @@ impl From<Gicv3ItsState> for GicState {
 }
 
 impl KvmGicV3Its {
-    /// Device trees specific constants
-    pub const ARCH_GIC_V3_MAINT_IRQ: u32 = 9;
-
     /// Returns the GIC version of the device
     fn version() -> u32 {
         kvm_bindings::kvm_device_type_KVM_DEV_TYPE_ARM_VGIC_V3
     }
 
     /// Setup the device-specific attributes
-    fn init_device_attributes(&mut self, vm: &KvmVm, nr_irqs: u32) -> Result<()> {
+    fn init_device_attributes(
+        &mut self,
+        vm: &KvmVm,
+        nr_irqs: u32,
+        maintenance_irq: Option<u32>,
+    ) -> Result<()> {
         // GicV3 part attributes
         /* Setting up the distributor attribute. */
         Self::set_device_attribute(
@@ -210,6 +222,17 @@ impl KvmGicV3Its {
             nr_irqs_ptr as u64,
             0,
         )?;
+
+        if let Some(maintenance_irq) = maintenance_irq {
+            let maintenance_irq_ptr = &raw const maintenance_irq;
+            Self::set_device_attribute(
+                &self.device,
+                kvm_bindings::KVM_DEV_ARM_VGIC_GRP_MAINT_IRQ,
+                0,
+                maintenance_irq_ptr as u64,
+                0,
+            )?;
+        }
 
         // Finalize the GIC.
         Self::set_device_attribute(
@@ -275,7 +298,7 @@ impl KvmGicV3Its {
             vcpu_count: config.vcpu_count,
         };
 
-        gic_device.init_device_attributes(vm, config.nr_irqs)?;
+        gic_device.init_device_attributes(vm, config.nr_irqs, config.maintenance_irq)?;
 
         Ok(gic_device)
     }
@@ -295,7 +318,7 @@ impl Vgic for KvmGicV3Its {
     }
 
     fn fdt_maint_irq(&self) -> u32 {
-        KvmGicV3Its::ARCH_GIC_V3_MAINT_IRQ
+        AARCH64_GIC_MAINT_PPI_INDEX
     }
 
     fn vcpu_count(&self) -> u64 {
@@ -313,6 +336,20 @@ impl Vgic for KvmGicV3Its {
 
     fn msi_properties(&self) -> [u64; 2] {
         [self.msi_addr, self.msi_size]
+    }
+
+    fn config(&self) -> VgicConfig {
+        VgicConfig {
+            vcpu_count: self.vcpu_count,
+            dist_addr: self.dist_addr,
+            dist_size: self.dist_size,
+            redists_addr: self.redists_addr,
+            redists_size: self.redists_size,
+            msi_addr: self.msi_addr,
+            msi_size: self.msi_size,
+            nr_irqs: 0,
+            maintenance_irq: None,
+        }
     }
 
     /// Save the state of GICv3ITS.
@@ -377,6 +414,7 @@ impl Vgic for KvmGicV3Its {
             its_cwriter: its_cwriter_state,
             its_creadr: its_creadr_state,
             its_baser: its_baser_state,
+            dist_addr: Some(self.dist_addr),
         }
         .into();
 
@@ -487,6 +525,7 @@ mod tests {
             msi_addr: 0x0900_0000 - 0x01_0000 - 0x02_0000 - 0x02_0000,
             msi_size: 0x02_0000,
             nr_irqs: 256,
+            maintenance_irq: None,
         }
     }
 
@@ -494,6 +533,7 @@ mod tests {
     fn test_create_gic() {
         let hv = crate::new().unwrap();
         let vm = hv.create_vm(HypervisorVmConfig::default()).unwrap();
+        let _ = vm.create_vcpu(0, None).unwrap();
 
         KvmGicV3Its::new(&*vm, &create_test_vgic_config()).unwrap();
     }
@@ -563,6 +603,7 @@ mod tests {
             msi_addr: 0x0900_0000 - 0x01_0000 - 0x04_0000 - 0x02_0000,
             msi_size: 0x02_0000,
             nr_irqs: 256,
+            maintenance_irq: None,
         }
     }
 

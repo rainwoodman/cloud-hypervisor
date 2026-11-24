@@ -10,14 +10,15 @@
 //! * no interrupt is generated
 //! * RTC cannot be disabled via RTCCR
 //! * no test registers
-//!
 use std::result;
 use std::sync::{Arc, Barrier};
-use std::time::Instant;
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use log::{debug, warn};
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_device::BusDevice;
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 
 use crate::{read_le_u32, write_le_u32};
 
@@ -52,44 +53,6 @@ pub(super) enum Error {
 
 type Result<T> = result::Result<T, Error>;
 
-/// Wrapper over `libc::clockid_t` to specify Linux Kernel clock source.
-pub enum ClockType {
-    /// Equivalent to `libc::CLOCK_MONOTONIC`.
-    Monotonic,
-    /// Equivalent to `libc::CLOCK_REALTIME`.
-    Real,
-    /// Equivalent to `libc::CLOCK_PROCESS_CPUTIME_ID`.
-    ProcessCpu,
-    /// Equivalent to `libc::CLOCK_THREAD_CPUTIME_ID`.
-    ThreadCpu,
-}
-
-impl From<ClockType> for libc::clockid_t {
-    fn from(ct: ClockType) -> libc::clockid_t {
-        match ct {
-            ClockType::Monotonic => libc::CLOCK_MONOTONIC,
-            ClockType::Real => libc::CLOCK_REALTIME,
-            ClockType::ProcessCpu => libc::CLOCK_PROCESS_CPUTIME_ID,
-            ClockType::ThreadCpu => libc::CLOCK_THREAD_CPUTIME_ID,
-        }
-    }
-}
-
-/// Returns a timestamp in nanoseconds based on the provided clock type.
-///
-/// # Arguments
-///
-/// * `clock_type` - Identifier of the Linux Kernel clock on which to act.
-pub(super) fn get_time(clock_type: ClockType) -> u64 {
-    let mut time_struct = libc::timespec {
-        tv_sec: 0,
-        tv_nsec: 0,
-    };
-    // SAFETY: the parameters are valid.
-    unsafe { libc::clock_gettime(clock_type.into(), &mut time_struct) };
-    seconds_to_nanoseconds(time_struct.tv_sec).unwrap() as u64 + (time_struct.tv_nsec as u64)
-}
-
 /// Converts a timestamp in seconds to an equivalent one in nanoseconds.
 /// Returns `None` if the conversion overflows.
 ///
@@ -98,6 +61,15 @@ pub(super) fn get_time(clock_type: ClockType) -> u64 {
 /// * `value` - Timestamp in seconds.
 pub(super) fn seconds_to_nanoseconds(value: i64) -> Option<i64> {
     value.checked_mul(NANOS_PER_SECOND as i64)
+}
+
+pub const RTC_SNAPSHOT_ID: &str = "__rtc_pl031";
+
+#[derive(Default, Serialize, Deserialize)]
+pub struct RtcState {
+    offset_nanoseconds: i64,
+    match_value: u32,
+    load: u32,
 }
 
 /// A RTC device following the PL031 specification..
@@ -112,13 +84,18 @@ pub struct Rtc {
 
 impl Rtc {
     /// Constructs an AMBA PL031 RTC device.
-    pub fn new() -> Self {
+    pub fn new(state: Option<RtcState>) -> Self {
+        let state = state.unwrap_or_default();
         Self {
             // This is used only for duration measuring purposes.
             previous_now: Instant::now(),
-            tick_offset: get_time(ClockType::Real) as i64,
-            match_value: 0,
-            load: 0,
+            tick_offset: SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos() as i64
+                + state.offset_nanoseconds,
+            match_value: state.match_value,
+            load: state.load,
         }
     }
 
@@ -158,9 +135,34 @@ impl Rtc {
 
 impl Default for Rtc {
     fn default() -> Self {
-        Self::new()
+        Self::new(None)
     }
 }
+
+impl Snapshottable for Rtc {
+    fn id(&self) -> String {
+        RTC_SNAPSHOT_ID.to_string()
+    }
+
+    fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        // Keep the guest's offset from wall time so the RTC advances during downtime.
+        let guest_time =
+            i128::from(self.tick_offset) + self.previous_now.elapsed().as_nanos() as i128;
+        let host_time = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos() as i128;
+        Snapshot::new_from_state(&RtcState {
+            offset_nanoseconds: (guest_time - host_time) as i64,
+            match_value: self.match_value,
+            load: self.load,
+        })
+    }
+}
+
+impl Pausable for Rtc {}
+impl Transportable for Rtc {}
+impl Migratable for Rtc {}
 
 impl BusDevice for Rtc {
     fn read(&mut self, _base: u64, offset: u64, data: &mut [u8]) {
@@ -217,7 +219,8 @@ impl BusDevice for Rtc {
 
 #[cfg(test)]
 mod tests {
-    use std::{fmt, ptr};
+    use std::thread;
+    use std::time::Duration;
 
     use super::*;
     use crate::{
@@ -227,119 +230,25 @@ mod tests {
 
     const LEGACY_RTC_MAPPED_IO_START: u64 = 0x0901_0000;
 
-    struct LocalTime {
-        sec: i32,
-        min: i32,
-        hour: i32,
-        mday: i32,
-        mon: i32,
-        year: i32,
-        nsec: i64,
-    }
-
-    impl LocalTime {
-        fn now() -> LocalTime {
-            let mut timespec = libc::timespec {
-                tv_sec: 0,
-                tv_nsec: 0,
-            };
-            let mut tm: libc::tm = libc::tm {
-                tm_sec: 0,
-                tm_min: 0,
-                tm_hour: 0,
-                tm_mday: 0,
-                tm_mon: 0,
-                tm_year: 0,
-                tm_wday: 0,
-                tm_yday: 0,
-                tm_isdst: 0,
-                tm_gmtoff: 0,
-                tm_zone: ptr::null(),
-            };
-
-            // SAFETY: the parameters are valid.
-            unsafe {
-                libc::clock_gettime(libc::CLOCK_REALTIME, &mut timespec);
-                libc::localtime_r(&timespec.tv_sec, &mut tm);
-            }
-
-            LocalTime {
-                sec: tm.tm_sec,
-                min: tm.tm_min,
-                hour: tm.tm_hour,
-                mday: tm.tm_mday,
-                mon: tm.tm_mon,
-                year: tm.tm_year,
-                nsec: timespec.tv_nsec,
-            }
-        }
-    }
-
-    impl fmt::Display for LocalTime {
-        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            write!(
-                f,
-                "{}-{:02}-{:02}T{:02}:{:02}:{:02}.{:09}",
-                self.year + 1900,
-                self.mon + 1,
-                self.mday,
-                self.hour,
-                self.min,
-                self.sec,
-                self.nsec
-            )
-        }
-    }
-
     #[test]
-    fn test_get_time() {
-        for _ in 0..1000 {
-            assert!(get_time(ClockType::Monotonic) <= get_time(ClockType::Monotonic));
-        }
-
-        for _ in 0..1000 {
-            assert!(get_time(ClockType::ProcessCpu) <= get_time(ClockType::ProcessCpu));
-        }
-
-        for _ in 0..1000 {
-            assert!(get_time(ClockType::ThreadCpu) <= get_time(ClockType::ThreadCpu));
-        }
-
-        assert_ne!(get_time(ClockType::Real), 0);
-    }
-
-    #[test]
-    fn test_local_time_display() {
-        let local_time = LocalTime {
-            sec: 30,
-            min: 15,
-            hour: 10,
-            mday: 4,
-            mon: 6,
-            year: 119,
-            nsec: 123_456_789,
-        };
-        assert_eq!(
-            String::from("2019-07-04T10:15:30.123456789"),
-            local_time.to_string()
-        );
-
-        let local_time = LocalTime {
-            sec: 5,
-            min: 5,
-            hour: 5,
-            mday: 23,
-            mon: 7,
-            year: 44,
-            nsec: 123,
-        };
-        assert_eq!(
-            String::from("1944-08-23T05:05:05.000000123"),
-            local_time.to_string()
-        );
-
-        let local_time = LocalTime::now();
-        assert!(local_time.mon >= 0 && local_time.mon <= 11);
+    fn restore_preserves_guest_time_and_registers() {
+        let mut rtc = Rtc::new(None);
+        let start = Instant::now();
+        rtc.write(0, RTCLR, &1234u32.to_le_bytes());
+        rtc.write(0, RTCMR, &5678u32.to_le_bytes());
+        let state = rtc.snapshot().unwrap().to_state().unwrap();
+        // The RTC follows wall time, including time spent off-host.
+        thread::sleep(Duration::from_millis(1100));
+        let mut restored = Rtc::new(Some(state));
+        let mut data = [0; 4];
+        restored.read(0, RTCLR, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 1234);
+        restored.read(0, RTCMR, &mut data);
+        assert_eq!(u32::from_le_bytes(data), 5678);
+        restored.read(0, RTCDR, &mut data);
+        let time = u32::from_le_bytes(data);
+        assert!(time >= 1235);
+        assert!(time <= 1235 + start.elapsed().as_secs() as u32);
     }
 
     #[test]
@@ -354,7 +263,7 @@ mod tests {
 
     #[test]
     fn test_rtc_read_write_and_event() {
-        let mut rtc = Rtc::new();
+        let mut rtc = Rtc::new(None);
         let mut data = [0; 4];
 
         // Read and write to the MR register.
@@ -365,8 +274,11 @@ mod tests {
         assert_eq!(v, 123);
 
         // Read and write to the LR register.
-        let v = get_time(ClockType::Real);
-        write_le_u32(&mut data, (v / NANOS_PER_SECOND) as u32);
+        let v = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("host clock should be after the Unix epoch")
+            .as_secs() as u32;
+        write_le_u32(&mut data, v);
         let previous_now_before = rtc.previous_now;
         rtc.write(LEGACY_RTC_MAPPED_IO_START, RTCLR, &data);
 
@@ -374,7 +286,7 @@ mod tests {
 
         rtc.read(LEGACY_RTC_MAPPED_IO_START, RTCLR, &mut data);
         let v_read = read_le_u32(&data);
-        assert_eq!((v / NANOS_PER_SECOND) as u32, v_read);
+        assert_eq!(v, v_read);
 
         // Read and write to IMSC register.
         // Test with non zero value. Our device ignores the write.

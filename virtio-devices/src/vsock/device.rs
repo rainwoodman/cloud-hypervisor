@@ -10,12 +10,10 @@
 
 use std::os::unix::io::AsRawFd;
 use std::path::PathBuf;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier, RwLock};
+use std::sync::{Arc, RwLock};
 use std::{fs, io, result};
 
 use anyhow::anyhow;
-use byteorder::{ByteOrder, LittleEndian};
 use event_monitor::event;
 use log::{debug, error, info, warn};
 use seccompiler::SeccompAction;
@@ -45,13 +43,16 @@ use vmm_sys_util::eventfd::EventFd;
 /// - a TX queue FD;
 /// - an event queue FD; and
 /// - a backend FD.
-///
-use super::{VsockBackend, VsockPacket};
+use super::{
+    ConnectionInfo, SocketType, VsockBackend, VsockPacket,
+    defs::uapi::{self, VIRTIO_VSOCK_F_SEQPACKET},
+};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
+use crate::thread_helper::PauseCommon;
 use crate::{
     ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
-    Error as DeviceError, GuestMemoryMmap, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
+    Error as DeviceError, GuestMemory, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_IN_ORDER,
     VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice, VirtioDeviceType, VirtioInterrupt,
     VirtioInterruptType,
 };
@@ -92,9 +93,8 @@ enum Error {
 /// - on backend event:
 ///   - forward the event to the backend; then
 ///   - again, attempt to fetch any incoming packets queued by the backend into virtio RX buffers.
-///
 pub(crate) struct VsockEpollHandler<B: VsockBackend> {
-    pub mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    pub mem: GuestMemoryAtomic<GuestMemory>,
     pub queues: Vec<Queue>,
     pub queue_evts: Vec<EventFd>,
     pub kill_evt: EventFd,
@@ -102,6 +102,8 @@ pub(crate) struct VsockEpollHandler<B: VsockBackend> {
     pub interrupt_cb: Arc<dyn VirtioInterrupt>,
     pub backend: Arc<RwLock<B>>,
     pub access_platform: Option<Arc<dyn AccessPlatform>>,
+    pub backend_parked: bool,
+    pub seqpacket_negotiated: bool,
 }
 
 impl<B> VsockEpollHandler<B>
@@ -110,7 +112,6 @@ where
 {
     /// Signal the guest driver that we've used some virtio buffers that it had previously made
     /// available.
-    ///
     fn signal_used_queue(&self, queue_index: u16) -> result::Result<(), DeviceError> {
         debug!("vsock: raising IRQ");
 
@@ -123,9 +124,8 @@ where
     }
 
     /// Walk the driver-provided RX queue buffers and attempt to fill them up with any data that we
-    /// have pending.
-    ///
-    fn process_rx(&mut self) -> result::Result<bool, Error> {
+    /// have pending. Returns whether a buffer was used, and whether data is left without a buffer.
+    fn process_rx(&mut self) -> result::Result<(bool, bool), Error> {
         debug!("vsock: epoll_handler::process_rx()");
 
         let mut used_descs = false;
@@ -136,7 +136,27 @@ where
                 self.access_platform.as_deref(),
             ) {
                 Ok(mut pkt) => {
-                    if self.backend.write().unwrap().recv_pkt(&mut pkt).is_ok() {
+                    let received = self.backend.write().unwrap().recv_pkt(&mut pkt);
+                    if received.is_ok() {
+                        if pkt.type_() == uapi::VSOCK_TYPE_SEQPACKET && !self.seqpacket_negotiated {
+                            let (src_cid, dst_cid, src_port, dst_port) =
+                                (pkt.src_cid(), pkt.dst_cid(), pkt.src_port(), pkt.dst_port());
+                            pkt.set_src_cid(dst_cid)
+                                .set_dst_cid(src_cid)
+                                .set_src_port(dst_port)
+                                .set_dst_port(src_port)
+                                .set_op(uapi::VSOCK_OP_RST)
+                                .set_len(0)
+                                .set_flags(0);
+                            if let Err(error) = self.backend.write().unwrap().send_pkt(&pkt) {
+                                warn!(
+                                    "vsock: failed to reset unnegotiated SEQPACKET connection: {error:?}"
+                                );
+                            }
+                            self.queues[0].go_to_previous_position();
+                            continue;
+                        }
+
                         match pkt.commit_hdr(desc_chain.memory()) {
                             Ok(()) => pkt.hdr().len() as u32 + pkt.len(),
                             Err(err) => {
@@ -151,7 +171,7 @@ where
                         // We are using a consuming iterator over the virtio buffers, so, if we can't
                         // fill in this buffer, we'll need to undo the last iterator step.
                         self.queues[0].go_to_previous_position();
-                        break;
+                        return Ok((used_descs, false));
                     }
                 }
                 Err(e) => {
@@ -166,12 +186,39 @@ where
             used_descs = true;
         }
 
-        Ok(used_descs)
+        Ok((used_descs, self.backend.read().unwrap().has_pending_rx()))
+    }
+
+    /// Fill RX buffers and stop polling the backend while it has data but no RX buffer is left.
+    fn rx_and_park(&mut self, helper: &mut EpollHelper) -> result::Result<(), EpollHelperError> {
+        if !self.backend_parked && !self.backend.read().unwrap().has_pending_rx() {
+            return Ok(());
+        }
+        let (used, starved) = self.process_rx().map_err(|e| {
+            EpollHelperError::HandleEvent(anyhow!("Failed to process RX queue: {e:?}"))
+        })?;
+        if used {
+            self.signal_used_queue(0).map_err(|e| {
+                EpollHelperError::HandleEvent(anyhow!("Failed to signal used RX queue: {e:?}"))
+            })?;
+        }
+        if starved != self.backend_parked {
+            let evset = if starved {
+                epoll::Events::empty()
+            } else {
+                epoll::Events::EPOLLIN
+            };
+            let fd = self.backend.read().unwrap().get_polled_fd();
+            match helper.mod_event_custom(fd, BACKEND_EVENT, evset) {
+                Ok(()) => self.backend_parked = starved,
+                Err(e) => warn!("vsock: failed to update backend polling: {e:?}"),
+            }
+        }
+        Ok(())
     }
 
     /// Walk the driver-provided TX queue buffers, package them up as vsock packets, and send them to
     /// the backend for processing.
-    ///
     fn process_tx(&mut self) -> result::Result<bool, Error> {
         debug!("vsock: epoll_handler::process_tx()");
 
@@ -193,6 +240,15 @@ where
                 }
             };
 
+            if pkt.type_() == uapi::VSOCK_TYPE_SEQPACKET && !self.seqpacket_negotiated {
+                error!("vsock: dropping SEQPACKET packet without feature negotiation");
+                self.queues[1]
+                    .add_used(desc_chain.memory(), desc_chain.head_index(), 0)
+                    .map_err(Error::QueueAddUsed)?;
+                used_descs = true;
+                continue;
+            }
+
             if self.backend.write().unwrap().send_pkt(&pkt).is_err() {
                 self.queues[1].go_to_previous_position();
                 break;
@@ -207,17 +263,13 @@ where
         Ok(used_descs)
     }
 
-    fn run(
-        &mut self,
-        paused: &AtomicBool,
-        paused_sync: &Barrier,
-    ) -> result::Result<(), EpollHelperError> {
+    fn run(&mut self, pause_common: &PauseCommon) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
         helper.add_event(self.queue_evts[0].as_raw_fd(), RX_QUEUE_EVENT)?;
         helper.add_event(self.queue_evts[1].as_raw_fd(), TX_QUEUE_EVENT)?;
         helper.add_event(self.queue_evts[2].as_raw_fd(), EVT_QUEUE_EVENT)?;
         helper.add_event(self.backend.read().unwrap().get_polled_fd(), BACKEND_EVENT)?;
-        helper.run(paused, paused_sync, self)?;
+        helper.run(pause_common, self)?;
 
         Ok(())
     }
@@ -229,7 +281,7 @@ where
 {
     fn handle_event(
         &mut self,
-        _helper: &mut EpollHelper,
+        helper: &mut EpollHelper,
         event: &epoll::Event,
     ) -> result::Result<(), EpollHelperError> {
         let evset = match epoll::Events::from_bits(event.events) {
@@ -248,24 +300,19 @@ where
                 self.queue_evts[0].read().map_err(|e| {
                     EpollHelperError::HandleEvent(anyhow!("Failed to get RX queue event: {e:?}"))
                 })?;
-                if self.backend.read().unwrap().has_pending_rx() {
-                    let needs_notification = self.process_rx().map_err(|e| {
-                        EpollHelperError::HandleEvent(anyhow!("Failed to process RX queue: {e:?}"))
-                    })?;
-                    if needs_notification {
-                        self.signal_used_queue(0).map_err(|e| {
-                            EpollHelperError::HandleEvent(anyhow!(
-                                "Failed to signal used RX queue: {e:?}"
-                            ))
-                        })?;
-                    }
+                if self.backend_parked {
+                    self.backend.write().unwrap().notify(epoll::Events::EPOLLIN);
                 }
+                self.rx_and_park(helper)?;
             }
             TX_QUEUE_EVENT => {
                 debug!("vsock: TX queue event");
                 self.queue_evts[1].read().map_err(|e| {
                     EpollHelperError::HandleEvent(anyhow!("Failed to get TX queue event: {e:?}"))
                 })?;
+                if self.backend_parked {
+                    self.backend.write().unwrap().notify(epoll::Events::EPOLLIN);
+                }
 
                 let needs_notification = self.process_tx().map_err(|e| {
                     EpollHelperError::HandleEvent(anyhow!("Failed to process TX queue: {e:?}"))
@@ -281,18 +328,7 @@ where
                 // The backend may have queued up responses to the packets we sent during TX queue
                 // processing. If that happened, we need to fetch those responses and place them
                 // into RX buffers.
-                if self.backend.read().unwrap().has_pending_rx() {
-                    let needs_notification = self.process_rx().map_err(|e| {
-                        EpollHelperError::HandleEvent(anyhow!("Failed to process RX queue: {e:?}"))
-                    })?;
-                    if needs_notification {
-                        self.signal_used_queue(0).map_err(|e| {
-                            EpollHelperError::HandleEvent(anyhow!(
-                                "Failed to signal used RX queue: {e:?}"
-                            ))
-                        })?;
-                    }
-                }
+                self.rx_and_park(helper)?;
             }
             EVT_QUEUE_EVENT => {
                 debug!("vsock: EVT queue event");
@@ -318,18 +354,7 @@ where
                         ))
                     })?;
                 }
-                if self.backend.read().unwrap().has_pending_rx() {
-                    let needs_notification = self.process_rx().map_err(|e| {
-                        EpollHelperError::HandleEvent(anyhow!("Failed to process RX queue: {e:?}"))
-                    })?;
-                    if needs_notification {
-                        self.signal_used_queue(0).map_err(|e| {
-                            EpollHelperError::HandleEvent(anyhow!(
-                                "Failed to signal used RX queue: {e:?}"
-                            ))
-                        })?;
-                    }
-                }
+                self.rx_and_park(helper)?;
             }
             _ => {
                 return Err(EpollHelperError::HandleEvent(anyhow!(
@@ -357,8 +382,33 @@ pub struct Vsock<B: VsockBackend> {
 pub struct VsockState {
     pub avail_features: u64,
     pub acked_features: u64,
+    #[serde(default, deserialize_with = "deserialize_connections")]
+    pub connections: Vec<ConnectionInfo>,
     #[serde(default)]
-    pub connections: Vec<(u32, u32)>,
+    pub local_port_last: Option<u32>,
+}
+
+fn deserialize_connections<'de, D>(deserializer: D) -> result::Result<Vec<ConnectionInfo>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Connection {
+        Typed(ConnectionInfo),
+        Stream((u32, u32)),
+    }
+    Vec::<Connection>::deserialize(deserializer).map(|connections| {
+        connections
+            .into_iter()
+            .map(|connection| match connection {
+                Connection::Typed(connection) => connection,
+                Connection::Stream((local_port, peer_port)) => {
+                    (local_port, peer_port, SocketType::Stream.into())
+                }
+            })
+            .collect()
+    })
 }
 
 impl<B> Vsock<B>
@@ -383,9 +433,15 @@ where
             // Instead of letting the guest connection hang/timeout, proactively let
             // the guest know the connection is gone.
             backend.queue_rst_for_connections(state.connections.clone());
+            // New connection must not use old, stale, port
+            if let Some(local_port_last) = state.local_port_last {
+                backend.set_local_port_last(local_port_last);
+            }
             (state.avail_features, state.acked_features, true)
         } else {
-            let mut avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_F_IN_ORDER);
+            let mut avail_features = (1u64 << VIRTIO_F_VERSION_1)
+                | (1u64 << VIRTIO_F_IN_ORDER)
+                | (1u64 << VIRTIO_VSOCK_F_SEQPACKET);
 
             if access_platform_enabled {
                 avail_features |= 1u64 << VIRTIO_F_ACCESS_PLATFORM;
@@ -398,11 +454,9 @@ where
                 device_type: VirtioDeviceType::Vsock as u32,
                 avail_features,
                 acked_features,
-                paused_sync: Some(Arc::new(Barrier::new(2))),
                 queue_sizes: QUEUE_SIZES.to_vec(),
                 min_queues: NUM_QUEUES,
-                paused: Arc::new(AtomicBool::new(paused)),
-                ..Default::default()
+                ..VirtioCommon::new(paused)?
             },
             id,
             cid: cid.into(),
@@ -414,10 +468,12 @@ where
     }
 
     fn state(&self) -> VsockState {
+        let backend = self.backend.read().unwrap();
         VsockState {
             avail_features: self.common.avail_features,
             acked_features: self.common.acked_features,
-            connections: self.backend.read().unwrap().connections(),
+            connections: backend.connections(),
+            local_port_last: backend.local_port_last(),
         }
     }
 
@@ -449,10 +505,12 @@ where
 
     fn read_config(&self, offset: u64, data: &mut [u8]) {
         match offset {
-            0 if data.len() == 8 => LittleEndian::write_u64(data, self.cid),
-            0 if data.len() == 4 => LittleEndian::write_u32(data, (self.cid & 0xffff_ffff) as u32),
+            0 if data.len() == 8 => data.copy_from_slice(&self.cid.to_le_bytes()),
+            0 if data.len() == 4 => {
+                data.copy_from_slice(&((self.cid & 0xffff_ffff) as u32).to_le_bytes());
+            }
             4 if data.len() == 4 => {
-                LittleEndian::write_u32(data, ((self.cid >> 32) & 0xffff_ffff) as u32);
+                data.copy_from_slice(&(((self.cid >> 32) & 0xffff_ffff) as u32).to_le_bytes());
             }
             _ => warn!(
                 "vsock: virtio-vsock received invalid read request of {} bytes at offset {}",
@@ -488,10 +546,9 @@ where
             interrupt_cb: Arc::clone(&interrupt_cb),
             backend: Arc::clone(&self.backend),
             access_platform: self.common.access_platform(),
+            backend_parked: false,
+            seqpacket_negotiated: self.common.acked_features & (1 << VIRTIO_VSOCK_F_SEQPACKET) != 0,
         };
-
-        let paused = Arc::clone(&self.common.paused);
-        let paused_sync = self.common.paused_sync.clone();
 
         self.common.spawn_worker(
             &self.id,
@@ -500,7 +557,7 @@ where
             &self.exit_evt,
             Arc::clone(&device_status),
             Arc::clone(&interrupt_cb),
-            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            move |pause_common| handler.run(pause_common),
         )?;
 
         event!("virtio-device", "activated", "id", &self.id);
@@ -509,6 +566,7 @@ where
 
     fn reset(&mut self) {
         self.common.reset();
+        self.common.acked_features = 0;
         event!("virtio-device", "reset", "id", &self.id);
     }
 
@@ -567,26 +625,22 @@ mod tests {
     #[test]
     fn test_virtio_device() {
         let mut ctx = TestContext::new();
-        let avail_features = (1u64 << VIRTIO_F_VERSION_1) | (1u64 << VIRTIO_F_IN_ORDER);
+        let avail_features = (1u64 << VIRTIO_F_VERSION_1)
+            | (1u64 << VIRTIO_F_IN_ORDER)
+            | (1u64 << VIRTIO_VSOCK_F_SEQPACKET);
         let device_features = avail_features;
         let driver_features: u64 = avail_features | 1 | (1 << 32);
         let device_pages = [
             (device_features & 0xffff_ffff) as u32,
             (device_features >> 32) as u32,
         ];
-        let driver_pages = [
-            (driver_features & 0xffff_ffff) as u32,
-            (driver_features >> 32) as u32,
-        ];
         assert_eq!(ctx.device.device_type(), VirtioDeviceType::Vsock as u32);
         assert_eq!(ctx.device.queue_max_sizes(), QUEUE_SIZES);
         assert_eq!(ctx.device.features() as u32, device_pages[0]);
         assert_eq!((ctx.device.features() >> 32) as u32, device_pages[1]);
 
-        // Ack device features, page 0.
-        ctx.device.ack_features(u64::from(driver_pages[0]));
-        // Ack device features, page 1.
-        ctx.device.ack_features(u64::from(driver_pages[1]) << 32);
+        // Ack device features.
+        ctx.device.ack_features(driver_features);
         // Check that no side effect are present, and that the acked features are exactly the same
         // as the device features.
         assert_eq!(
@@ -595,22 +649,19 @@ mod tests {
         );
 
         // Test reading 32-bit chunks.
-        let mut data = [0u8; 8];
-        ctx.device.read_config(0, &mut data[..4]);
+        let mut data = [0u8; 4];
+        ctx.device.read_config(0, &mut data);
+        assert_eq!(u64::from(u32::from_le_bytes(data)), ctx.cid & 0xffff_ffff);
+        ctx.device.read_config(4, &mut data);
         assert_eq!(
-            u64::from(LittleEndian::read_u32(&data)),
-            ctx.cid & 0xffff_ffff
-        );
-        ctx.device.read_config(4, &mut data[4..]);
-        assert_eq!(
-            u64::from(LittleEndian::read_u32(&data[4..])),
+            u64::from(u32::from_le_bytes(data)),
             (ctx.cid >> 32) & 0xffff_ffff
         );
 
         // Test reading 64-bit.
         let mut data = [0u8; 8];
         ctx.device.read_config(0, &mut data);
-        assert_eq!(LittleEndian::read_u64(&data), ctx.cid);
+        assert_eq!(u64::from_le_bytes(data), ctx.cid);
 
         // Check that out-of-bounds reading doesn't mutate the destination buffer.
         let mut data = [0u8, 1, 2, 3, 4, 5, 6, 7];
@@ -660,18 +711,6 @@ mod tests {
                 device_status: Arc::new(AtomicU8::new(0)),
             })
             .unwrap();
-    }
-
-    #[test]
-    fn test_irq() {
-        // Test case: successful IRQ signaling.
-        {
-            let test_ctx = TestContext::new();
-            let ctx = test_ctx.create_epoll_handler_context();
-
-            let _queue: Queue = Queue::new(256).unwrap();
-            ctx.handler.signal_used_queue(0).unwrap();
-        }
     }
 
     #[test]
@@ -902,6 +941,45 @@ mod tests {
             // The RX queue should've been left untouched.
             assert_eq!(ctx.guest_rxvq.used.idx.get(), 0);
         }
+    }
+
+    #[test]
+    fn test_backend_parked_without_rx_buffers() {
+        let test_ctx = TestContext::new();
+        let mut ctx = test_ctx.create_epoll_handler_context();
+        let mut helper = EpollHelper::new(&ctx.handler.kill_evt, &ctx.handler.pause_evt).unwrap();
+        let fd = ctx.handler.backend.read().unwrap().get_polled_fd();
+        helper.add_event(fd, BACKEND_EVENT).unwrap();
+
+        // The backend has data but the guest posted only one RX buffer, so the backend is parked.
+        ctx.handler.backend.write().unwrap().set_pending_rx(true);
+        let event = epoll::Event::new(epoll::Events::EPOLLIN, BACKEND_EVENT as u64);
+        ctx.handler.handle_event(&mut helper, &event).unwrap();
+        assert_eq!(ctx.guest_rxvq.used.idx.get(), 1);
+        assert!(ctx.handler.backend_parked);
+
+        ctx.handler.backend.write().unwrap().evset = None;
+        // A TX kick still lets the backend handle its events while it stays parked.
+        ctx.handler.queue_evts[1].write(1).unwrap();
+        let event = epoll::Event::new(epoll::Events::EPOLLIN, TX_QUEUE_EVENT as u64);
+        ctx.handler.handle_event(&mut helper, &event).unwrap();
+        assert_eq!(
+            ctx.handler.backend.read().unwrap().evset,
+            Some(epoll::Events::EPOLLIN)
+        );
+        assert!(ctx.handler.backend_parked);
+
+        ctx.handler.backend.write().unwrap().evset = None;
+        // Once the backend has no more data, an RX kick polls it again.
+        ctx.handler.backend.write().unwrap().set_pending_rx(false);
+        ctx.handler.queue_evts[0].write(1).unwrap();
+        let event = epoll::Event::new(epoll::Events::EPOLLIN, RX_QUEUE_EVENT as u64);
+        ctx.handler.handle_event(&mut helper, &event).unwrap();
+        assert_eq!(
+            ctx.handler.backend.read().unwrap().evset,
+            Some(epoll::Events::EPOLLIN)
+        );
+        assert!(!ctx.handler.backend_parked);
     }
 
     #[test]

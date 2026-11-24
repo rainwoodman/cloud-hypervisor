@@ -4,12 +4,10 @@
 //
 
 use std::any::Any;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Barrier};
 use std::{io, result};
 
-use anyhow::anyhow;
 use log::{debug, error};
 use pci::{
     BarReprogrammingParams, PCI_CONFIGURATION_ID, PciBarConfiguration, PciBarPrefetchable,
@@ -18,9 +16,8 @@ use pci::{
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-use vm_allocator::{AddressAllocator, SystemAllocator};
-use vm_device::{BusDevice, Resource, UserspaceMapping};
-use vm_memory::bitmap::AtomicBitmap;
+use vm_allocator::{AddressAllocator, GuestRegion, SystemAllocator};
+use vm_device::{BusDevice, Resource};
 use vm_memory::{Address, GuestAddress};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 
@@ -35,20 +32,12 @@ const IVSHMEM_SUBSYSTEM_ID: u16 = 0x1100;
 
 const IVSHMEM_REG_BAR_SIZE: u64 = 0x100;
 
-type MmapRegion = vm_memory::MmapRegion<AtomicBitmap>;
-
 #[derive(Debug, Error)]
 pub enum IvshmemError {
-    #[error("Failed to retrieve PciConfigurationState: {0}")]
-    RetrievePciConfigurationState(#[source] anyhow::Error),
-    #[error("Failed to retrieve IvshmemDeviceState: {0}")]
-    RetrieveIvshmemDeviceStateState(#[source] anyhow::Error),
-    #[error("Failed to create user memory region.")]
-    CreateUserMemoryRegion(#[source] anyhow::Error),
-    #[error("Failed to create userspace mapping.")]
-    CreateUserspaceMapping(#[source] anyhow::Error),
-    #[error("Failed to remove old userspace mapping.")]
-    RemoveUserspaceMapping(#[source] anyhow::Error),
+    #[error("Failed to retrieve PciConfigurationState")]
+    RetrievePciConfigurationState(#[source] MigratableError),
+    #[error("Failed to retrieve IvshmemDeviceState")]
+    RetrieveIvshmemDeviceStateState(#[source] MigratableError),
     #[error("Missing memory region")]
     MissingMemoryRegion,
 }
@@ -62,23 +51,6 @@ impl PciSubclass for IvshmemSubclass {
     fn get_register_value(&self) -> u8 {
         *self as u8
     }
-}
-
-pub trait IvshmemOps: Send + Sync {
-    fn map_ram_region(
-        &mut self,
-        start_addr: u64,
-        size: usize,
-        backing_file: Option<PathBuf>,
-    ) -> Result<(Arc<MmapRegion>, UserspaceMapping), IvshmemError>;
-
-    fn create_userspace_mapping(
-        &mut self,
-        start_addr: u64,
-        region: Arc<MmapRegion>,
-    ) -> Result<UserspaceMapping, IvshmemError>;
-
-    fn unmap_ram_region(&mut self, mapping: UserspaceMapping) -> Result<(), IvshmemError>;
 }
 
 /// Inner-Vm Shared Memory Device (Ivshmem device)
@@ -102,9 +74,7 @@ pub struct IvshmemDevice {
     bar_regions: Vec<PciBarConfiguration>,
 
     region_size: u64,
-    ivshmem_ops: Arc<Mutex<dyn IvshmemOps>>,
-    region: Option<Arc<MmapRegion>>,
-    userspace_mapping: Option<UserspaceMapping>,
+    region: Option<GuestRegion>,
 }
 
 #[derive(Serialize, Deserialize, Default, Clone)]
@@ -120,25 +90,16 @@ impl IvshmemDevice {
         id: String,
         bdf: PciBdf,
         region_size: u64,
-        ivshmem_ops: Arc<Mutex<dyn IvshmemOps>>,
         snapshot: Option<&Snapshot>,
     ) -> Result<Self, IvshmemError> {
         let pci_configuration_state = vm_migration::state_from_id(snapshot, PCI_CONFIGURATION_ID)
-            .map_err(|e| {
-            IvshmemError::RetrievePciConfigurationState(anyhow!(
-                "Failed to get PciConfigurationState from Snapshot: {e}",
-            ))
-        })?;
+            .map_err(IvshmemError::RetrievePciConfigurationState)?;
 
         let state: Option<IvshmemDeviceState> = snapshot
             .as_ref()
             .map(|s| s.to_state())
             .transpose()
-            .map_err(|e| {
-                IvshmemError::RetrieveIvshmemDeviceStateState(anyhow!(
-                    "Failed to get IvshmemDeviceState from Snapshot: {e}",
-                ))
-            })?;
+            .map_err(IvshmemError::RetrieveIvshmemDeviceStateState)?;
 
         let configuration = PciConfiguration::new(
             IVSHMEM_VENDOR_ID,
@@ -165,9 +126,7 @@ impl IvshmemDevice {
                 _iv_position: s.iv_position,
                 _doorbell: s.doorbell,
                 region_size,
-                ivshmem_ops,
                 region: None,
-                userspace_mapping: None,
             }
         } else {
             IvshmemDevice {
@@ -180,17 +139,14 @@ impl IvshmemDevice {
                 _iv_position: 0,
                 _doorbell: 0,
                 region_size,
-                ivshmem_ops,
                 region: None,
-                userspace_mapping: None,
             }
         };
         Ok(device)
     }
 
-    pub fn set_region(&mut self, region: Arc<MmapRegion>, userspace_mapping: UserspaceMapping) {
+    pub fn set_region(&mut self, region: GuestRegion) {
         self.region = Some(region);
-        self.userspace_mapping = Some(userspace_mapping);
     }
 
     fn state(&self) -> IvshmemDeviceState {
@@ -252,8 +208,13 @@ impl PciDevice for IvshmemDevice {
         }
 
         // BAR0 holds device registers (256 Byte MMIO)
+        let bar0_alignment = if restoring {
+            None
+        } else {
+            Some(IVSHMEM_REG_BAR_SIZE)
+        };
         let bar0_addr = mmio32_allocator
-            .allocate(bar0_addr, IVSHMEM_REG_BAR_SIZE, None)
+            .allocate(bar0_addr, IVSHMEM_REG_BAR_SIZE, bar0_alignment)
             .ok_or(PciDeviceError::IoAllocationFailed(IVSHMEM_REG_BAR_SIZE))?;
         debug!("ivshmem bar0 address 0x{:x}", bar0_addr.0);
 
@@ -268,8 +229,9 @@ impl PciDevice for IvshmemDevice {
 
         // The data BAR maps the shared memory object
         let data_bar_size = self.region_size;
+        let data_bar_alignment = if restoring { None } else { Some(data_bar_size) };
         let data_bar_addr = mmio64_allocator
-            .allocate(data_bar_addr, data_bar_size, None)
+            .allocate(data_bar_addr, data_bar_size, data_bar_alignment)
             .ok_or(PciDeviceError::IoAllocationFailed(data_bar_size))?;
         debug!("ivshmem data BAR address 0x{:x}", data_bar_addr.0);
 
@@ -353,24 +315,11 @@ impl PciDevice for IvshmemDevice {
 
     fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
         if bar_idx == IVSHMEM_DATA_BAR_IDX {
-            let region = self
-                .region
-                .clone()
-                .ok_or_else(|| io::Error::other(IvshmemError::MissingMemoryRegion))?;
-            if let Some(old_mapping) = self.userspace_mapping.take() {
-                self.ivshmem_ops
-                    .lock()
-                    .unwrap()
-                    .unmap_ram_region(old_mapping)
-                    .map_err(io::Error::other)?;
-            }
-            let new_mapping = self
-                .ivshmem_ops
-                .lock()
-                .unwrap()
-                .create_userspace_mapping(new_base, region)
+            self.region
+                .as_mut()
+                .ok_or_else(|| io::Error::other(IvshmemError::MissingMemoryRegion))?
+                .move_guest_address(GuestAddress(new_base))
                 .map_err(io::Error::other)?;
-            self.userspace_mapping = Some(new_mapping);
         }
         for bar in self.bar_regions.iter_mut() {
             if bar.idx() == bar_idx {

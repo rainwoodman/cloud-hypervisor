@@ -102,6 +102,17 @@ after restore completes:
 At this point, the VM is fully restored and is identical to the VM which was
 snapshot earlier.
 
+The restored VM uses the console outputs from the snapshot. If an output is not
+available on the new host, the options `serial_file`, `serial_socket`,
+`serial_tcp`, `console_file`, `console_socket`, and `console_tcp` select a new
+one in the same mode:
+
+```bash
+./cloud-hypervisor \
+    --api-socket /tmp/cloud-hypervisor.sock \
+    --restore source_url=file:///home/foo/snapshot,serial_tcp=127.0.0.1:4444
+```
+
 See [Network Announcements After Resume](live_migration.md#network-announcements-after-resume)
 for the announcement behavior after restore/resume.
 
@@ -122,19 +133,25 @@ guest RAM before restore completes. This mode is strict: if Cloud Hypervisor
 cannot enable the `userfaultfd` restore path, restore fails instead of falling
 back to `copy`.
 
-If the page source fails during the restore, the guest memory that was not
-restored yet is poisoned so that the guest cannot use it. This needs Linux
-6.6 or later. On older kernels Cloud Hypervisor exits with an error instead.
+`memory_restore_mode=ondemand` also copies the remaining pages into guest RAM in
+the background. If you don't want prefaulting to happen, use
+`memory_restore_mode=ondemand_no_background_fetch_pages` instead. Only the pages
+that the guest, the VMM or vhost-user backends access are populated. Be aware
+that the VM will stay in a "restoring" state indefinitely.
 
-Current constraints for `memory_restore_mode=ondemand`:
+If the page source fails during the restore, the guest memory that was not
+restored yet is poisoned so that the guest cannot use it.
+
+Current constraints for `memory_restore_mode=ondemand` and
+`memory_restore_mode=ondemand_no_background_fetch_pages`:
 
 - `prefault=on` is not supported
 - the snapshot memory ranges must be page-aligned
 - the process must be able to create a `userfaultfd` object
+- every vhost-user backend must support the `PAGEFAULT` protocol feature
 - VFIO devices are not supported
 - vDPA devices are not supported
 - vfio-user devices are not supported
-- vhost-user devices are not supported
 
 Cloud Hypervisor first tries to open `/dev/userfaultfd`, which is governed by
 file permissions, and falls back to the `userfaultfd(2)` syscall, which is
@@ -190,29 +207,32 @@ Current constraints for `memory_restore_mode=copyonwrite`:
   reflink and then writes only the pages that changed since the restore.
   For this, the snapshot and the restore source must be on the same
   filesystem, and the filesystem must support reflinks (for example XFS or
-  btrfs). Before Linux 5.18, they must also be on the same mount. The new
-  memory file is complete, so it restores like any other snapshot. If a
-  reflink is not possible, all guest memory is written.
+  btrfs). The new memory file is complete, so it restores like any other
+  snapshot. If a reflink is not possible, all guest memory is written.
 - A device that is hot-plugged after the restore and that pins guest memory
   (VFIO, vfio-user, vDPA) write-faults every guest page when its IOMMU mapping
   is created. Every page becomes a private copy: the VM stays correct, but the
   page-cache sharing is lost for that VM and host memory use grows to the
   eager-copy level. The same applies to `ondemand` restores.
 
-## Restore a VM with new Net FDs
-For a VM created with FDs explicitly passed to NetConfig, a set of valid FDs
-need to be provided along with the VM restore command in the following syntax:
+## Restore a VM with new external FDs
+
+For a VM created with FDs explicitly passed to `NetConfig`, replacement FDs
+must be provided with the restore command through `external_fds`. Each entry
+identifies a network device, and `ch-remote` passes the listed FDs to the VMM
+over its API UNIX socket via SCM_RIGHTS:
 
 ```bash
 # First terminal
 ./cloud-hypervisor --api-socket /tmp/cloud-hypervisor.sock
 
 # Second terminal
-./ch-remote --api-socket=/tmp/cloud-hypervisor.sock restore source_url=file:///home/foo/snapshot net_fds=[net1@[23,24],net2@[25,26]]
+./ch-remote --api-socket=/tmp/cloud-hypervisor.sock restore \
+    'source_url=file:///home/foo/snapshot,external_fds=[net(net1)@[23,24],net(net2)@[25,26]]'
 ```
-In the example above, the net device with id `net1` will be backed by FDs '23'
-and '24', and the net device with id `net2` will be backed by FDs '25' and '26'
-from the restored VM.
+
+In this example, the network device with id `net1` is backed by FDs `23` and
+`24`, and the device with id `net2` is backed by FDs `25` and `26`.
 
 ## VFIO devices
 
@@ -316,7 +336,8 @@ with `memory_mode=memfds`) to the `send-migration` command:
 ./ch-remote --api-socket /tmp/cloud-hypervisor.sock pause
 ./ch-remote --api-socket /tmp/cloud-hypervisor.sock \
     send-migration destination_url=unix:/tmp/offload.sock,memory_mode=memfds,preserve_source=on
-# The source VMM keeps running, the VM is left paused. Resume it when ready:
+# send-migration only starts the transfer. The source VMM keeps running and
+# the VM is left paused. Resume it after the vm.migration-finished event:
 ./ch-remote --api-socket /tmp/cloud-hypervisor.sock resume
 ```
 
@@ -423,9 +444,5 @@ production backend.
 - Every guest memory region must use shared memory (`shared=on`) or hugepage
   backing. Anonymous memory is rejected with the same error message that local
   live migration produces.
-- Orchestrator-supplied network FDs (today carried by `vm.restore`'s
-  `net_fds` field) are not plumbed through `vm.receive-migration`,
-  so VMs whose configuration relies on externally-provided net FDs
-  cannot currently be restored via the offload path.
 - Confidential VMs (CVMs) inherit the live-migration restriction: offload
   is not supported for CVMs.

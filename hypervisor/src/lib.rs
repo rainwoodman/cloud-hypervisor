@@ -19,7 +19,6 @@
 //! - x86_64
 //! - arm64
 //! - riscv64 (experimental)
-//!
 
 /// Architecture specific definitions
 #[macro_use]
@@ -62,6 +61,8 @@ pub use device::HypervisorDeviceError;
 pub use kvm::aarch64;
 #[cfg(all(feature = "kvm", target_arch = "riscv64"))]
 pub use kvm::{AiaState, riscv64};
+#[cfg(target_arch = "x86_64")]
+use serde::{Deserialize, Serialize};
 pub use vm::{
     DataMatch, HypervisorVmError, InterruptSourceConfig, LegacyIrqSourceConfig,
     MemoryConversionHandler, MemoryVisibility, MsiIrqSourceConfig, Vm, VmOps,
@@ -216,6 +217,7 @@ impl ClockData {
     /// Returns the clock with `CLOCK_REALTIME` filled from the host wall clock
     /// when absent, so a later restore can advance the guest to current wall
     /// time. No-op for backends without a realtime field (e.g. MSHV).
+    #[must_use]
     pub fn with_realtime_filled(mut self) -> Self {
         if !self.has_realtime() {
             self.set_realtime(SystemTime::now());
@@ -227,8 +229,14 @@ impl ClockData {
 /// Guest clock state preserved across pause/resume and snapshot/restore
 /// (`ClockData` on x86, `TimerState` on aarch64+kvm.
 /// The platform where it has not guest clock, `Option<ClockState>` will be None.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[cfg(target_arch = "x86_64")]
-pub type ClockState = ClockData;
+pub struct ClockState {
+    #[serde(rename = "clock")]
+    pub data: ClockData,
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "clock_tsc")]
+    pub tsc: Option<u64>,
+}
 #[cfg(all(target_arch = "aarch64", feature = "kvm"))]
 pub type ClockState = TimerState;
 #[cfg(not(any(target_arch = "x86_64", all(target_arch = "aarch64", feature = "kvm"))))]

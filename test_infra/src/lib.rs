@@ -4,13 +4,17 @@
 //
 
 #![expect(clippy::undocumented_unsafe_blocks)]
+#![expect(clippy::panic, reason = "test code")]
+
+#[path = "../../cloud-hypervisor/tests/common/mod.rs"]
+pub mod test_utils;
 
 use std::any::Any;
 use std::collections::HashMap;
 use std::ffi::{CString, OsStr};
 use std::fmt::{Display, Formatter};
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::net::{IpAddr, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
@@ -29,6 +33,8 @@ use ssh2::Session;
 use thiserror::Error;
 use vmm_sys_util::tempdir::TempDir;
 use wait_timeout::ChildExt;
+
+use crate::test_utils::QemuImgCommand;
 
 // ---------------------------------------------------------------------------
 // Process group registry, one group per test.
@@ -693,20 +699,16 @@ impl DiskConfig for WindowsDiskConfig {
         workload_path.push("workloads");
         let qcow2_name = format!("windows-qcow2-{}.qcow2", random_extension.to_str().unwrap());
         let qcow2_path = workload_path.join(&qcow2_name);
-        let output = Command::new("qemu-img")
-            .args([
-                "create",
-                "-f",
-                "qcow2",
+        QemuImgCommand::new()
+            .create("qcow2", "")
+            .args(&[
                 "-b",
                 osdisk_path.to_str().unwrap(),
                 "-F",
                 "raw",
                 qcow2_path.to_str().unwrap(),
             ])
-            .output()
-            .expect("Expect creating qcow2 overlay to succeed");
-        assert!(output.status.success(), "qemu-img create failed");
+            .run("Expect creating qcow2 overlay to succeed");
         self.osdisk_qcow2_path = qcow2_path.to_str().unwrap().to_string();
     }
 
@@ -1284,26 +1286,31 @@ impl Guest {
         Self::new_from_ip_range(disk_config, "192.168", next_guest_id())
     }
 
+    #[must_use]
     pub fn with_cpu(mut self, count: u32) -> Self {
         self.num_cpu = count;
         self
     }
 
+    #[must_use]
     pub fn with_memory(mut self, mem_size: &str) -> Self {
         self.mem_size_str = mem_size.to_string();
         self
     }
 
+    #[must_use]
     pub fn with_nested(mut self, nested: bool) -> Self {
         self.nested = nested;
         self
     }
 
+    #[must_use]
     pub fn with_kernel_path(mut self, kernel_path: &str) -> Self {
         self.kernel_path = Some(kernel_path.to_string());
         self
     }
 
+    #[must_use]
     pub fn with_kernel(mut self, kernel: String) -> Self {
         self.kernel_path = Some(kernel);
         self
@@ -1632,28 +1639,88 @@ impl Guest {
         Ok(false)
     }
 
-    pub fn check_vsock(&self, socket: &str) {
+    pub fn check_vsock(&self, socket: &str, socket_type: libc::c_int) {
         // Listen from guest on vsock CID=3 PORT=16
         // SOCKET-LISTEN:<domain>:<protocol>:<local-address>
+        // (CID=3 PORT=16)
+        let guest_vsock_address = "x00x00x10x00x00x00x03x00x00x00x00x00x00x00";
         let guest_ip = self.network.guest_ip0.clone();
         let listen_socat = thread::spawn(move || {
-            ssh_command_ip("sudo socat - SOCKET-LISTEN:40:0:x00x00x10x00x00x00x03x00x00x00x00x00x00x00 > vsock_log", &guest_ip, DEFAULT_SSH_RETRIES, DEFAULT_SSH_TIMEOUT).unwrap();
+            ssh_command_ip(
+                &format!("sudo socat -u SOCKET-LISTEN:40:0:{guest_vsock_address},socktype={socket_type} - > vsock_log"),
+                &guest_ip,
+                DEFAULT_SSH_RETRIES,
+                DEFAULT_SSH_TIMEOUT,
+            )
+            .unwrap();
         });
 
         // Make sure socat is listening, which might take a few second on slow systems
         thread::sleep(Duration::new(10, 0));
 
-        // Write something to vsock from the host
-        assert!(
-            exec_host_command_status(&format!(
-                "echo -e \"CONNECT 16\\nHelloWorld!\" | socat - UNIX-CONNECT:{socket}"
-            ))
-            .success()
-        );
+        // Wait for OK to keep SEQPACKET records separate.
+        let mut socat = Command::new("socat")
+            .args([
+                "-T",
+                "30",
+                "-",
+                &format!("UNIX-CONNECT:{socket},socktype={socket_type}"),
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let mut input = socat.stdin.take().unwrap();
+        let mut output = BufReader::new(socat.stdout.take().unwrap());
+        input.write_all(b"CONNECT 16\n").unwrap();
+        let mut response = String::new();
+        output.read_line(&mut response).unwrap();
+        response
+            .strip_prefix("OK ")
+            .unwrap()
+            .trim()
+            .parse::<u32>()
+            .unwrap();
+        input.write_all(b"HelloWorld!\n").unwrap();
+        drop(input);
+        assert!(socat.wait().unwrap().success());
 
         // Wait for the thread to terminate.
         listen_socat.join().unwrap();
 
+        assert_eq!(
+            self.ssh_command("cat vsock_log").unwrap().trim(),
+            "HelloWorld!"
+        );
+
+        // Check guest initiated connections.
+        let path = format!("{socket}_16");
+        let _ = fs::remove_file(&path);
+        let mut socat = Command::new("socat")
+            .args([
+                "-T",
+                "30",
+                "-u",
+                "-",
+                &format!("UNIX-LISTEN:{path},socktype={socket_type}"),
+            ])
+            .stdin(Stdio::piped())
+            .spawn()
+            .unwrap();
+        socat
+            .stdin
+            .take()
+            .unwrap()
+            .write_all(b"HelloWorld!\n")
+            .unwrap();
+        assert!(wait_until(Duration::from_secs(10), || Path::new(&path).exists()));
+        // (CID=2 PORT=16)
+        let host_vsock_address = "x00x00x10x00x00x00x02x00x00x00x00x00x00x00";
+        self.ssh_command(&format!(
+            "sudo socat -u SOCKET-CONNECT:40:0:{host_vsock_address},socktype={socket_type} - > vsock_log"
+        ))
+        .unwrap();
+        assert!(socat.wait().unwrap().success());
         assert_eq!(
             self.ssh_command("cat vsock_log").unwrap().trim(),
             "HelloWorld!"
@@ -1727,7 +1794,7 @@ impl Guest {
             .unwrap();
         // Check vsock
         if let Some(socket) = socket {
-            self.check_vsock(socket.as_str());
+            self.check_vsock(socket.as_str(), libc::SOCK_STREAM);
         }
         // Check if the console is usable
         if let Some(console_text) = console_text {
@@ -2116,8 +2183,9 @@ impl<'a> GuestCommand<'a> {
             } else {
                 "hvc0"
             };
-            let igvm = direct_igvm_boot_path(Some(console_str))
-                .expect("IGVM boot file not found for console type: {console_str}");
+            let igvm = direct_igvm_boot_path(Some(console_str)).unwrap_or_else(|| {
+                panic!("IGVM boot file not found for console type: {console_str}")
+            });
             self.command.args([
                 "--igvm",
                 igvm.to_str().expect("IGVM path is not valid UTF-8"),
@@ -2648,7 +2716,7 @@ pub fn on_kvm_sev_snp() -> bool {
     sev_snp_direct_kernel().is_some()
 }
 
-// Get the direct igvm boot file path based on the console type
+// Get the stage0 IGVM path or a console-specific Linux IGVM path.
 fn direct_igvm_boot_path(console: Option<&str>) -> Option<PathBuf> {
     // get the default hvc0 igvm file if console string is not passed
     let console_str = console.unwrap_or("hvc0");
@@ -2657,7 +2725,11 @@ fn direct_igvm_boot_path(console: Option<&str>) -> Option<PathBuf> {
         panic!("IGVM console should be hvc0 or ttyS0, got: {console_str}");
     }
 
-    let igvm_filepath = format!("/igvm_files/linux-{console_str}.bin");
+    let igvm_filepath = if on_kvm_sev_snp() {
+        "/igvm_files/stage0.igvm".to_string()
+    } else {
+        format!("/igvm_files/linux-{console_str}.bin")
+    };
     if Path::new(&igvm_filepath).exists() {
         Some(PathBuf::from(igvm_filepath))
     } else {

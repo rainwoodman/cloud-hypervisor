@@ -10,10 +10,10 @@ use std::io::{self, Write};
 use std::net::IpAddr;
 use std::num::Wrapping;
 use std::ops::Deref;
-use std::os::unix::io::{AsRawFd, RawFd};
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::result;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow};
@@ -45,7 +45,8 @@ use super::{
 };
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
-use crate::{GuestMemoryMmap, VirtioInterrupt};
+use crate::thread_helper::PauseCommon;
+use crate::{GuestMemory, VirtioInterrupt};
 
 /// Control queue
 // Event available on the control queue.
@@ -59,7 +60,7 @@ const RETRY_ANNOUNCEMENTS_EVENT: u16 = START_ANNOUNCEMENTS_EVENT + 1;
 pub const MIN_MTU: u16 = 1280;
 
 pub struct NetCtrlEpollHandler {
-    pub mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    pub mem: GuestMemoryAtomic<GuestMemory>,
     pub kill_evt: EventFd,
     pub pause_evt: EventFd,
     pub ctrl_q: CtrlQueue,
@@ -83,11 +84,7 @@ impl NetCtrlEpollHandler {
             })
     }
 
-    pub fn run_ctrl(
-        &mut self,
-        paused: &AtomicBool,
-        paused_sync: &Barrier,
-    ) -> result::Result<(), EpollHelperError> {
+    pub fn run_ctrl(&mut self, pause_common: &PauseCommon) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
         helper.add_event(self.queue_evt.as_raw_fd(), CTRL_QUEUE_EVENT)?;
         helper.add_event(self.announce_evt.as_raw_fd(), START_ANNOUNCEMENTS_EVENT)?;
@@ -95,7 +92,7 @@ impl NetCtrlEpollHandler {
             self.announce_retry_timer.as_raw_fd(),
             RETRY_ANNOUNCEMENTS_EVENT,
         )?;
-        helper.run(paused, paused_sync, self)?;
+        helper.run(pause_common, self)?;
 
         Ok(())
     }
@@ -230,7 +227,7 @@ pub type Result<T> = result::Result<T, Error>;
 
 struct NetEpollHandler {
     net: NetQueuePair,
-    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    mem: GuestMemoryAtomic<GuestMemory>,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     kill_evt: EventFd,
     pause_evt: EventFd,
@@ -281,7 +278,7 @@ impl NetEpollHandler {
     fn process_tx(&mut self) -> result::Result<(), DeviceError> {
         let res = self
             .net
-            .process_tx(&self.mem.memory(), &mut self.queue_pair.1)
+            .process_tx(&*self.mem.memory(), &mut self.queue_pair.1)
             .map_err(DeviceError::NetQueuePair)?;
 
         if res {
@@ -310,7 +307,7 @@ impl NetEpollHandler {
     fn handle_rx_tap_event(&mut self) -> result::Result<(), DeviceError> {
         let res = self
             .net
-            .process_rx(&self.mem.memory(), &mut self.queue_pair.0)
+            .process_rx(&*self.mem.memory(), &mut self.queue_pair.0)
             .map_err(DeviceError::NetQueuePair)?;
 
         if res {
@@ -322,11 +319,7 @@ impl NetEpollHandler {
         Ok(())
     }
 
-    fn run(
-        &mut self,
-        paused: &AtomicBool,
-        paused_sync: &Barrier,
-    ) -> result::Result<(), EpollHelperError> {
+    fn run(&mut self, pause_common: &PauseCommon) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
         helper.add_event(self.queue_evt_pair.0.as_raw_fd(), RX_QUEUE_EVENT)?;
         helper.add_event(self.queue_evt_pair.1.as_raw_fd(), TX_QUEUE_EVENT)?;
@@ -359,7 +352,7 @@ impl NetEpollHandler {
         // The NetQueuePair needs the epoll fd.
         self.net.epoll_fd = Some(helper.as_raw_fd());
 
-        helper.run(paused, paused_sync, self)?;
+        helper.run(pause_common, self)?;
 
         Ok(())
     }
@@ -632,10 +625,8 @@ impl Net {
                 avail_features,
                 acked_features,
                 queue_sizes,
-                paused_sync: Some(Arc::new(Barrier::new((num_queues / 2) as usize + 1))),
                 min_queues: 2,
-                paused: Arc::new(AtomicBool::new(paused)),
-                ..Default::default()
+                ..VirtioCommon::new(paused).map_err(Error::CreateEventFd)?
             },
             id,
             taps,
@@ -703,7 +694,7 @@ impl Net {
     #[expect(clippy::too_many_arguments)]
     pub fn from_tap_fds(
         id: String,
-        fds: &[RawFd],
+        fds: &[BorrowedFd<'_>],
         guest_mac: MacAddr,
         mtu: Option<u16>,
         access_platform_enabled: bool,
@@ -724,13 +715,9 @@ impl Net {
             .ok_or(Error::BadQueueNum)?;
 
         for fd in fds.iter() {
-            // Duplicate so that it can survive reboots
-            // SAFETY: FFI call to dup. Trivially safe.
-            let fd = unsafe { libc::dup(*fd) };
-            if fd < 0 {
-                return Err(Error::DuplicateTapFd(io::Error::last_os_error()));
-            }
-            let tap = Tap::from_tap_fd(fd, num_queue_pairs).map_err(Error::TapError)?;
+            // Keep the preserved original available across reboots.
+            let fd = fd.try_clone_to_owned().map_err(Error::DuplicateTapFd)?;
+            let tap = Tap::from_file(fd.into(), num_queue_pairs).map_err(Error::TapError)?;
             taps.push(tap);
         }
 
@@ -867,14 +854,10 @@ impl VirtioDevice for Net {
         let num_queues = u16::try_from(queues.len()).map_err(|_| ActivateError::BadActivate)?;
         let event_idx = self.common.feature_acked(VIRTIO_RING_F_EVENT_IDX.into());
 
-        // Recompute the barrier size from the queues that are actually activated.
         let has_ctrl_queue =
             self.common.feature_acked(VIRTIO_NET_F_CTRL_VQ.into()) && !num_queues.is_multiple_of(2);
         let ctrl_threads = if has_ctrl_queue { 1 } else { 0 };
         let qp_threads = (num_queues - ctrl_threads) / 2;
-        self.common.paused_sync = Some(Arc::new(Barrier::new(usize::from(
-            1 + qp_threads + ctrl_threads,
-        ))));
 
         // Only a queue pair with a worker drains its tap queue, so detach the
         // rest before the workers start.
@@ -904,10 +887,8 @@ impl VirtioDevice for Net {
                 &self.announce,
             );
 
-            let host_announce_ops = VirtioNetHostAnnounceOps::new(
-                self.build_rarp_announce(),
-                self.taps.clone().into_boxed_slice(),
-            );
+            let host_announce_ops =
+                VirtioNetHostAnnounceOps::new(self.build_rarp_announce(), self.taps[0].clone());
 
             let announcer = Announcer::new(
                 &self.announce,
@@ -927,6 +908,7 @@ impl VirtioDevice for Net {
                     Arc::clone(&self.announce.pending),
                     self.config.max_virtqueue_pairs,
                     Arc::clone(&self.curr_queue_pairs),
+                    self.common.acked_features,
                 ),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
@@ -942,9 +924,6 @@ impl VirtioDevice for Net {
                 announcer,
             };
 
-            let paused = Arc::clone(&self.common.paused);
-            let paused_sync = self.common.paused_sync.clone();
-
             self.common.spawn_worker(
                 &format!("{}_ctrl", self.id),
                 &self.seccomp_action,
@@ -952,14 +931,14 @@ impl VirtioDevice for Net {
                 &self.exit_evt,
                 Arc::clone(&self.device_status),
                 Arc::clone(&interrupt_cb),
-                move || ctrl_handler.run_ctrl(&paused, paused_sync.as_ref().unwrap()),
+                move |pause_common| ctrl_handler.run_ctrl(pause_common),
             )?;
         }
 
         let mut taps = self.taps.clone();
         for i in 0..queues.len() / 2 {
             let rx = RxVirtio::new();
-            let tx = TxVirtio::new(self.common.feature_acked(VIRTIO_NET_F_CSUM.into()));
+            let tx = TxVirtio::new(self.common.acked_features);
             let rx_tap_listening = false;
 
             let (_, queue_0, queue_evt_0) = queues.remove(0);
@@ -1018,9 +997,6 @@ impl VirtioDevice for Net {
                 pause_evt,
             };
 
-            let paused = Arc::clone(&self.common.paused);
-            let paused_sync = self.common.paused_sync.clone();
-
             self.common.spawn_worker(
                 &format!("{}_qp{}", self.id.clone(), i),
                 &self.seccomp_action,
@@ -1028,7 +1004,7 @@ impl VirtioDevice for Net {
                 &self.exit_evt,
                 Arc::clone(&self.device_status),
                 Arc::clone(&interrupt_cb),
-                move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+                move |pause_common| handler.run(pause_common),
             )?;
         }
 
@@ -1219,15 +1195,12 @@ impl AnnounceOps for VirtioNetGuestAnnounceOps {
 
 struct VirtioNetHostAnnounceOps {
     rarp_announce: Option<[u8; ETH_FRAME_LEN]>,
-    taps: Box<[Tap]>,
+    tap: Tap,
 }
 
 impl VirtioNetHostAnnounceOps {
-    pub(crate) fn new(rarp_announce: Option<[u8; ETH_FRAME_LEN]>, taps: Box<[Tap]>) -> Self {
-        Self {
-            rarp_announce,
-            taps,
-        }
+    pub(crate) fn new(rarp_announce: Option<[u8; ETH_FRAME_LEN]>, tap: Tap) -> Self {
+        Self { rarp_announce, tap }
     }
 }
 
@@ -1239,12 +1212,10 @@ impl AnnounceOps for VirtioNetHostAnnounceOps {
             let mut buf = vec![0u8; vnet_hdr_len() + rarp_announce.len()];
             buf[vnet_hdr_len()..].copy_from_slice(&rarp_announce);
 
-            for tap in &mut self.taps {
-                if let Err(e) = tap.write_all(&buf) {
-                    // The host-side RARP packets are best-effort. Thus, to keep things simple, we
-                    // only log errors here instead of waiting for the TAP to become writable again.
-                    error!("Host RARP write to TAP failed: {e}");
-                }
+            if let Err(e) = self.tap.write_all(&buf) {
+                // The host-side RARP packets are best-effort. Thus, to keep things simple, we
+                // only log errors here instead of waiting for the TAP to become writable again.
+                error!("Host RARP write to TAP failed: {e}");
             }
 
             return AnnounceOutcome::Retry;
@@ -1276,7 +1247,7 @@ mod tests {
             common: VirtioCommon {
                 acked_features,
                 interrupt_cb,
-                ..Default::default()
+                ..VirtioCommon::new(false).unwrap()
             },
             id: "test-net".to_string(),
             taps: Vec::new(),
@@ -1349,18 +1320,9 @@ mod tests {
             &dev.announce,
         );
 
-        let host_announce_ops = VirtioNetHostAnnounceOps::new(
-            dev.build_rarp_announce(),
-            dev.taps.clone().into_boxed_slice(),
-        );
-
         let announcer = Announcer::new(
             &dev.announce,
-            vec![
-                Box::new(guest_announce_ops) as Box<dyn AnnounceOps>,
-                Box::new(host_announce_ops) as Box<dyn AnnounceOps>,
-            ]
-            .into_boxed_slice(),
+            vec![Box::new(guest_announce_ops) as Box<dyn AnnounceOps>].into_boxed_slice(),
         );
 
         Ok(announcer)

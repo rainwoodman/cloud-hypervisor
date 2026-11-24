@@ -18,6 +18,8 @@ use std::mem::offset_of;
 use std::num;
 use std::os::fd::{FromRawFd, OwnedFd};
 use std::os::unix::io::AsRawFd;
+#[cfg(feature = "sev_snp")]
+use std::process;
 #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
 use std::sync::Mutex;
 #[cfg(feature = "sev_snp")]
@@ -41,7 +43,6 @@ use kvm_ioctls::{NoDatamatch, VcpuFd, VmFd};
 use log::debug;
 #[cfg(target_arch = "x86_64")]
 use log::warn;
-use vmm_sys_util::errno;
 use vmm_sys_util::eventfd::EventFd;
 
 #[cfg(target_arch = "aarch64")]
@@ -77,6 +78,8 @@ use kvm_bindings::{
 };
 #[cfg(target_arch = "x86_64")]
 use x86_64::check_required_kvm_extensions;
+#[cfg(all(target_arch = "x86_64", feature = "sev_snp"))]
+use x86_64::check_required_sev_snp_extensions;
 #[cfg(target_arch = "x86_64")]
 pub use x86_64::{CpuId, ExtendedControlRegisters, MsrEntries, VcpuKvmState};
 
@@ -91,9 +94,7 @@ use crate::arch::x86::{
 use crate::{ClockRestoreMode, ClockState};
 use crate::{
     CpuState, HypervisorType, HypervisorVmConfig, InterruptSourceConfig, IoEventAddress,
-    IrqRoutingEntry, MpState, StandardRegisters, USER_MEMORY_REGION_GUEST_MEMFD,
-    USER_MEMORY_REGION_LOG_DIRTY, USER_MEMORY_REGION_READ, USER_MEMORY_REGION_WRITE,
-    UserMemoryRegion, VmOps, cpu, hypervisor, vm,
+    IrqRoutingEntry, MpState, StandardRegisters, VmOps, cpu, hypervisor, vm,
 };
 // aarch64 dependencies
 #[cfg(target_arch = "aarch64")]
@@ -104,9 +105,7 @@ pub mod riscv64;
 
 #[cfg(target_arch = "x86_64")]
 use kvm_bindings::KVM_X86_DEFAULT_VM;
-///
 /// Export generically-named wrappers of kvm-bindings for Unix-based platforms
-///
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
 pub use kvm_bindings::kvm_vcpu_events as VcpuEvents;
 #[cfg(target_arch = "x86_64")]
@@ -116,8 +115,7 @@ pub use kvm_bindings::{
     KVM_IRQ_ROUTING_MSI, KVM_MEM_GUEST_MEMFD, KVM_MEM_LOG_DIRTY_PAGES, KVM_MEM_READONLY,
     KVM_MSI_VALID_DEVID, kvm_clock_data, kvm_create_device, kvm_create_device as CreateDevice,
     kvm_device_attr as DeviceAttr, kvm_device_type_KVM_DEV_TYPE_VFIO, kvm_guest_debug,
-    kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_run, kvm_userspace_memory_region,
-    kvm_userspace_memory_region2,
+    kvm_irq_routing, kvm_irq_routing_entry, kvm_mp_state, kvm_run, kvm_userspace_memory_region2,
 };
 #[cfg(target_arch = "aarch64")]
 use kvm_bindings::{
@@ -170,6 +168,9 @@ const KVM_REG_ARM_TIMER_CNT: u64 = KVM_REG_ARM64
 
 #[cfg(target_arch = "aarch64")]
 const NANOS_PER_SECOND: u128 = 1_000_000_000;
+
+#[cfg(target_arch = "aarch64")]
+const KVM_CAP_ARM_EL2: u32 = 240;
 
 #[cfg(target_arch = "x86_64")]
 const INVALID_GPA: u64 = u64::MAX;
@@ -252,62 +253,6 @@ fn make_segment(sev_selector: SevSelector) -> Segment {
     }
 }
 
-impl From<kvm_userspace_memory_region2> for UserMemoryRegion {
-    fn from(region: kvm_userspace_memory_region2) -> Self {
-        let mut flags = USER_MEMORY_REGION_READ;
-        if region.flags & KVM_MEM_READONLY == 0 {
-            flags |= USER_MEMORY_REGION_WRITE;
-        }
-        if region.flags & KVM_MEM_LOG_DIRTY_PAGES != 0 {
-            flags |= USER_MEMORY_REGION_LOG_DIRTY;
-        }
-        if region.flags & KVM_MEM_GUEST_MEMFD != 0 {
-            flags |= USER_MEMORY_REGION_GUEST_MEMFD;
-        }
-
-        UserMemoryRegion {
-            slot: region.slot,
-            guest_phys_addr: region.guest_phys_addr,
-            memory_size: region.memory_size,
-            userspace_addr: region.userspace_addr,
-            flags,
-            guest_memfd: Some(region.guest_memfd),
-            guest_memfd_offset: Some(region.guest_memfd_offset),
-        }
-    }
-}
-
-impl From<UserMemoryRegion> for kvm_userspace_memory_region2 {
-    fn from(region: UserMemoryRegion) -> Self {
-        assert_ne!(
-            region.flags & USER_MEMORY_REGION_READ,
-            0,
-            "KVM mapped memory is always readable"
-        );
-
-        let mut flags = 0;
-        if region.flags & USER_MEMORY_REGION_WRITE == 0 {
-            flags |= KVM_MEM_READONLY;
-        }
-        if region.flags & USER_MEMORY_REGION_LOG_DIRTY != 0 {
-            flags |= KVM_MEM_LOG_DIRTY_PAGES;
-        }
-        if region.flags & USER_MEMORY_REGION_GUEST_MEMFD != 0 {
-            flags |= KVM_MEM_GUEST_MEMFD;
-        }
-
-        kvm_userspace_memory_region2 {
-            slot: region.slot,
-            guest_phys_addr: region.guest_phys_addr,
-            memory_size: region.memory_size,
-            userspace_addr: region.userspace_addr,
-            flags,
-            guest_memfd: region.guest_memfd.unwrap_or(0),
-            guest_memfd_offset: region.guest_memfd_offset.unwrap_or(0),
-            ..Default::default()
-        }
-    }
-}
 impl From<kvm_mp_state> for MpState {
     fn from(s: kvm_mp_state) -> Self {
         MpState::Kvm(s)
@@ -320,6 +265,7 @@ impl From<MpState> for kvm_mp_state {
             MpState::Kvm(s) => s,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("CpuState is not valid"),
         }
     }
@@ -355,6 +301,7 @@ impl From<CpuState> for VcpuKvmState {
             CpuState::Kvm(s) => s,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("CpuState is not valid"),
         }
     }
@@ -374,6 +321,7 @@ impl From<ClockData> for kvm_clock_data {
             ClockData::Kvm(s) => s,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("CpuState is not valid"),
         }
     }
@@ -391,6 +339,7 @@ impl From<crate::Register> for kvm_bindings::kvm_one_reg {
             crate::Register::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("Register is not valid"),
         }
     }
@@ -410,6 +359,7 @@ impl From<crate::VcpuInit> for kvm_bindings::kvm_vcpu_init {
             crate::VcpuInit::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("VcpuInit is not valid"),
         }
     }
@@ -429,6 +379,7 @@ impl From<crate::RegList> for kvm_bindings::RegList {
             crate::RegList::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("RegList is not valid"),
         }
     }
@@ -448,6 +399,7 @@ impl From<crate::StandardRegisters> for kvm_bindings::kvm_regs {
             crate::StandardRegisters::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("StandardRegisters are not valid"),
         }
     }
@@ -467,6 +419,7 @@ impl From<crate::StandardRegisters> for kvm_bindings::kvm_riscv_core {
             crate::StandardRegisters::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("StandardRegisters are not valid"),
         }
     }
@@ -484,6 +437,7 @@ impl From<IrqRoutingEntry> for kvm_irq_routing_entry {
             IrqRoutingEntry::Kvm(e) => e,
             /* Needed in case other hypervisors are enabled */
             #[allow(unreachable_patterns)]
+            #[expect(clippy::panic, reason = "mixed hypervisor backends")]
             _ => panic!("IrqRoutingEntry is not valid"),
         }
     }
@@ -527,7 +481,6 @@ pub struct KvmVm {
 }
 
 impl KvmVm {
-    ///
     /// Creates an emulated device in the kernel.
     ///
     /// See the documentation for `KVM_CREATE_DEVICE`.
@@ -585,38 +538,6 @@ impl KvmVm {
     #[cfg(not(target_arch = "x86_64"))]
     fn translate_msi_ext_dest_id(address_lo: u32, address_hi: u32) -> (u32, u32) {
         (address_lo, address_hi)
-    }
-
-    /// Set user memory region to use guest_memfd when available.
-    /// guest_memfd is available on host linux kernel v6.8+
-    ///
-    /// # Safety
-    ///
-    /// `region.userspace_addr` must point to `region.memory_size` bytes of
-    /// memory that will stay mapped until the slot is removed via
-    /// `remove_user_memory_region`. The memory region must
-    /// be uniquely owned by the caller, as mapping it into the guest
-    /// effectively creates a long-lived mutable reference.
-    unsafe fn set_user_memory_region(
-        &self,
-        region: kvm_userspace_memory_region2,
-    ) -> Result<(), errno::Error> {
-        if self.memory_slots.is_some() {
-            // SAFETY: Safe as the caller guarantees that region is safe to map
-            // the guest and is non-overlapping.
-            unsafe { self.fd.set_user_memory_region2(region) }
-        } else {
-            // SAFETY: Safe because guest regions are guaranteed not to overlap.
-            unsafe {
-                self.fd.set_user_memory_region(kvm_userspace_memory_region {
-                    slot: region.slot,
-                    guest_phys_addr: region.guest_phys_addr,
-                    userspace_addr: region.userspace_addr,
-                    flags: region.flags,
-                    memory_size: region.memory_size,
-                })
-            }
-        }
     }
 }
 
@@ -714,9 +635,7 @@ impl vm::Vm for KvmVm {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Sets the address of the one-page region in the VM's address space.
-    ///
     fn set_identity_map_address(&self, address: u64) -> vm::Result<()> {
         self.fd
             .set_identity_map_address(address)
@@ -724,9 +643,7 @@ impl vm::Vm for KvmVm {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Sets the address of the three-page region in the VM's address space.
-    ///
     fn set_tss_address(&self, offset: usize) -> vm::Result<()> {
         self.fd
             .set_tss_address(offset)
@@ -734,36 +651,28 @@ impl vm::Vm for KvmVm {
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    ///
     /// Creates an in-kernel interrupt controller.
-    ///
     fn create_irq_chip(&self) -> vm::Result<()> {
         self.fd
             .create_irq_chip()
             .map_err(|e| vm::HypervisorVmError::CreateIrq(e.into()))
     }
 
-    ///
     /// Registers an event that will, when signaled, trigger the `gsi` IRQ.
-    ///
     fn register_irqfd(&self, fd: &EventFd, gsi: u32) -> vm::Result<()> {
         self.fd
             .register_irqfd(fd, gsi)
             .map_err(|e| vm::HypervisorVmError::RegisterIrqFd(e.into()))
     }
 
-    ///
     /// Unregisters an event that will, when signaled, trigger the `gsi` IRQ.
-    ///
     fn unregister_irqfd(&self, fd: &EventFd, gsi: u32) -> vm::Result<()> {
         self.fd
             .unregister_irqfd(fd, gsi)
             .map_err(|e| vm::HypervisorVmError::UnregisterIrqFd(e.into()))
     }
 
-    ///
     /// Creates a VcpuFd object from a vcpu RawFd.
-    ///
     fn create_vcpu(
         &self,
         id: u32,
@@ -856,7 +765,7 @@ impl vm::Vm for KvmVm {
             xsave_size,
             #[cfg(target_arch = "x86_64")]
             has_xcrs: self.check_extension(Cap::Xcrs),
-            #[cfg(any(target_arch = "x86_64", feature = "sev_snp"))]
+            #[cfg(target_arch = "x86_64")]
             vm_fd: Arc::clone(&self.fd),
             #[cfg(feature = "sev_snp")]
             memory_slots: self.memory_slots.clone(),
@@ -867,9 +776,7 @@ impl vm::Vm for KvmVm {
     }
 
     #[cfg(target_arch = "aarch64")]
-    ///
     /// Creates a virtual GIC device.
-    ///
     fn create_vgic(&self, config: &VgicConfig) -> vm::Result<Arc<Mutex<dyn Vgic>>> {
         let gic_device = KvmGicV3Its::new(self, config)
             .map_err(|e| vm::HypervisorVmError::CreateVgic(anyhow!("Vgic error {e:?}")))?;
@@ -877,18 +784,14 @@ impl vm::Vm for KvmVm {
     }
 
     #[cfg(target_arch = "riscv64")]
-    ///
     /// Creates a virtual AIA device.
-    ///
     fn create_vaia(&self, config: &VaiaConfig) -> vm::Result<Arc<Mutex<dyn Vaia>>> {
         let aia_device = KvmAiaImsics::new(self, config)
             .map_err(|e| vm::HypervisorVmError::CreateVaia(anyhow!("Vaia error {e:?}")))?;
         Ok(Arc::new(Mutex::new(aia_device)))
     }
 
-    ///
     /// Registers an event to be signaled whenever a certain address is written to.
-    ///
     fn register_ioevent(
         &self,
         fd: &EventFd,
@@ -914,9 +817,7 @@ impl vm::Vm for KvmVm {
         }
     }
 
-    ///
     /// Unregisters an event from a certain address it has been previously registered to.
-    ///
     fn unregister_ioevent(&self, fd: &EventFd, addr: &IoEventAddress) -> vm::Result<()> {
         let addr = &kvm_ioctls::IoEventAddress::from(*addr);
         self.fd
@@ -924,9 +825,7 @@ impl vm::Vm for KvmVm {
             .map_err(|e| vm::HypervisorVmError::UnregisterIoEvent(e.into()))
     }
 
-    ///
     /// Constructs a routing entry
-    ///
     fn make_routing_entry(&self, gsi: u32, config: &InterruptSourceConfig) -> IrqRoutingEntry {
         match &config {
             InterruptSourceConfig::MsiIrq(cfg) => {
@@ -981,16 +880,15 @@ impl vm::Vm for KvmVm {
         }
     }
 
-    ///
     /// Sets the GSI routing table entries, overwriting any previously set
     /// entries, as per the `KVM_SET_GSI_ROUTING` ioctl.
-    ///
     fn set_gsi_routing(&self, entries: &[IrqRoutingEntry]) -> vm::Result<()> {
         let entries: Vec<kvm_irq_routing_entry> = entries
             .iter()
             .map(|entry| match entry {
                 IrqRoutingEntry::Kvm(e) => *e,
                 #[allow(unreachable_patterns)]
+                #[expect(clippy::panic, reason = "mixed hypervisor backends")]
                 _ => panic!("IrqRoutingEntry type is wrong"),
             })
             .collect();
@@ -1030,10 +928,11 @@ impl vm::Vm for KvmVm {
 
         // Create a per-region guest_memfd when supported.
         // Each region gets its own fd sized exactly to memory_size
-        let guest_memfd = if let Some(slots) = self
+        let guest_memfd = if self
             .memory_slots
             .as_ref()
             .filter(|_| visibility == vm::MemoryVisibility::Private)
+            .is_some()
         {
             if log_dirty_pages {
                 return Err(vm::HypervisorVmError::CreateUserMemory(anyhow!(
@@ -1052,19 +951,9 @@ impl vm::Vm for KvmVm {
                         .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?,
                 )
             };
-            let raw_fd = fd.as_raw_fd() as u32;
-            slots.write().unwrap().insert(
-                slot,
-                KvmMemorySlot {
-                    guest_memfd: fd,
-                    guest_phys_addr,
-                    memory_size: memory_size as u64,
-                    userspace_addr: userspace_addr as usize as u64,
-                },
-            );
-            raw_fd
+            Some(fd)
         } else {
-            0
+            None
         };
 
         let region = kvm_userspace_memory_region2 {
@@ -1073,19 +962,58 @@ impl vm::Vm for KvmVm {
             guest_phys_addr,
             memory_size: memory_size as u64,
             userspace_addr: userspace_addr as usize as u64,
-            guest_memfd,
+            guest_memfd: guest_memfd.as_ref().map_or(0, |fd| fd.as_raw_fd() as u32),
             // Each guest_memfd is per-region and sized to memory_size,
             // so the region's data always starts at offset 0.
             guest_memfd_offset: 0,
             ..Default::default()
         };
-        if log_dirty_pages {
-            if (region.flags & KVM_MEM_READONLY) != 0 {
-                return Err(vm::HypervisorVmError::CreateUserMemory(anyhow!(
-                    "Error creating regions with both 'dirty-pages-log' and 'read-only'."
-                )));
-            }
+        if log_dirty_pages && (region.flags & KVM_MEM_READONLY) != 0 {
+            return Err(vm::HypervisorVmError::CreateUserMemory(anyhow!(
+                "Error creating regions with both 'dirty-pages-log' and 'read-only'."
+            )));
+        }
 
+        // SAFETY: Safe because guest regions are guaranteed not to overlap.
+        unsafe {
+            self.fd
+                .set_user_memory_region2(region)
+                .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
+        }
+
+        #[cfg(feature = "sev_snp")]
+        if visibility == vm::MemoryVisibility::Private
+            && self.memory_slots.is_some()
+            && let Err(e) = self.fd.set_memory_attributes(kvm_memory_attributes {
+                address: region.guest_phys_addr,
+                size: region.memory_size,
+                attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
+                flags: 0,
+            })
+        {
+            let removed = kvm_userspace_memory_region2 {
+                memory_size: 0,
+                ..region
+            };
+            // SAFETY: the region was installed above and its backing is still alive.
+            if let Err(rollback) = unsafe { self.fd.set_user_memory_region2(removed) } {
+                error!("Failed to roll back memory slot {slot}: {rollback}");
+                process::exit(1);
+            }
+            return Err(vm::HypervisorVmError::CreateUserMemory(e.into()));
+        }
+        if let Some(fd) = guest_memfd {
+            self.memory_slots.as_ref().unwrap().write().unwrap().insert(
+                slot,
+                KvmMemorySlot {
+                    guest_memfd: fd,
+                    guest_phys_addr,
+                    memory_size: memory_size as u64,
+                    userspace_addr: userspace_addr as usize as u64,
+                },
+            );
+        }
+        if log_dirty_pages {
             // Keep track of the regions that need dirty pages log
             self.dirty_log_slots.write().unwrap().insert(
                 region.slot,
@@ -1101,23 +1029,6 @@ impl vm::Vm for KvmVm {
             );
         }
 
-        // SAFETY: Safe because caller promised this is safe.
-        unsafe {
-            self.set_user_memory_region(region)
-                .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
-        }
-
-        #[cfg(feature = "sev_snp")]
-        if visibility == vm::MemoryVisibility::Private && self.memory_slots.is_some() {
-            self.fd
-                .set_memory_attributes(kvm_memory_attributes {
-                    address: region.guest_phys_addr,
-                    size: region.memory_size,
-                    attributes: KVM_MEMORY_ATTRIBUTE_PRIVATE as u64,
-                    flags: 0,
-                })
-                .map_err(|e| vm::HypervisorVmError::CreateUserMemory(e.into()))?;
-        }
         Ok(())
     }
 
@@ -1146,16 +1057,17 @@ impl vm::Vm for KvmVm {
             ..Default::default()
         };
 
-        // Remove the corresponding entry from "self.dirty_log_slots" if needed
-        self.dirty_log_slots.write().unwrap().remove(&region.slot);
-
         // Setting the size to 0 means "remove"
         region.memory_size = 0;
-        // SAFETY: Safe because caller promised this is safe.
+        // SAFETY: Safe because guest regions are guaranteed not to overlap.
         unsafe {
-            self.set_user_memory_region(region)
+            self.fd
+                .set_user_memory_region2(region)
                 .map_err(|e| vm::HypervisorVmError::RemoveUserMemory(e.into()))?;
         }
+
+        // Remove the corresponding entry from "self.dirty_log_slots" if needed
+        self.dirty_log_slots.write().unwrap().remove(&region.slot);
 
         // Close the per-region guest_memfd if one was created for this slot
         if let Some(slots) = &self.memory_slots {
@@ -1165,9 +1077,7 @@ impl vm::Vm for KvmVm {
         Ok(())
     }
 
-    ///
     /// Returns the preferred CPU target type which can be emulated by KVM on underlying host.
-    ///
     #[cfg(target_arch = "aarch64")]
     fn get_preferred_target(&self, kvi: &mut crate::VcpuInit) -> vm::Result<()> {
         let mut kvm_kvi: kvm_bindings::kvm_vcpu_init = (*kvi).into();
@@ -1237,8 +1147,19 @@ impl vm::Vm for KvmVm {
 
     /// Capture kvmclock (filling realtime) for snapshot/migration.
     #[cfg(target_arch = "x86_64")]
-    fn snapshot_clock(&self, _boot_vcpu: &dyn cpu::Vcpu) -> vm::Result<Option<ClockState>> {
-        Ok(Some(self.get_clock()?.with_realtime_filled()))
+    fn snapshot_clock(&self, boot_vcpu: &dyn cpu::Vcpu) -> vm::Result<Option<ClockState>> {
+        let data = self.get_clock()?.with_realtime_filled();
+        let mut msrs = vec![MsrEntry {
+            index: msr_index::MSR_IA32_TSC,
+            data: 0,
+        }];
+        boot_vcpu
+            .get_msrs(&mut msrs)
+            .map_err(|e| vm::HypervisorVmError::GetClock(e.into()))?;
+        Ok(Some(ClockState {
+            data,
+            tsc: Some(msrs[0].data),
+        }))
     }
 
     /// Capture the guest virtual counter and host wall clock for
@@ -1265,11 +1186,64 @@ impl vm::Vm for KvmVm {
     #[cfg(target_arch = "x86_64")]
     fn restore_clock(
         &self,
-        _vcpus: &[&dyn cpu::Vcpu],
+        vcpus: &[&dyn cpu::Vcpu],
         state: &ClockState,
-        _mode: ClockRestoreMode,
+        mode: ClockRestoreMode,
     ) -> vm::Result<()> {
-        self.set_clock(state)
+        self.set_clock(&state.data)?;
+        if mode != ClockRestoreMode::SnapshotRestore || !state.data.has_realtime() {
+            return Ok(());
+        }
+        if let (Some(tsc), Some(vcpu)) = (state.tsc, vcpus.first()) {
+            let saved_clock = kvm_clock_data::from(state.data);
+            let clock = kvm_clock_data::from(self.get_clock()?);
+            let (Some(khz), Some(offset)) = (
+                vcpu.tsc_khz()
+                    .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))?,
+                vcpu.tsc_offset()
+                    .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))?,
+            ) else {
+                return Ok(());
+            };
+            let ticks = (u128::from(clock.clock.saturating_sub(saved_clock.clock))
+                * u128::from(khz)
+                / 1_000_000) as u64;
+            let mut msrs = vec![MsrEntry {
+                index: msr_index::MSR_IA32_TSC,
+                data: 0,
+            }];
+            vcpu.get_msrs(&mut msrs)
+                .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))?;
+            let delta = tsc.wrapping_add(ticks).wrapping_sub(msrs[0].data);
+            if delta as i64 > 0 {
+                for vcpu in vcpus {
+                    vcpu.set_tsc_offset(offset.wrapping_add(delta))
+                        .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))?;
+                }
+            }
+        }
+        for vcpu in vcpus {
+            let mut msrs = vec![
+                MsrEntry {
+                    index: msr_index::MSR_IA32_TSC,
+                    data: 0,
+                },
+                MsrEntry {
+                    index: msr_index::MSR_IA32_TSC_DEADLINE,
+                    data: 0,
+                },
+            ];
+            vcpu.get_msrs(&mut msrs)
+                .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))?;
+            if msrs[1].data != 0 {
+                if state.tsc.is_none() && msrs[1].data > msrs[0].data {
+                    msrs[1].data = msrs[0].data;
+                }
+                vcpu.set_msrs(&msrs[1..])
+                    .map_err(|e| vm::HypervisorVmError::SetClock(e.into()))?;
+            }
+        }
+        Ok(())
     }
 
     /// Advance the guest virtual counter to current wall time before the vCPUs
@@ -1320,9 +1294,7 @@ impl vm::Vm for KvmVm {
             .map_err(|e| vm::HypervisorVmError::CreatePassthroughDevice(e.into()))
     }
 
-    ///
     /// Start logging dirty pages
-    ///
     fn start_dirty_log(&self) -> vm::Result<()> {
         let dirty_log_slots = self.dirty_log_slots.read().unwrap();
         for s in dirty_log_slots.values() {
@@ -1338,7 +1310,8 @@ impl vm::Vm for KvmVm {
             };
             // SAFETY: Safe because guest regions are guaranteed not to overlap.
             unsafe {
-                self.set_user_memory_region(region)
+                self.fd
+                    .set_user_memory_region2(region)
                     .map_err(|e| vm::HypervisorVmError::StartDirtyLog(e.into()))?;
             }
         }
@@ -1346,9 +1319,7 @@ impl vm::Vm for KvmVm {
         Ok(())
     }
 
-    ///
     /// Stop logging dirty pages
-    ///
     fn stop_dirty_log(&self) -> vm::Result<()> {
         let dirty_log_slots = self.dirty_log_slots.read().unwrap();
         for s in dirty_log_slots.values() {
@@ -1364,7 +1335,8 @@ impl vm::Vm for KvmVm {
             };
             // SAFETY: Safe because guest regions are guaranteed not to overlap.
             unsafe {
-                self.set_user_memory_region(region)
+                self.fd
+                    .set_user_memory_region2(region)
                     .map_err(|e| vm::HypervisorVmError::StartDirtyLog(e.into()))?;
             }
         }
@@ -1372,9 +1344,7 @@ impl vm::Vm for KvmVm {
         Ok(())
     }
 
-    ///
     /// Get dirty pages bitmap (one bit per page)
-    ///
     fn get_dirty_log(&self, slot: u32, _base_gpa: u64, memory_size: u64) -> vm::Result<Vec<u64>> {
         self.fd
             .get_dirty_log(slot, memory_size as usize)
@@ -1394,9 +1364,7 @@ pub struct KvmHypervisor {
 
 impl KvmHypervisor {
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Retrieve the list of MSRs supported by the hypervisor.
-    ///
     fn get_msr_list(&self) -> hypervisor::Result<MsrList> {
         let mut indices = self
             .kvm
@@ -1421,6 +1389,11 @@ impl KvmHypervisor {
 pub enum KvmError {
     #[error("Capability missing: {0:?}")]
     CapabilityMissing(Cap),
+    #[cfg(feature = "sev_snp")]
+    #[error(
+        "Memory attributes {0:#b} do not include required private attribute ({KVM_MEMORY_ATTRIBUTE_PRIVATE:#b})"
+    )]
+    MemoryAttributePrivateMissing(u32),
 }
 
 pub type KvmResult<T> = result::Result<T, KvmError>;
@@ -1464,9 +1437,7 @@ impl KvmHypervisor {
 /// let vm = hypervisor.create_vm(HypervisorVmConfig::default()).expect("new VM fd creation failed");
 /// ```
 impl hypervisor::Hypervisor for KvmHypervisor {
-    ///
     /// Returns the type of the hypervisor
-    ///
     fn hypervisor_type(&self) -> HypervisorType {
         HypervisorType::Kvm
     }
@@ -1523,6 +1494,11 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             break;
         }
 
+        #[cfg(target_arch = "aarch64")]
+        if _config.nested && fd.check_extension_raw(KVM_CAP_ARM_EL2 as libc::c_ulong) <= 0 {
+            return Err(hypervisor::HypervisorError::NestedVirtualizationNotSupported);
+        }
+
         #[cfg(target_arch = "x86_64")]
         {
             let msr_list = self.get_msr_list()?;
@@ -1541,7 +1517,9 @@ impl hypervisor::Hypervisor for KvmHypervisor {
             #[allow(unused_mut)]
             let mut memory_slots = None;
             #[cfg(feature = "sev_snp")]
-            if _config.sev_snp_enabled && fd.check_extension(Cap::GuestMemfd) {
+            if _config.sev_snp_enabled {
+                check_required_sev_snp_extensions(&fd)
+                    .map_err(|e| hypervisor::HypervisorError::CheckExtensions(e.into()))?;
                 memory_slots = Some(Arc::new(RwLock::new(HashMap::new())));
             }
 
@@ -1603,9 +1581,7 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// X86 specific call to get the system supported CPUID values.
-    ///
     fn get_supported_cpuid(&self) -> hypervisor::Result<Vec<CpuIdEntry>> {
         let kvm_cpuid = self
             .kvm
@@ -1659,17 +1635,13 @@ impl hypervisor::Hypervisor for KvmHypervisor {
     }
 
     #[cfg(target_arch = "aarch64")]
-    ///
     /// Retrieve AArch64 host maximum IPA size supported by KVM.
-    ///
     fn get_host_ipa_limit(&self) -> i32 {
         self.kvm.get_host_ipa_limit()
     }
 
     #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-    ///
     /// Get the number of supported hardware breakpoints
-    ///
     fn get_guest_debug_hw_bps(&self) -> usize {
         #[cfg(target_arch = "x86_64")]
         {
@@ -1701,7 +1673,7 @@ pub struct KvmVcpu {
     xsave_size: i32,
     #[cfg(target_arch = "x86_64")]
     has_xcrs: bool,
-    #[cfg(any(target_arch = "x86_64", feature = "sev_snp"))]
+    #[cfg(target_arch = "x86_64")]
     vm_fd: Arc<VmFd>,
     #[cfg(feature = "sev_snp")]
     memory_slots: Option<Arc<RwLock<HashMap<u32, KvmMemorySlot>>>>,
@@ -1712,7 +1684,8 @@ pub struct KvmVcpu {
 #[cfg(feature = "sev_snp")]
 impl KvmVcpu {
     fn validate_gpa_range(&self, gpa: u64, num_pages: u64) -> cpu::Result<u64> {
-        if let Some(size) = num_pages.checked_mul(PAGE_SIZE_4K)
+        if gpa.is_multiple_of(PAGE_SIZE_4K)
+            && let Some(size) = num_pages.checked_mul(PAGE_SIZE_4K)
             && size != 0
             && let Some(end) = gpa.checked_add(size)
             && let Some(slots) = &self.memory_slots
@@ -1863,9 +1836,7 @@ impl KvmVcpu {
 /// let vcpu = vm.create_vcpu(0, None, #[cfg(target_arch = "x86_64")] Default::default()).unwrap();
 /// ```
 impl cpu::Vcpu for KvmVcpu {
-    ///
     /// Returns StandardRegisters with default value set
-    ///
     fn create_standard_regs(&self) -> StandardRegisters {
         #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
         {
@@ -1877,9 +1848,7 @@ impl cpu::Vcpu for KvmVcpu {
         }
     }
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Returns the vCPU general purpose registers.
-    ///
     fn get_regs(&self) -> cpu::Result<StandardRegisters> {
         Ok(self
             .fd
@@ -1888,11 +1857,9 @@ impl cpu::Vcpu for KvmVcpu {
             .into())
     }
 
-    ///
     /// Returns the vCPU general purpose registers.
     /// The `KVM_GET_REGS` ioctl is not available on AArch64, `KVM_GET_ONE_REG`
     /// is used to get registers one by one.
-    ///
     #[cfg(target_arch = "aarch64")]
     fn get_regs(&self) -> cpu::Result<StandardRegisters> {
         let mut state = kvm_regs::default();
@@ -1967,11 +1934,9 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "riscv64")]
-    ///
     /// Returns the RISC-V vCPU core registers.
     /// The `KVM_GET_REGS` ioctl is not available on RISC-V 64-bit,
     /// `KVM_GET_ONE_REG` is used to get registers one by one.
-    ///
     fn get_regs(&self) -> cpu::Result<StandardRegisters> {
         let mut state = kvm_riscv_core::default();
 
@@ -2034,9 +1999,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Sets the vCPU general purpose registers using the `KVM_SET_REGS` ioctl.
-    ///
     fn set_regs(&self, regs: &StandardRegisters) -> cpu::Result<()> {
         let regs = (*regs).into();
         self.fd
@@ -2044,11 +2007,9 @@ impl cpu::Vcpu for KvmVcpu {
             .map_err(|e| cpu::HypervisorCpuError::SetStandardRegs(e.into()))
     }
 
-    ///
     /// Sets the vCPU general purpose registers.
     /// The `KVM_SET_REGS` ioctl is not available on AArch64, `KVM_SET_ONE_REG`
     /// is used to set registers one by one.
-    ///
     #[cfg(target_arch = "aarch64")]
     fn set_regs(&self, state: &StandardRegisters) -> cpu::Result<()> {
         // The function follows the exact identical order from `state`. Look there
@@ -2120,11 +2081,9 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "riscv64")]
-    ///
     /// Sets the RISC-V vCPU core registers.
     /// The `KVM_SET_REGS` ioctl is not available on RISC-V 64-bit,
     /// `KVM_SET_ONE_REG` is used to set registers one by one.
-    ///
     fn set_regs(&self, state: &StandardRegisters) -> cpu::Result<()> {
         // The function follows the exact identical order from `state`. Look there
         // for some additional info on registers.
@@ -2191,9 +2150,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Returns the vCPU special registers.
-    ///
     fn get_sregs(&self) -> cpu::Result<SpecialRegisters> {
         Ok(self
             .fd
@@ -2203,9 +2160,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Sets the vCPU special registers using the `KVM_SET_SREGS` ioctl.
-    ///
     fn set_sregs(&self, sregs: &SpecialRegisters) -> cpu::Result<()> {
         let sregs = (*sregs).into();
         self.fd
@@ -2214,9 +2169,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Returns the floating point state (FPU) from the vCPU.
-    ///
     fn get_fpu(&self) -> cpu::Result<FpuState> {
         Ok(self
             .fd
@@ -2226,9 +2179,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Set the floating point state (FPU) of a vCPU using the `KVM_SET_FPU` ioctl.
-    ///
     fn set_fpu(&self, fpu: &FpuState) -> cpu::Result<()> {
         let fpu: kvm_bindings::kvm_fpu = (*fpu).clone().into();
         self.fd
@@ -2237,9 +2188,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// X86 specific call to setup the CPUID registers.
-    ///
     fn set_cpuid2(&self, cpuid: &[CpuIdEntry]) -> cpu::Result<()> {
         let cpuid: Vec<kvm_bindings::kvm_cpuid_entry2> =
             cpuid.iter().map(|e| (*e).into()).collect();
@@ -2253,9 +2202,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// X86 specific call to enable HyperV SynIC
-    ///
     fn enable_hyperv_synic(&self) -> cpu::Result<()> {
         // Update the information about Hyper-V SynIC being enabled and
         // emulated as it will influence later which MSRs should be saved.
@@ -2270,9 +2217,7 @@ impl cpu::Vcpu for KvmVcpu {
             .map_err(|e| cpu::HypervisorCpuError::EnableHyperVSyncIc(e.into()))
     }
 
-    ///
     /// X86 specific call to retrieve the CPUID registers.
-    ///
     #[cfg(target_arch = "x86_64")]
     fn get_cpuid2(&self, num_entries: usize) -> cpu::Result<Vec<CpuIdEntry>> {
         let kvm_cpuid = self
@@ -2286,9 +2231,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Returns the state of the LAPIC (Local Advanced Programmable Interrupt Controller).
-    ///
     fn get_lapic(&self) -> cpu::Result<LapicState> {
         Ok(self
             .fd
@@ -2298,9 +2241,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Sets the state of the LAPIC (Local Advanced Programmable Interrupt Controller).
-    ///
     fn set_lapic(&self, klapic: &LapicState) -> cpu::Result<()> {
         let klapic: kvm_bindings::kvm_lapic_state = (*klapic).clone().into();
         self.fd
@@ -2309,9 +2250,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Returns the model-specific registers (MSR) for this vCPU.
-    ///
     fn get_msrs(&self, msrs: &mut Vec<MsrEntry>) -> cpu::Result<usize> {
         let kvm_msrs: Vec<kvm_msr_entry> = msrs.iter().map(|e| (*e).into()).collect();
         let mut kvm_msrs = MsrEntries::from_entries(&kvm_msrs).unwrap();
@@ -2331,10 +2270,8 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Setup the model-specific registers (MSR) for this vCPU.
     /// Returns the number of MSR entries actually written.
-    ///
     fn set_msrs(&self, msrs: &[MsrEntry]) -> cpu::Result<usize> {
         let kvm_msrs: Vec<kvm_msr_entry> = msrs.iter().map(|e| (*e).into()).collect();
         let kvm_msrs = MsrEntries::from_entries(&kvm_msrs).unwrap();
@@ -2343,9 +2280,7 @@ impl cpu::Vcpu for KvmVcpu {
             .map_err(|e| cpu::HypervisorCpuError::SetMsrEntries(e.into()))
     }
 
-    ///
     /// Returns the vcpu's current "multiprocessing state".
-    ///
     fn get_mp_state(&self) -> cpu::Result<MpState> {
         Ok(self
             .fd
@@ -2354,9 +2289,7 @@ impl cpu::Vcpu for KvmVcpu {
             .into())
     }
 
-    ///
     /// Sets the vcpu's current "multiprocessing state".
-    ///
     fn set_mp_state(&self, mp_state: MpState) -> cpu::Result<()> {
         self.fd
             .set_mp_state(mp_state.into())
@@ -2364,9 +2297,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Translates guest virtual address to guest physical address using the `KVM_TRANSLATE` ioctl.
-    ///
     fn translate_gva(&self, gva: u64, _flags: u64) -> cpu::Result<(u64, u32)> {
         let tr = self
             .fd
@@ -2381,9 +2312,7 @@ impl cpu::Vcpu for KvmVcpu {
         }
     }
 
-    ///
     /// Triggers the running of the current virtual CPU returning an exit reason.
-    ///
     fn run(&mut self) -> result::Result<cpu::VmExit, cpu::HypervisorCpuError> {
         match self.fd.run() {
             Ok(run) => match run {
@@ -2575,10 +2504,8 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Let the guest know that it has been paused, which prevents from
     /// potential soft lockups when being resumed.
-    ///
     fn notify_guest_clock_paused(&self) -> cpu::Result<()> {
         if let Err(e) = self.fd.kvmclock_ctrl() {
             // Linux kernel returns -EINVAL if the PV clock isn't yet initialised
@@ -2593,9 +2520,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(not(target_arch = "riscv64"))]
-    ///
     /// Sets debug registers to set hardware breakpoints and/or enable single step.
-    ///
     fn set_guest_debug(
         &self,
         addrs: &[vm_memory::GuestAddress],
@@ -2658,6 +2583,7 @@ impl cpu::Vcpu for KvmVcpu {
         vm: &dyn crate::Vm,
         kvi: &mut crate::VcpuInit,
         id: u32,
+        nested: bool,
     ) -> cpu::Result<()> {
         use std::arch::is_aarch64_feature_detected;
         #[allow(clippy::nonminimal_bool)]
@@ -2668,6 +2594,9 @@ impl cpu::Vcpu for KvmVcpu {
 
         // We already checked that the capability is supported.
         kvm_kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_PSCI_0_2;
+        if nested {
+            kvm_kvi.features[0] |= 1 << kvm_bindings::KVM_ARM_VCPU_HAS_EL2;
+        }
         if vm
             .as_any()
             .downcast_ref::<KvmVm>()
@@ -2697,9 +2626,7 @@ impl cpu::Vcpu for KvmVcpu {
         Ok(())
     }
 
-    ///
     /// Return VcpuInit with default value set
-    ///
     #[cfg(target_arch = "aarch64")]
     fn create_vcpu_init(&self) -> crate::VcpuInit {
         kvm_bindings::kvm_vcpu_init::default().into()
@@ -2731,10 +2658,8 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "riscv64"))]
-    ///
     /// Gets a list of the guest registers that are supported for the
     /// KVM_GET_ONE_REG/KVM_SET_ONE_REG calls.
-    ///
     fn get_reg_list(&self, reg_list: &mut RegList) -> cpu::Result<()> {
         let mut kvm_reg_list: kvm_bindings::RegList = reg_list.clone().into();
         self.fd
@@ -2744,9 +2669,7 @@ impl cpu::Vcpu for KvmVcpu {
         Ok(())
     }
 
-    ///
     /// Gets the value of a system register
-    ///
     #[cfg(target_arch = "aarch64")]
     fn get_sys_reg(&self, sys_reg: u32) -> cpu::Result<u64> {
         //
@@ -2777,9 +2700,7 @@ impl cpu::Vcpu for KvmVcpu {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    ///
     /// Gets the guest virtual counter via `KVM_REG_ARM_TIMER_CNT`.
-    ///
     #[cfg(target_arch = "aarch64")]
     fn get_cntvct(&self) -> cpu::Result<u64> {
         let mut bytes = [0_u8; 8];
@@ -2789,9 +2710,7 @@ impl cpu::Vcpu for KvmVcpu {
         Ok(u64::from_le_bytes(bytes))
     }
 
-    ///
     /// Sets the guest virtual counter via `KVM_REG_ARM_TIMER_CNT`.
-    ///
     #[cfg(target_arch = "aarch64")]
     fn set_cntvct(&self, val: u64) -> cpu::Result<()> {
         self.fd
@@ -2812,17 +2731,26 @@ impl cpu::Vcpu for KvmVcpu {
         Ok(u64::from_le_bytes(freq_bytes))
     }
 
-    ///
     /// Configure core registers for a given CPU.
-    ///
     #[cfg(target_arch = "aarch64")]
-    fn setup_regs(&self, cpu_id: u32, boot_ip: u64, fdt_start: u64) -> cpu::Result<()> {
+    fn setup_regs(
+        &self,
+        cpu_id: u32,
+        boot_ip: u64,
+        fdt_start: u64,
+        nested: bool,
+    ) -> cpu::Result<()> {
         // Get the register index of the PSTATE (Processor State) register.
         let pstate = offset_of!(kvm_regs, regs.pstate);
+        let pstate_value = if nested {
+            regs::PSTATE_FAULT_BITS_64_EL2H
+        } else {
+            regs::PSTATE_FAULT_BITS_64_EL1H
+        };
         self.fd
             .set_one_reg(
                 arm64_core_reg_id!(KVM_REG_SIZE_U64, pstate),
-                &regs::PSTATE_FAULT_BITS_64.to_le_bytes(),
+                &pstate_value.to_le_bytes(),
             )
             .map_err(|e| cpu::HypervisorCpuError::SetAarchCoreRegister(e.into()))?;
 
@@ -2853,9 +2781,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "riscv64")]
-    ///
     /// Configure registers for a given RISC-V CPU.
-    ///
     fn setup_regs(&self, cpu_id: u32, boot_ip: u64, fdt_start: u64) -> cpu::Result<()> {
         // Setting the A0 () to the hartid of this CPU.
         let a0 = offset_of!(kvm_riscv_core, regs.a0);
@@ -2892,7 +2818,6 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Get the current CPU state
     ///
     /// Ordering requirements:
@@ -3038,9 +2963,7 @@ impl cpu::Vcpu for KvmVcpu {
         .into())
     }
 
-    ///
     /// Get the current AArch64 CPU state
-    ///
     #[cfg(target_arch = "aarch64")]
     fn state(&self) -> cpu::Result<CpuState> {
         let mut state = VcpuKvmState {
@@ -3110,9 +3033,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "riscv64")]
-    ///
     /// Get the current RISC-V 64-bit CPU state
-    ///
     fn state(&self) -> cpu::Result<CpuState> {
         let mut state = VcpuKvmState {
             mp_state: self.get_mp_state()?.into(),
@@ -3166,7 +3087,6 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Restore the previously saved CPU state
     ///
     /// Ordering requirements:
@@ -3281,9 +3201,7 @@ impl cpu::Vcpu for KvmVcpu {
         Ok(())
     }
 
-    ///
     /// Restore the previously saved AArch64 CPU state
-    ///
     #[cfg(target_arch = "aarch64")]
     fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
         let state: VcpuKvmState = state.clone().into();
@@ -3318,9 +3236,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "riscv64")]
-    ///
     /// Restore the previously saved RISC-V 64-bit CPU state
-    ///
     fn set_state(&self, state: &CpuState) -> cpu::Result<()> {
         let state: VcpuKvmState = state.clone().into();
         // Set core registers
@@ -3337,17 +3253,13 @@ impl cpu::Vcpu for KvmVcpu {
         Ok(())
     }
 
-    ///
     /// Set the "immediate_exit" state
-    ///
     fn set_immediate_exit(&mut self, exit: bool) {
         self.fd.set_kvm_immediate_exit(exit.into());
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Return the list of initial MSR entries for a VCPU
-    ///
     fn boot_msr_entries(&self) -> Vec<MsrEntry> {
         let mut boot_entries = self.feature_msrs.clone();
 
@@ -3405,9 +3317,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Get the frequency of the TSC if available
-    ///
     fn tsc_khz(&self) -> cpu::Result<Option<u32>> {
         match self.fd.get_tsc_khz() {
             Err(e) => {
@@ -3422,9 +3332,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Set the frequency of the TSC if available
-    ///
     fn set_tsc_khz(&self, freq: u32) -> cpu::Result<()> {
         match self.fd.set_tsc_khz(freq) {
             Err(e) => {
@@ -3439,9 +3347,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Read the vCPU's L1 TSC offset.
-    ///
     fn tsc_offset(&self) -> cpu::Result<Option<u64>> {
         let mut offset = 0u64;
         let attr = Self::tsc_offset_attr(&raw mut offset as u64);
@@ -3456,9 +3362,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Set the vCPU's L1 TSC offset.
-    ///
     fn set_tsc_offset(&self, offset: u64) -> cpu::Result<()> {
         let attr = Self::tsc_offset_attr(&raw const offset as u64);
         // SAFETY: FFI call; `attr.addr` points to `offset`, read by the kernel.
@@ -3472,9 +3376,7 @@ impl cpu::Vcpu for KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Trigger NMI interrupt
-    ///
     fn nmi(&self) -> cpu::Result<()> {
         match self.fd.nmi() {
             Err(e) => {
@@ -3486,11 +3388,6 @@ impl cpu::Vcpu for KvmVcpu {
             }
             Ok(_) => Ok(()),
         }
-    }
-
-    #[cfg(feature = "sev_snp")]
-    fn set_sev_control_register(&self, _vmsa_pfn: u64) -> cpu::Result<()> {
-        Ok(())
     }
 
     #[cfg(feature = "sev_snp")]
@@ -3702,9 +3599,7 @@ impl KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// X86 specific call that returns the vcpu's current "xcrs".
-    ///
     fn get_xcrs(&self) -> cpu::Result<ExtendedControlRegisters> {
         self.fd
             .get_xcrs()
@@ -3712,9 +3607,7 @@ impl KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// X86 specific call that sets the vcpu's current "xcrs".
-    ///
     fn set_xcrs(&self, xcrs: &ExtendedControlRegisters) -> cpu::Result<()> {
         self.fd
             .set_xcrs(xcrs)
@@ -3722,10 +3615,8 @@ impl KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Returns currently pending exceptions, interrupts, and NMIs as well as related
     /// states of the vcpu.
-    ///
     fn get_vcpu_events(&self) -> cpu::Result<VcpuEvents> {
         self.fd
             .get_vcpu_events()
@@ -3733,10 +3624,8 @@ impl KvmVcpu {
     }
 
     #[cfg(target_arch = "x86_64")]
-    ///
     /// Sets pending exceptions, interrupts, and NMIs as well as related states
     /// of the vcpu.
-    ///
     fn set_vcpu_events(&self, events: &VcpuEvents) -> cpu::Result<()> {
         self.fd
             .set_vcpu_events(events)
@@ -3782,6 +3671,77 @@ impl KvmVcpu {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(target_arch = "x86_64")]
+    use super::*;
+
+    #[cfg(target_arch = "x86_64")]
+    struct TscDeadlineVm {
+        vm: Arc<dyn vm::Vm>,
+        vcpu: Box<dyn cpu::Vcpu>,
+        tsc_hz: u64,
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    impl TscDeadlineVm {
+        fn new() -> Self {
+            let hypervisor = KvmHypervisor::new().unwrap();
+            let vm = hypervisor.create_vm(HypervisorVmConfig::default()).unwrap();
+            vm.enable_split_irq().unwrap();
+            let vcpu = vm.create_vcpu(0, None, Default::default()).unwrap();
+            let mut cpuid = hypervisor.get_supported_cpuid().unwrap();
+            for entry in cpuid.iter_mut().filter(|entry| entry.function == 1) {
+                entry.ecx |= 1 << 24;
+            }
+            vcpu.set_cpuid2(&cpuid).unwrap();
+            let mut lapic = vcpu.get_lapic().unwrap();
+            lapic.set_klapic_reg(0xf0, 0x1ff);
+            lapic.set_klapic_reg(0x320, 0x400f0);
+            vcpu.set_lapic(&lapic).unwrap();
+            let tsc_hz = u64::from(vcpu.tsc_khz().unwrap().unwrap()) * 1000;
+            Self { vm, vcpu, tsc_hz }
+        }
+
+        fn read_msr(&self, index: u32) -> u64 {
+            let mut msrs = vec![MsrEntry { index, data: 0 }];
+            assert_eq!(self.vcpu.get_msrs(&mut msrs).unwrap(), 1);
+            msrs[0].data
+        }
+
+        fn arm_deadline_after_secs(&self, seconds: u64) -> u64 {
+            let deadline = self.read_msr(msr_index::MSR_IA32_TSC) + seconds * self.tsc_hz;
+            assert_eq!(
+                self.vcpu
+                    .set_msrs(&[MsrEntry {
+                        index: msr_index::MSR_IA32_TSC_DEADLINE,
+                        data: deadline,
+                    }])
+                    .unwrap(),
+                1
+            );
+            assert_eq!(self.read_msr(msr_index::MSR_IA32_TSC_DEADLINE), deadline);
+            deadline
+        }
+
+        fn clock_state_with_gap(&self, seconds: u64) -> ClockState {
+            let mut state = self.vm.snapshot_clock(self.vcpu.as_ref()).unwrap().unwrap();
+            assert!(state.data.has_realtime());
+            let mut data = kvm_clock_data::from(state.data);
+            data.realtime -= seconds * 1_000_000_000;
+            state.data = data.into();
+            state
+        }
+
+        fn restore_clock(&self, state: &ClockState) {
+            self.vm
+                .restore_clock(
+                    &[self.vcpu.as_ref()],
+                    state,
+                    ClockRestoreMode::SnapshotRestore,
+                )
+                .unwrap();
+        }
+    }
+
     #[test]
     #[cfg(target_arch = "x86_64")]
     fn test_tsc_offset_round_trip() {
@@ -3797,6 +3757,28 @@ mod tests {
         assert_eq!(vcpu.tsc_offset().unwrap(), Some(target));
         vcpu.set_tsc_offset(offset).unwrap();
         assert_eq!(vcpu.tsc_offset().unwrap(), Some(offset));
+    }
+
+    #[test]
+    #[cfg(target_arch = "x86_64")]
+    fn test_restore_clock_rearms_tsc_deadline() {
+        let vm = TscDeadlineVm::new();
+        let mut state = vm.clock_state_with_gap(10);
+        let deadline = vm.arm_deadline_after_secs(100);
+
+        vm.restore_clock(&state);
+        assert_eq!(vm.read_msr(msr_index::MSR_IA32_TSC_DEADLINE), deadline);
+        let tsc = vm.read_msr(msr_index::MSR_IA32_TSC);
+        assert!(tsc >= state.tsc.unwrap() + 10 * vm.tsc_hz);
+        assert!(tsc < deadline);
+
+        state.tsc = None;
+        let offset = vm.vcpu.tsc_offset().unwrap();
+        vm.restore_clock(&state);
+        assert_eq!(vm.vcpu.tsc_offset().unwrap(), offset);
+        assert!(
+            vm.read_msr(msr_index::MSR_IA32_TSC_DEADLINE) <= vm.read_msr(msr_index::MSR_IA32_TSC)
+        );
     }
 
     #[test]
@@ -3849,6 +3831,8 @@ mod tests {
         assert_eq!(vcpu.validate_gpa_range(0x5000, 1).unwrap(), 0x1000);
         for (gpa, pages) in [
             (0, 1),
+            (0x1001, 1),
+            (0x1fff, 1),
             (0x6000, 1),
             (0x3000, 2),
             (0x3000, 3),

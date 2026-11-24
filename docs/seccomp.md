@@ -26,6 +26,10 @@ than the VMM thread's filter.
 By default, Cloud Hypervisor enables seccomp filtering as the project believes
 that security should not be an option.
 
+In this default mode, Cloud Hypervisor prints the prohibited system call
+number and the thread name to stderr before it terminates, for example
+`Probable seccomp violation: si_syscall=47 si_arch=0xc000003e thread=vcpu0`.
+
 For development and debugging purposes, one might want to disable this feature
 or log the faulty system call.
 
@@ -69,13 +73,11 @@ regression caused by an unknown syscall can be observed without an immediate
 crash, at the cost of turning the violation into a soft failure visible only as
 a syscall error.
 
-By default the kernel does not log `errno` actions. To audit them, ensure
-`errno` is included in the host's `kernel.seccomp.actions_logged` sysctl, for
-example:
-
-```
-# sysctl -w kernel.seccomp.actions_logged='kill_process kill_thread trap errno log'
-```
+The kernel does not log `errno` actions for Cloud Hypervisor, even if `errno`
+is included in the host's `kernel.seccomp.actions_logged` sysctl, because
+Cloud Hypervisor installs its filters without the `SECCOMP_FILTER_FLAG_LOG`
+flag. To find the prohibited system calls, use `--seccomp log` or `strace`
+instead.
 
 ### Further debug with `strace`
 

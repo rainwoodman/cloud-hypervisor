@@ -1,12 +1,14 @@
 # How to build and test Cloud Hypervisor on riscv64
 
 This document introduces how to build and test Cloud Hypervisor on `riscv64`.
-All instructions here are tested with Ubuntu 24.04.2 as the host OS.
 
 ## Hardware requirements
 
 - riscv64 servers (recommended) or development boards equipped with the AIA
 (Advance Interrupt Architecture) interrupt controller.
+- The Smstateen extension. Cloud Hypervisor sets the `sstateen0` CSR of every
+vCPU so that the guest can access the AIA CSRs, and vCPU creation fails
+without it.
 
 ## Getting started
 
@@ -70,7 +72,7 @@ popd
 ```console
 pushd $CLOUDH
 sudo $CLOUDH/cloud-hypervisor/target/debug/cloud-hypervisor \
-           --kernel $CLOUDH/linux/arch/riscv64/boot/Image \
+           --kernel $CLOUDH/linux/arch/riscv/boot/Image \
            --disk path=jammy-server-cloudimg-riscv64.raw,image_type=raw \
            --cmdline "console=hvc0 root=/dev/vda rw" \
            --cpus boot=1 \
@@ -111,12 +113,13 @@ sudo make install
 
 ### Download Ubuntu Server Image
 
-At the time of writing, the best results have been seen with 
-the Ubuntu 24.10 (Oracular) server image. Ex:
+Download the latest Ubuntu 24.04 LTS (Noble) preinstalled server
+image for riscv64 from https://cdimage.ubuntu.com/releases/noble/release/.
+Ex:
 
 ```console
-wget https://cdimage.ubuntu.com/releases/oracular/release/ubuntu-24.10-preinstalled-server-riscv64.img.xz
-xz -dk ubuntu-24.10-preinstalled-server-riscv64.img.xz
+wget https://cdimage.ubuntu.com/releases/noble/release/ubuntu-24.04.5-preinstalled-server-riscv64.img.xz
+xz -dk ubuntu-24.04.5-preinstalled-server-riscv64.img.xz
 ```
 
 ### (Optional) Resize Disk
@@ -163,7 +166,6 @@ https://www.qemu.org/docs/master/specs/riscv-aia.html
 
 ## Known limitations
 
-- Direct kernel boot only
 - `64-bit Linux` guest OS only
 - For more details, see
   [here](https://github.com/cloud-hypervisor/cloud-hypervisor/issues/6978).

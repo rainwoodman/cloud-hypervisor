@@ -35,7 +35,6 @@ Here are some good references for detailing them.
 
 ## Test environment
 
-The below test environment is based on Ubuntu release (20.04.1 LTS), as for other system, please check related documents.
 This test runs with multiple queue (MQ) support enabled, using 4 queues defined for both SPDK and the virtual machine.
 Here are the detailed instructions.
 
@@ -86,7 +85,8 @@ sudo scripts/rpc.py vhost_create_blk_controller --cpumask 0x1 vhost.1 Malloc0
 
 ### Launch the VM
 
-VMs run in client mode. They connect to the socket created by the `dpdkvhostuser` in the SPDK backend.
+VMs run in client mode. They connect to the socket created by the SPDK vhost
+target.
 ```bash
 # From the test terminal. We need to create one vhost-user-blk device for the --disk.
 ./cloud-hypervisor \
@@ -97,8 +97,7 @@ VMs run in client mode. They connect to the socket created by the `dpdkvhostuser
         --disk path=images/focal-server-cloudimg-amd64.raw,image_type=raw \
                 vhost_user=true,socket=/var/tmp/vhost.1,num_queues=4,queue_size=128 \
         --console off \
-        --serial tty \
-        --rng
+        --serial tty
 ```
 
 ```bash

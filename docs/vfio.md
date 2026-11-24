@@ -36,16 +36,7 @@ Now that we have identified the device, we must unbind it from its native driver
 First we add VFIO support to the host:
 
 ```
-# modprobe -r vfio_pci
-# modprobe -r vfio_iommu_type1
-# modprobe vfio_iommu_type1 allow_unsafe_interrupts
 # modprobe vfio_pci
-```
-
-In case the VFIO drivers are built-in, enable unsafe interrupts with:
-
-```
-# echo 1 > /sys/module/vfio_iommu_type1/parameters/allow_unsafe_interrupts
 ```
 
 Then we unbind it from its native driver:
@@ -87,6 +78,7 @@ takes the device's sysfs path as an argument. In our example it is
     --cmdline "console=ttyS0 root=/dev/vda1 rw" \
     --cpus boot=4 \
     --memory size=512M \
+    --platform iommufd=on \
     --device path=/sys/bus/pci/devices/0000:01:00.0/
 ```
 
@@ -190,7 +182,7 @@ demonstrates a guest with two PCI segments. 2/3 of the 32-bit mmio address
 space is available for use by devices on PCI segment 0 and 1/3 of the 32-bit
 mmio address space is available for use by devices on PCI segment 1.
 ```
---platform num_pci_segments=2
+--platform iommufd=on,num_pci_segments=2
 --pci-segment pci_segment=0,mmio32_aperture_weight=2
 --pci-segment pci_segment=1,mmio32_aperture_weight=1
 ```
@@ -204,8 +196,6 @@ the same protocol and is covered in
 
 ### Requirements
 
-- **Kernel.** Linux 5.18 or newer for the migration v2 ioctls. 6.0 or newer is
-  recommended for the broadest set of state transitions.
 - **Driver.** The device must be bound to a VFIO variant driver that implements
   migration v2, for example `mlx5_vfio_pci` on Mellanox NICs. The generic
   `vfio_pci` driver does not implement migration and is treated as non
@@ -276,9 +266,9 @@ are out of scope, see the requirement above.
 
 The device paths and file descriptors in the source configuration are
 meaningless on the destination host. The receive migration request therefore
-carries replacements. Each `vfio_fds` entry pairs a device id with a cdev
-file descriptor opened on the destination, and `iommufd_fd` carries a freshly
-opened iommufd. Both travel over the ch-remote UNIX socket via SCM_RIGHTS.
+carries replacements in `external_fds`. The iommufd file descriptor and cdev
+file descriptors, both opened on the destination, travel over the ch-remote
+UNIX socket via SCM_RIGHTS.
 
 The destination VF can live at a different BDF than the source's, and the
 kernel assigns its cdev name independently of the device id. The `vfio-dev`
@@ -290,13 +280,16 @@ vfio12
 dst $ exec 5<>/dev/vfio/devices/vfio12
 dst $ exec 6<>/dev/iommu
 dst $ ch-remote --api-socket=/tmp/api receive-migration \
-          receiver_url=tcp:0.0.0.0:{port},tls_dir=/path/to/dst-tls,vfio_fds=[vfio0@5],iommufd_fd=6
+          'receiver_url=tcp:0.0.0.0:{port},tls_dir=/path/to/dst-tls,external_fds=[vfio(vfio0)@[5],iommu@[6]]'
 ```
 
-The id in each `vfio_fds` entry must match the `id` of the corresponding
-device in the source VM configuration. The same substitution is available on
-snapshot restore through the `vfio_fds` and `iommufd_fd` parameters of the
-restore request, for restoring onto a different VF or host.
+The id in each `vfio(<id>)` entry must match the `id` of the corresponding
+device in the source VM configuration. The `iommu` entry supplies the iommufd
+FD.
+Snapshot restore requires a replacement FD for every VFIO device, including devices
+saved with a sysfs path and restores on the same host. For snapshot restore,
+supply `vfio(<id>)` and `iommu` entries in `external_fds`. The saved VM
+configuration must have `iommufd=on`.
 
 ### Failure Recovery
 

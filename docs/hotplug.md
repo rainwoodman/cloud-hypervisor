@@ -4,8 +4,8 @@ Currently Cloud Hypervisor supports hot plugging of CPUs devices (x86 only), PCI
 
 ## Kernel support
 
-For hotplug on Cloud Hypervisor ACPI GED support is needed. This can either be achieved by turning on `CONFIG_ACPI_REDUCED_HARDWARE_ONLY`
-or by using this kernel patch (available in 5.5-rc1 and later): https://git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git/patch/drivers/acpi/Makefile?id=ac36d37e943635fc072e9d4f47e40a48fbcdb3f0
+For hotplug on Cloud Hypervisor ACPI GED support is needed in the guest kernel.
+Linux includes it with `CONFIG_ACPI` since version 5.5.
 
 ## CPU Hot Plug
 
@@ -26,7 +26,6 @@ $ ./cloud-hypervisor/target/release/cloud-hypervisor \
 	--cpus boot=4,max=8 \
 	--memory size=1024M \
 	--net "tap=,mac=,ip=,mask=" \
-	--rng \
 	--api-socket=/tmp/ch-socket
 $ popd
 ```
@@ -63,6 +62,10 @@ As per adding CPUs to the guest, after a reboot the VM will be running with the 
 
 ## Memory Hot Plug
 
+ACPI memory hotplug is deprecated and will be removed in a future release.
+Use the [virtio-mem method](#virtio-mem-method) with
+`--memory hotplug_method=virtio-mem` instead.
+
 ### ACPI method
 
 Extra memory can be added from a running `cloud-hypervisor` instance. This is controlled by two mechanisms:
@@ -84,7 +87,6 @@ $ ./cloud-hypervisor/target/release/cloud-hypervisor \
 	--cpus boot=4,max=8 \
 	--memory size=1024M,hotplug_size=8192M \
 	--net "tap=,mac=,ip=,mask=" \
-	--rng \
 	--api-socket=/tmp/ch-socket
 $ popd
 ```
@@ -154,6 +156,17 @@ Swap:          32Mi          0B        32Mi
 ```
 
 The same API can also be used to reduce the desired RAM for a VM. It is important to note that reducing RAM size might only partially work, as the guest might be using some of it.
+
+If the guest memory is made of memory zones (`--memory size=0` with
+`--memory-zone`), the `resize` API is rejected. Instead, each zone with a
+`hotplug_size` is resized on its own with the `resize-zone` API. It takes the
+new total size of the zone, which must be between the zone's `size` and its
+`size` plus `hotplug_size`. See
+[the memory documentation](memory.md#advanced-parameters).
+
+```shell
+./ch-remote --api-socket=/tmp/ch-socket resize-zone --id mem0 --size 3G
+```
 
 ## PCI Device Hot Plug
 

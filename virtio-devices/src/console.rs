@@ -4,10 +4,11 @@
 use std::collections::VecDeque;
 use std::fs::File;
 use std::io::{Read, Write};
+use std::net::TcpListener;
 use std::os::unix::io::AsRawFd;
 use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 use std::{cmp, io, result};
 
 use anyhow::anyhow;
@@ -33,7 +34,8 @@ use super::{
 };
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
-use crate::{GuestMemoryMmap, VirtioInterrupt};
+use crate::thread_helper::PauseCommon;
+use crate::{GuestMemory, VirtioInterrupt};
 
 const QUEUE_SIZE: u16 = 256;
 const NUM_QUEUES: u16 = 2;
@@ -84,7 +86,7 @@ impl Default for VirtioConsoleConfig {
 unsafe impl ByteValued for VirtioConsoleConfig {}
 
 struct ConsoleEpollHandler {
-    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    mem: GuestMemoryAtomic<GuestMemory>,
     input_queue: Queue,
     output_queue: Queue,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
@@ -110,6 +112,7 @@ pub enum Endpoint {
     FilePair(Arc<File>, Arc<File>),
     PtyPair(Arc<File>, Arc<File>),
     Socket(Arc<UnixListener>),
+    TcpListen(Arc<TcpListener>),
     Null,
 }
 
@@ -120,6 +123,7 @@ impl Endpoint {
             Self::FilePair(f, _) => Some(f),
             Self::PtyPair(f, _) => Some(f),
             Self::Socket(..) => None,
+            Self::TcpListen(..) => None,
             Self::Null => None,
         }
     }
@@ -130,6 +134,7 @@ impl Endpoint {
             Self::FilePair(_, f) => Some(f),
             Self::PtyPair(_, f) => Some(f),
             Self::Socket(..) => None,
+            Self::TcpListen(..) => None,
             Self::Null => None,
         }
     }
@@ -137,12 +142,16 @@ impl Endpoint {
     fn is_pty(&self) -> bool {
         matches!(self, Self::PtyPair(_, _))
     }
+
+    fn is_socket(&self) -> bool {
+        matches!(self, Self::Socket(..) | Self::TcpListen(..))
+    }
 }
 
 impl ConsoleEpollHandler {
     #[expect(clippy::too_many_arguments)]
     fn new(
-        mem: GuestMemoryAtomic<GuestMemoryMmap>,
+        mem: GuestMemoryAtomic<GuestMemory>,
         input_queue: Queue,
         output_queue: Queue,
         interrupt_cb: Arc<dyn VirtioInterrupt>,
@@ -157,7 +166,7 @@ impl ConsoleEpollHandler {
         pause_evt: EventFd,
         access_platform: Option<Arc<dyn AccessPlatform>>,
     ) -> Self {
-        let (socket_console, out, write_out) = if let Endpoint::Socket(..) = &endpoint {
+        let (socket_console, out, write_out) = if endpoint.is_socket() {
             let console = SocketConsole::new();
             let out = console.out_sink();
             (Some(console), Some(out), None)
@@ -321,11 +330,7 @@ impl ConsoleEpollHandler {
             })
     }
 
-    fn run(
-        &mut self,
-        paused: &AtomicBool,
-        paused_sync: &Barrier,
-    ) -> result::Result<(), EpollHelperError> {
+    fn run(&mut self, pause_common: &PauseCommon) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
         helper.add_event(self.input_queue_evt.as_raw_fd(), INPUT_QUEUE_EVENT)?;
         helper.add_event(self.output_queue_evt.as_raw_fd(), OUTPUT_QUEUE_EVENT)?;
@@ -341,8 +346,14 @@ impl ConsoleEpollHandler {
             helper.add_event_custom(in_file.as_raw_fd(), FILE_EVENT, events)?;
             self.file_event_registered = true;
         }
-        if let Endpoint::Socket(listener) = &self.endpoint {
-            helper.add_event(listener.as_raw_fd(), SOCKET_EVENT)?;
+        match &self.endpoint {
+            Endpoint::Socket(listener) => {
+                helper.add_event(listener.as_raw_fd(), SOCKET_EVENT)?;
+            }
+            Endpoint::TcpListen(listener) => {
+                helper.add_event(listener.as_raw_fd(), SOCKET_EVENT)?;
+            }
+            _ => {}
         }
 
         // In case of PTY, we want to be able to detect a connection on the
@@ -356,7 +367,7 @@ impl ConsoleEpollHandler {
         } else {
             (-1, false)
         };
-        helper.run_with_timeout(paused, paused_sync, self, timeout, enable_event_list)?;
+        helper.run_with_timeout(pause_common, self, timeout, enable_event_list)?;
 
         Ok(())
     }
@@ -456,30 +467,55 @@ impl EpollHelperHandler for ConsoleEpollHandler {
                 self.resizer.update_console_size();
             }
             SOCKET_EVENT => {
-                // A new client is connecting, so replace the current client with it.
-                if let (Some(console), Endpoint::Socket(listener)) =
-                    (self.socket_console.as_mut(), &self.endpoint)
-                {
+                if let Some(console) = self.socket_console.as_mut() {
+                    if let Endpoint::TcpListen(listener) = &self.endpoint {
+                        if console
+                            .accept_tcp(listener)
+                            .map_err(EpollHelperError::IoError)?
+                            && let Some(fd) = console.client_fd()
+                        {
+                            helper.del_event_custom(
+                                listener.as_raw_fd(),
+                                SOCKET_EVENT,
+                                epoll::Events::EPOLLIN,
+                            )?;
+                            helper.add_event_custom(fd, FILE_EVENT, epoll::Events::EPOLLIN)?;
+                        }
+                        return Ok(());
+                    }
                     if let Some(fd) = console.client_fd() {
                         helper.del_event_custom(fd, FILE_EVENT, epoll::Events::EPOLLIN)?;
                         console.shutdown().map_err(EpollHelperError::IoError)?;
                     }
-                    console
-                        .accept(listener)
-                        .map_err(EpollHelperError::IoError)?;
+                    if let Endpoint::Socket(listener) = &self.endpoint {
+                        console
+                            .accept(listener)
+                            .map_err(EpollHelperError::IoError)?;
+                    }
                     if let Some(fd) = console.client_fd() {
                         helper.add_event_custom(fd, FILE_EVENT, epoll::Events::EPOLLIN)?;
                     }
                 }
             }
             FILE_EVENT => {
-                if event.events & libc::EPOLLIN as u32 != 0 {
+                if event.events & libc::EPOLLIN as u32 != 0
+                    || matches!(self.endpoint, Endpoint::TcpListen(_))
+                        && event.events & (libc::EPOLLHUP | libc::EPOLLERR) as u32 != 0
+                {
                     let mut input = [0u8; 64];
                     let count = if let Some(console) = self.socket_console.as_mut() {
-                        console.read(&mut input).unwrap_or_else(|e| {
+                        let was_connected = console.client_fd().is_some();
+                        let count = console.read(&mut input).unwrap_or_else(|e| {
                             warn!("Failed to read console input: {e}");
                             0
-                        })
+                        });
+                        if was_connected
+                            && console.client_fd().is_none()
+                            && let Endpoint::TcpListen(listener) = &self.endpoint
+                        {
+                            helper.add_event(listener.as_raw_fd(), SOCKET_EVENT)?;
+                        }
+                        count
                     } else if let Some(mut in_file) = self.endpoint.in_file() {
                         in_file.read(&mut input).unwrap_or(0)
                     } else {
@@ -701,10 +737,8 @@ impl Console {
                     queue_sizes: QUEUE_SIZES.to_vec(),
                     avail_features,
                     acked_features,
-                    paused_sync: Some(Arc::new(Barrier::new(2))),
                     min_queues: NUM_QUEUES,
-                    paused: Arc::new(AtomicBool::new(paused)),
-                    ..Default::default()
+                    ..VirtioCommon::new(paused)?
                 },
                 id,
                 config: console_config,
@@ -795,9 +829,6 @@ impl VirtioDevice for Console {
             self.common.access_platform(),
         );
 
-        let paused = Arc::clone(&self.common.paused);
-        let paused_sync = self.common.paused_sync.clone();
-
         self.common.spawn_worker(
             &self.id,
             &self.seccomp_action,
@@ -805,7 +836,7 @@ impl VirtioDevice for Console {
             &self.exit_evt,
             Arc::clone(&device_status),
             Arc::clone(&interrupt_cb),
-            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            move |pause_common| handler.run(pause_common),
         )?;
 
         event!("virtio-device", "activated", "id", &self.id);

@@ -138,6 +138,8 @@ impl RequestHandler for StubApiRequestHandler {
                     max_vcpus: 1,
                     topology: None,
                     kvm_hyperv: false,
+                    #[cfg(target_arch = "x86_64")]
+                    kvm_hint_realtime: false,
                     max_phys_bits: 46,
                     affinity: None,
                     features: CpuFeatures::default(),
@@ -181,18 +183,10 @@ impl RequestHandler for StubApiRequestHandler {
                 generic_vhost_user: None,
                 pmem: None,
                 serial: SerialConfig {
-                    common: CommonConsoleConfig {
-                        file: None,
-                        mode: ConsoleOutputMode::Tty,
-                        socket: None,
-                    },
+                    output: ConsoleOutput::Tty,
                 },
                 console: ConsoleConfig {
-                    common: CommonConsoleConfig {
-                        file: None,
-                        mode: ConsoleOutputMode::Tty,
-                        socket: None,
-                    },
+                    output: ConsoleOutput::Tty,
                     pci_common: PciDeviceCommonConfig::default(),
                 },
                 #[cfg(target_arch = "x86_64")]
@@ -212,7 +206,6 @@ impl RequestHandler for StubApiRequestHandler {
                 pci_segments: None,
                 platform: None,
                 tpm: None,
-                preserved_fds: None,
                 landlock_enable: false,
                 landlock_rules: None,
                 #[cfg(feature = "ivshmem")]

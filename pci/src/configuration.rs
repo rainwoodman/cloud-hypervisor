@@ -7,7 +7,6 @@
 use std::sync::{Arc, Mutex};
 use std::{mem, result};
 
-use byteorder::{ByteOrder, LittleEndian};
 use log::{debug, info, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -635,10 +634,6 @@ pub enum Error {
     CapabilityEmpty,
     #[error("Capability of size {0} doesn't fit")]
     CapabilitySpaceFull(usize),
-    #[error("Failed to decode 32-bit BAR size")]
-    Decode32BarSize,
-    #[error("Failed to decode 64-bit BAR size")]
-    Decode64BarSize,
     #[error("Failed to encode 32-bit BAR size")]
     Encode32BarSize,
     #[error("Failed to encode 64-bit BAR size")]
@@ -774,7 +769,29 @@ impl PciConfiguration {
             }
             p.bar_idx.is_some()
         });
+
+        for param in mem::take(&mut self.pending_bar_reprogram) {
+            self.enqueue_bar_reprogramming(param);
+        }
+
         self
+    }
+
+    fn enqueue_bar_reprogramming(&mut self, param: BarReprogrammingParams) {
+        if let Some(idx) = self
+            .pending_bar_reprogram
+            .iter()
+            .position(|pending| pending.bar_idx == param.bar_idx)
+        {
+            // The mapping is still at the first old_base while decoding is
+            // disabled. Only the most recent destination needs to be applied.
+            self.pending_bar_reprogram[idx].new_base = param.new_base;
+            if self.pending_bar_reprogram[idx].old_base == param.new_base {
+                self.pending_bar_reprogram.remove(idx);
+            }
+        } else if param.old_base != param.new_base {
+            self.pending_bar_reprogram.push(param);
+        }
     }
 
     fn find_bar_idx_by_addr(&self, base_addr: u64, region_type: PciBarRegionType) -> Option<usize> {
@@ -930,7 +947,7 @@ impl PciConfiguration {
                     encode_64_bits_bar_size(config.size).ok_or(Error::Encode64BarSize)?;
 
                 self.registers[reg_idx + 1] = (config.addr >> 32) as u32;
-                self.writable_bits[reg_idx + 1] = 0xffff_ffff;
+                self.writable_bits[reg_idx + 1] = !((config.size - 1) >> 32) as u32;
                 self.bars[bar_idx + 1].addr = self.registers[reg_idx + 1];
                 self.bars[bar_idx].size = bar_size_lo;
                 self.bars[bar_idx + 1].size = bar_size_hi;
@@ -945,6 +962,7 @@ impl PciConfiguration {
             ),
             PciBarRegionType::IoRegion => (BAR_IO_ADDR_MASK, config.region_type as u32),
         };
+        let mask = mask & !(config.size - 1) as u32;
 
         self.registers[reg_idx] = ((config.addr as u32) & mask) | lower_bits;
         self.writable_bits[reg_idx] = mask;
@@ -982,7 +1000,7 @@ impl PciConfiguration {
         }
 
         self.registers[reg_idx] = (config.addr as u32) | active;
-        self.writable_bits[reg_idx] = ROM_BAR_ADDR_MASK;
+        self.writable_bits[reg_idx] = ROM_BAR_ADDR_MASK & !(config.size - 1) as u32;
         self.rom_bar_addr = self.registers[reg_idx];
         self.rom_bar_size =
             encode_32_bits_bar_size(config.size as u32).ok_or(Error::Encode32BarSize)?;
@@ -1000,7 +1018,7 @@ impl PciConfiguration {
         if let Some(bar_type) = self.bars[bar_num].r#type
             && bar_type == PciBarRegionType::Memory64BitRegion
         {
-            addr |= u64::from(self.bars[bar_num + 1].addr) << 32;
+            addr |= u64::from(self.bars[bar_num + 1].addr & self.writable_bits[bar_idx + 1]) << 32;
         }
 
         addr
@@ -1069,16 +1087,27 @@ impl PciConfiguration {
         if let Some(msix_cap_reg_idx) = self.msix_cap_reg_idx
             && let Some(msix_config) = &self.msix_config
         {
-            if msix_cap_reg_idx == reg_idx && offset == 2 && data.len() == 2 {
+            if msix_cap_reg_idx == reg_idx
+                && offset == 2
+                && let Ok(data) = <[u8; 2]>::try_from(data)
+            {
                 msix_config
                     .lock()
                     .unwrap()
-                    .set_msg_ctl(LittleEndian::read_u16(data));
-            } else if msix_cap_reg_idx == reg_idx && offset == 0 && data.len() == 4 {
+                    .set_msg_ctl(u16::from_le_bytes(data));
+            } else if msix_cap_reg_idx == reg_idx
+                && offset == 0
+                && let Ok(data) = <[u8; 4]>::try_from(data)
+            {
                 msix_config
                     .lock()
                     .unwrap()
-                    .set_msg_ctl((LittleEndian::read_u32(data) >> 16) as u16);
+                    .set_msg_ctl((u32::from_le_bytes(data) >> 16) as u16);
+            } else if msix_cap_reg_idx == reg_idx && offset == 3 && data.len() == 1 {
+                msix_config
+                    .lock()
+                    .unwrap()
+                    .set_msg_ctl(u16::from(data[0]) << 8);
             }
         }
 
@@ -1088,14 +1117,22 @@ impl PciConfiguration {
                 reg_idx * 4 + offset as usize,
                 u16::from(data[0]) | (u16::from(data[1]) << 8),
             ),
-            4 => self.write_reg(reg_idx, LittleEndian::read_u32(data)),
+            4 => self.write_reg(
+                reg_idx,
+                u32::from_le_bytes(data.try_into().expect("data should be 4 bytes")),
+            ),
             _ => (),
         }
 
         if let Some(param) = self.detect_bar_reprogramming(reg_idx, data) {
-            self.pending_bar_reprogram.push(param);
+            self.enqueue_bar_reprogramming(param);
         }
 
+        self.drain_pending_bar_reprogram()
+    }
+
+    // Return pending BAR reprogramming if MSE bit is set
+    pub(crate) fn drain_pending_bar_reprogram(&mut self) -> Vec<BarReprogrammingParams> {
         if !self.pending_bar_reprogram.is_empty() {
             // Return bar reprogramming only if the MSE bit is enabled;
             if self.read_config_register(COMMAND_REG) & COMMAND_REG_MEMORY_SPACE_MASK
@@ -1125,11 +1162,11 @@ impl PciConfiguration {
         reg_idx: usize,
         data: &[u8],
     ) -> Option<BarReprogrammingParams> {
-        if data.len() != 4 {
+        let Ok(data) = <[u8; 4]>::try_from(data) else {
             return None;
-        }
+        };
 
-        let value = LittleEndian::read_u32(data);
+        let value = u32::from_le_bytes(data);
 
         // Ignore the case where the BAR size is being asked for.
         if self.is_bar_size_probe(reg_idx, value) {
@@ -1254,14 +1291,6 @@ impl PciConfiguration {
             }
             None => value == BAR_SIZE_PROBE_ALL_ONES,
         }
-    }
-
-    pub(crate) fn pending_bar_reprogram(&self) -> Vec<BarReprogrammingParams> {
-        self.pending_bar_reprogram.clone()
-    }
-
-    pub(crate) fn clear_pending_bar_reprogram(&mut self) {
-        self.pending_bar_reprogram = Vec::new();
     }
 
     /// Restore BAR address after a failed move. This undoes the premature
@@ -1433,14 +1462,6 @@ mod tests {
         assert_eq!(registers.as_slice(), &[(0, 0x1234_5678), (15, 0xff)]);
     }
 
-    #[test]
-    fn test_register_map_restores_the_dense_form() {
-        // Snapshots of older versions carry every register.
-        #[expect(deprecated)]
-        let dense = PciConfigurationRegisterState::Linear(vec![1, 0, 3]);
-        assert_eq!(Into::<Vec<u32>>::into(dense), vec![1_u32, 0, 3]);
-    }
-
     #[repr(C, packed)]
     #[derive(Clone, Copy, Default)]
     struct TestCap {
@@ -1575,6 +1596,93 @@ mod tests {
         assert!(reprogram.is_empty());
         assert_eq!(cfg.read_reg(BAR0_REG), 0xfff8_0000);
         assert_eq!(cfg.get_bar_addr(0), bar_addr);
+    }
+
+    #[test]
+    fn bar_address_bits_below_the_size_are_read_only() {
+        let mut cfg = reloc_config(None);
+        let bar = PciBarConfiguration::new(
+            0,
+            0x10_0000,
+            PciBarRegionType::Memory32BitRegion,
+            PciBarPrefetchable::NotPrefetchable,
+        )
+        .set_address(0xc000_0000);
+        cfg.add_pci_bar(&bar).unwrap();
+        let bar = PciBarConfiguration::new(
+            2,
+            0x2_0000_0000,
+            PciBarRegionType::Memory64BitRegion,
+            PciBarPrefetchable::NotPrefetchable,
+        )
+        .set_address(0x8_0000_0000);
+        cfg.add_pci_bar(&bar).unwrap();
+        let rom = PciBarConfiguration::new(
+            ROM_BAR_IDX,
+            0x1_0000,
+            PciBarRegionType::Memory32BitRegion,
+            PciBarPrefetchable::NotPrefetchable,
+        )
+        .set_address(0xf000_0000);
+        cfg.add_pci_rom_bar(&rom, 1).unwrap();
+        cfg.write_reg(COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK);
+
+        // Low address bits are dropped, so the BAR stays where it is.
+        let reprogram = cfg.write_config_register(BAR0_REG, 0, &0xc008_0000u32.to_le_bytes());
+        assert!(reprogram.is_empty());
+        assert_eq!(cfg.read_reg(BAR0_REG), 0xc000_0000);
+
+        // A move lands on the aligned address.
+        let reprogram = cfg.write_config_register(BAR0_REG, 0, &0xd008_0000u32.to_le_bytes());
+        assert_eq!(reprogram.len(), 1);
+        assert_eq!(reprogram[0].new_base, 0xd000_0000);
+        assert_eq!(cfg.read_reg(BAR0_REG), 0xd000_0000);
+
+        // An 8 GiB BAR has no writable address bit in its low half and
+        // none below bit 33 in its high half.
+        let reprogram = cfg.write_config_register(BAR0_REG + 2, 0, &0x1000_0000u32.to_le_bytes());
+        assert!(reprogram.is_empty());
+        let reprogram = cfg.write_config_register(BAR0_REG + 3, 0, &0x9u32.to_le_bytes());
+        assert!(reprogram.is_empty());
+        assert_eq!(cfg.get_bar_addr(2), 0x8_0000_0000);
+        let reprogram = cfg.write_config_register(BAR0_REG + 3, 0, &0xbu32.to_le_bytes());
+        assert_eq!(reprogram.len(), 1);
+        assert_eq!(reprogram[0].new_base, 0xa_0000_0000);
+        assert_eq!(cfg.read_reg(BAR0_REG + 3), 0xa);
+        assert_eq!(cfg.get_bar_addr(2), 0xa_0000_0000);
+
+        let reprogram = cfg.write_config_register(ROM_BAR_REG, 0, &0xf000_8001u32.to_le_bytes());
+        assert!(reprogram.is_empty());
+        assert_eq!(cfg.read_reg(ROM_BAR_REG), 0xf000_0001);
+    }
+
+    #[test]
+    fn restored_bar_keeps_its_saved_writable_bits() {
+        let mut cfg = reloc_config(None);
+        let bar = PciBarConfiguration::new(
+            0,
+            0x10_0000,
+            PciBarRegionType::Memory32BitRegion,
+            PciBarPrefetchable::NotPrefetchable,
+        )
+        .set_address(0xc000_0000);
+        cfg.add_pci_bar(&bar).unwrap();
+        // The mask an older version saved, with the bits below the size writable.
+        cfg.writable_bits[BAR0_REG] = BAR_MEM_ADDR_MASK;
+
+        let mut cfg = reloc_config(Some(cfg.state()));
+        cfg.write_reg(COMMAND_REG, COMMAND_REG_MEMORY_SPACE_MASK);
+
+        assert_eq!(cfg.writable_bits[BAR0_REG], BAR_MEM_ADDR_MASK);
+        let reprogram = cfg.write_config_register(BAR0_REG, 0, &0xc000_0000u32.to_le_bytes());
+        assert!(reprogram.is_empty());
+        assert_eq!(cfg.read_reg(BAR0_REG), 0xc000_0000);
+
+        // The bits below the size stay writable, as in the older version.
+        let reprogram = cfg.write_config_register(BAR0_REG, 0, &0xc008_0000u32.to_le_bytes());
+        assert_eq!(reprogram.len(), 1);
+        assert_eq!(reprogram[0].new_base, 0xc008_0000);
+        assert_eq!(cfg.read_reg(BAR0_REG), 0xc008_0000);
     }
 
     #[test]
@@ -1880,16 +1988,64 @@ mod tests {
         add_reloc_bar(&mut cfg, 1, 0xd000_0000);
         cfg.write_reg(COMMAND_REG, 0);
 
-        cfg.write_config_register(BAR0_REG + 1, 0, &0xe000_0000u32.to_le_bytes());
         cfg.write_config_register(BAR0_REG + 1, 0, &0xf000_0000u32.to_le_bytes());
+        let mut state = cfg.state();
+        let mut first = state.pending_bar_reprogram[0];
+        first.bar_idx = None;
+        first.new_base = 0xe000_0000;
+        let mut second = first;
+        second.old_base = first.new_base;
+        second.new_base = 0xf000_0000;
+        state.pending_bar_reprogram = vec![first, second];
 
-        let pending = restore_legacy(&cfg);
+        let pending = reloc_config(Some(state)).pending_bar_reprogram;
 
-        assert_eq!(pending.len(), 2);
+        assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].bar_idx, Some(1));
-        assert_eq!(pending[0].new_base, 0xe000_0000);
-        assert_eq!(pending[1].bar_idx, Some(1));
-        assert_eq!(pending[1].new_base, 0xf000_0000);
+        assert_eq!(pending[0].old_base, 0xd000_0000);
+        assert_eq!(pending[0].new_base, 0xf000_0000);
+    }
+
+    #[test]
+    fn deferred_bar_moves_preserve_the_mapped_address() {
+        let mut cfg = reloc_config(None);
+        add_reloc_bar(&mut cfg, 0, 0xc000_0000);
+        add_reloc_bar(&mut cfg, 1, 0xd000_0000);
+        cfg.write_reg(COMMAND_REG, 0);
+
+        for i in 1..=128u32 {
+            for idx in 0..2 {
+                let address = 0xe000_0000 + (idx as u32 * 0x100 + i) * RELOC_BAR_SIZE as u32;
+                assert!(
+                    cfg.write_config_register(BAR0_REG + idx, 0, &address.to_le_bytes())
+                        .is_empty()
+                );
+            }
+            assert_eq!(cfg.pending_bar_reprogram.len(), 2);
+        }
+        let pending =
+            cfg.write_config_register(COMMAND_REG, 0, &COMMAND_REG_MEMORY_SPACE_MASK.to_le_bytes());
+        assert_eq!(pending.len(), 2);
+        for (idx, param) in pending.iter().enumerate() {
+            assert_eq!(param.bar_idx, Some(idx));
+            assert_eq!(param.old_base, 0xc000_0000 + idx as u64 * 0x1000_0000);
+            assert_eq!(param.new_base, cfg.get_bar_addr(idx));
+            cfg.restore_bar_addr(param);
+            assert_eq!(cfg.get_bar_addr(idx), param.old_base);
+        }
+    }
+
+    #[test]
+    fn deferred_bar_move_back_to_mapped_address_is_a_noop() {
+        let mut cfg = reloc_config(None);
+        add_reloc_bar(&mut cfg, 0, 0xc000_0000);
+        cfg.write_reg(COMMAND_REG, 0);
+        cfg.write_config_register(BAR0_REG, 0, &0xd000_0000u32.to_le_bytes());
+        cfg.write_config_register(BAR0_REG, 0, &0xc000_0000u32.to_le_bytes());
+        assert!(cfg.pending_bar_reprogram.is_empty());
+        assert!(cfg.write_config_register(
+            COMMAND_REG, 0, &COMMAND_REG_MEMORY_SPACE_MASK.to_le_bytes(),
+        ).is_empty());
     }
 
     #[test]

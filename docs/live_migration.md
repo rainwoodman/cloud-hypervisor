@@ -53,9 +53,10 @@ Start to send migration for the source VM (on the host machine):
 $ target/release/ch-remote --api-socket=/tmp/api1 send-migration destination_url=unix:/tmp/sock,memory_mode=memfds
 ```
 
-When the above commands completed, the source VM should be successfully
-migrated to the destination VM. Now the destination VM is running while
-the source VM is terminated gracefully.
+`send-migration` only starts the migration and returns immediately, so its exit
+status does not tell whether the migration succeeded. Use the [events](#events)
+to observe the result. Once the migration has finished, the destination VM is
+running while the source VM is terminated gracefully.
 
 ## TCP/TLS Migration
 
@@ -68,7 +69,9 @@ setup without storage. Same host TCP/TLS migration is also supported.
 > [!WARNING]
 > For development and testing, you can omit `tls_dir` on both sides to
 > use plain TCP. The migration is then unencrypted, with the receiver
-> accepting arbitrary connections.
+> accepting arbitrary connections. See the
+> [threat model](threat-model.md#live-migration-and-snapshots) for why
+> migration peers must be trusted.
 
 ### Preparation
 
@@ -145,12 +148,13 @@ src $ ch-remote --api-socket=/tmp/api send-migration destination_url=tcp:{dst}:{
 > Replace {dst}:{port} with the actual host name or IP address and port of
 > your destination host. For a same-host migration, use `localhost`.
 
-After completing the above commands, the source VM will be migrated to
-the destination host and continue running there. The source VM instance
-will terminate normally. All ongoing processes and connections within
-the VM should remain intact after the migration.
-See [Network Announcements After Resume](#network-announcements-after-resume)
-for the announcement behavior after a VM resumes.
+`send-migration` only starts the migration, see [Events](#events) for observing
+the result. After the migration has finished, the VM continues running on the
+destination host and the source VM instance terminates normally. All ongoing
+processes and connections within the VM should remain intact after the
+migration. See
+[Network Announcements After Resume](#network-announcements-after-resume) for
+the announcement behavior after a VM resumes.
 
 #### Encryption
 
@@ -298,13 +302,15 @@ following parameters. Unless marked otherwise, they apply to
 - `memory_mode <memfds|precopy|postcopy>`: \
   Memory transfer mode. `memfds` passes the guest memory backing file
   descriptors over a UNIX socket. It requires every guest memory region to use
-  shared memory or hugepage backing. `postcopy` resumes the destination first
-  and faults guest pages in on demand over a dedicated connection. Defaults to
-  `precopy`. `postcopy` is not supported with:
+  shared memory or hugepage backing. `postcopy` (experimental) resumes the
+  destination first and faults guest pages in on demand over a dedicated
+  connection. It requires every vhost-user backend to support the `PAGEFAULT`
+  protocol feature. Defaults to `precopy`. `postcopy` is not supported with:
   - VFIO devices
   - vDPA devices
   - vfio-user devices
-  - vhost-user devices
+  - memory prefault (`prefault=on`)
+  - multiple connections (`connections` greater than `1`)
 - `preserve_source <on|off>`: \
   Keep the source VM in a paused state after migration completes. This is only
   supported with `memory_mode=memfds` and defaults to `off`.
@@ -312,13 +318,40 @@ following parameters. Unless marked otherwise, they apply to
   A list of updates to apply to memory zones on the receiver side. For example,
   this can be used to remap memory zones to another NUMA node. Each zone update
   has the form `zone_id@host_numa_node`.
-- `vfio_fds <list of id@fd>` and `iommufd_fd <fd>` (`receive-migration`): \
-  File descriptors opened on the destination for migratable VFIO devices, see
-  [Destination File Descriptors](vfio.md#destination-file-descriptors).
+- `external_fds <list of target@[fd,...]>` (`receive-migration`): \
+  Replacement file descriptors opened on the destination. Use `net(<id>)`
+  for network FDs, `vfio(<id>)` for VFIO cdev FDs, and `iommu` for the
+  iommufd FD. For migratable VFIO devices, see [Destination File Descriptors](vfio.md#destination-file-descriptors).
 - `background_fetch_pages <on|off>` (`receive-migration`): \
   For postcopy migration and on-demand restore, keep fetching the remaining
   guest pages in the background after the VM resumed. With `off`, only the
   pages that the guest or the VMM access are fetched. Defaults to `on`.
+- `serial_file <path>`, `serial_socket <path>`, or `serial_tcp <ip>:<port>`
+  (`receive-migration`): \
+  New output of the serial port on the destination, for example if the output
+  of the source is not available there. It must use the same mode as the output
+  of the source VM.
+- `console_file <path>`, `console_socket <path>`, or `console_tcp <ip>:<port>`
+  (`receive-migration`): \
+  The same for the `virtio-console` device.
+
+## Connection Timeouts
+
+Cloud Hypervisor detects unresponsive migration peers with fixed timeouts,
+independent of `timeout_s`, the timeout of the migration itself:
+
+- Connection setup on the destination (10 seconds): \
+  Setting up an incoming connection, including the TLS handshake, must not
+  stall. A failing additional connection (see `connections`) is dropped, a
+  failing main connection fails the migration.
+- Sender reads and writes (120 seconds): \
+  A hung destination fails the migration and the source VM resumes. This
+  also applies to the TLS handshake and to prefaulting the guest memory on
+  the destination. The final handover of the VM and the postcopy fault
+  connection are exempt.
+- Dead peers (120 seconds): \
+  TCP keepalive and `TCP_USER_TIMEOUT` detect a peer whose host or network is
+  gone, or that stops reading.
 
 ## Network Announcements After Resume
 
@@ -337,8 +370,7 @@ only uses the guest announcement path.
 VMs with migratable VFIO devices, for example NIC VFs bound to
 `mlx5_vfio_pci`, can be live migrated. The opaque device state is captured
 during the downtime window and the destination receives new device file
-descriptors through the `vfio_fds` and `iommufd_fd` options of
-`receive-migration`.
+descriptors through the `external_fds` option of `receive-migration`.
 
 See [Live Migration of VFIO Devices](vfio.md#live-migration-of-vfio-devices)
 for the requirements, the dirty tracking behavior, and an example.
@@ -363,7 +395,8 @@ Starting with `v54`, Cloud Hypervisor guarantees migration compatibility from
 the previous two versions ("n-2"), e.g. `v54` accepts migrations from `v52` and
 `v53`. Upgrades spanning more major versions might work. It is, however,
 strongly recommended to do incremental upgrades, e.g., `v54 -> v56 -> v58`.
-Backward migrations, such as `v54 -> v52`, are **not** supported.
+Backward migrations, such as `v54 -> v52`, are **not** supported. Experimental
+features, such as `memory_mode=postcopy`, are excluded from this guarantee.
 
 New VMM functionality is designed in a way that it does not cause any
 incompatibility for VMs coming from older versions of Cloud Hypervisor. If new
@@ -371,6 +404,11 @@ features are added to existing device models or the VMM, the corresponding
 device-specific config falls back to safe false/disabled values. Hence, only
 newly spawned VMs will be able to use new functionality, while being able to run
 VMs first spawned in older versions of Cloud Hypervisor.
+
+**Beware** that reliable usage in a **heterogeneous fleet** need the use of a
+matching **CPU profile**, which are available since `v55`. The progress is
+tracked in
+[#7086](https://github.com/cloud-hypervisor/cloud-hypervisor/issues/7068).
 
 ## Events
 

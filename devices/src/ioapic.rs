@@ -9,10 +9,9 @@
 // Implementation of an intel 82093AA Input/Output Advanced Programmable Interrupt Controller
 // See https://pdos.csail.mit.edu/6.828/2016/readings/ia32/ioapic.pdf for a specification.
 
-use std::result;
 use std::sync::{Arc, Barrier};
+use std::{io, result};
 
-use byteorder::{ByteOrder, LittleEndian};
 use log::{debug, error, trace};
 use serde::{Deserialize, Serialize};
 use vm_device::BusDevice;
@@ -163,18 +162,18 @@ impl BusDevice for Ioapic {
             }
         };
 
-        LittleEndian::write_u32(data, value);
+        data.copy_from_slice(&value.to_le_bytes());
     }
 
     fn write(&mut self, _base: u64, offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
-        if data.len() != size_of::<u32>() {
+        let Ok(data) = <[u8; size_of::<u32>()]>::try_from(data) else {
             debug!("Invalid write size on IOAPIC: {}", data.len());
             return None;
-        }
+        };
 
         debug!("IOAPIC_W @ offset 0x{offset:x}");
 
-        let value = LittleEndian::read_u32(data);
+        let value = u32::from_le_bytes(data);
 
         match offset as u8 {
             IOREGSEL_OFF => self.reg_sel = value,
@@ -431,7 +430,7 @@ impl InterruptController for Ioapic {
         Ok(())
     }
 
-    fn notifier(&self, irq: usize) -> Option<EventFd> {
+    fn notifier(&self, irq: usize) -> io::Result<Option<EventFd>> {
         self.interrupt_source_group.notifier(irq as InterruptIndex)
     }
 }

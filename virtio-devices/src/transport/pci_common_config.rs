@@ -10,11 +10,11 @@ use std::result;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU16, Ordering};
 use std::sync::{Arc, Mutex};
 
-use byteorder::{ByteOrder, LittleEndian};
 use log::{debug, error};
 use serde::{Deserialize, Serialize};
 use virtio_queue::{Queue, QueueT};
 use vm_migration::{MigratableError, Pausable, Snapshot, Snapshottable};
+use vm_virtio::AccessType;
 
 use super::pci_device::VIRTQ_MSI_NO_VECTOR;
 use crate::{DEVICE_FEATURES_OK, VirtioDevice};
@@ -25,8 +25,12 @@ pub const VIRTIO_PCI_COMMON_CONFIG_ID: &str = "virtio_pci_common_config";
 pub struct VirtioPciCommonConfigState {
     pub driver_status: u8,
     pub config_generation: u8,
+    #[serde(default)]
+    pub config_changed: bool,
     pub device_feature_select: u32,
     pub driver_feature_select: u32,
+    #[serde(default)]
+    pub driver_features: u64,
     pub queue_select: u16,
     pub msix_config: u16,
     pub msix_queues: Vec<u16>,
@@ -134,6 +138,9 @@ pub struct VirtioPciCommonConfig {
     pub config_changed: Arc<AtomicBool>,
     pub device_feature_select: u32,
     pub driver_feature_select: u32,
+    /// Last written driver features. A write replaces only the selected
+    /// 32-bit half.
+    pub driver_features: u64,
     pub queue_select: u16,
     pub msix_config: Arc<AtomicU16>,
     pub msix_queues: Arc<Mutex<Vec<u16>>>,
@@ -145,9 +152,10 @@ impl VirtioPciCommonConfig {
             device,
             driver_status: Arc::new(AtomicU8::new(state.driver_status)),
             config_generation: Arc::new(AtomicU8::new(state.config_generation)),
-            config_changed: Arc::new(AtomicBool::new(false)),
+            config_changed: Arc::new(AtomicBool::new(state.config_changed)),
             device_feature_select: state.device_feature_select,
             driver_feature_select: state.driver_feature_select,
+            driver_features: state.driver_features,
             queue_select: state.queue_select,
             msix_config: Arc::new(AtomicU16::new(state.msix_config)),
             msix_queues: Arc::new(Mutex::new(state.msix_queues)),
@@ -168,8 +176,10 @@ impl VirtioPciCommonConfig {
         VirtioPciCommonConfigState {
             driver_status: self.driver_status.load(Ordering::Acquire),
             config_generation: self.config_generation.load(Ordering::Acquire),
+            config_changed: self.config_changed.load(Ordering::Acquire),
             device_feature_select: self.device_feature_select,
             driver_feature_select: self.driver_feature_select,
+            driver_features: self.driver_features,
             queue_select: self.queue_select,
             msix_config: self.msix_config.load(Ordering::Acquire),
             msix_queues: self.msix_queues.lock().unwrap().clone(),
@@ -184,6 +194,7 @@ impl VirtioPciCommonConfig {
         self.config_changed.store(false, Ordering::Release);
         self.device_feature_select = 0;
         self.driver_feature_select = 0;
+        self.driver_features = 0;
         self.queue_select = 0;
         self.msix_config
             .store(VIRTQ_MSI_NO_VECTOR, Ordering::Release);
@@ -200,15 +211,15 @@ impl VirtioPciCommonConfig {
             }
             2 => {
                 let v = self.read_common_config_word(offset, queues);
-                LittleEndian::write_u16(data, v);
+                data.copy_from_slice(&v.to_le_bytes());
             }
             4 => {
                 let v = self.read_common_config_dword(offset);
-                LittleEndian::write_u32(data, v);
+                data.copy_from_slice(&v.to_le_bytes());
             }
             8 => {
                 let v = self.read_common_config_qword(offset);
-                LittleEndian::write_u64(data, v);
+                data.copy_from_slice(&v.to_le_bytes());
             }
             _ => debug!("invalid data length for virtio read: len {}", data.len()),
         }
@@ -219,11 +230,23 @@ impl VirtioPciCommonConfig {
 
         match data.len() {
             1 => self.write_common_config_byte(offset, data[0]),
-            2 => self.write_common_config_word(offset, LittleEndian::read_u16(data), queues),
+            2 => self.write_common_config_word(
+                offset,
+                u16::from_le_bytes(data.try_into().expect("data should be 2 bytes")),
+                queues,
+            ),
             4 => {
-                self.write_common_config_dword(offset, LittleEndian::read_u32(data), queues);
+                self.write_common_config_dword(
+                    offset,
+                    u32::from_le_bytes(data.try_into().expect("data should be 4 bytes")),
+                    queues,
+                );
             }
-            8 => self.write_common_config_qword(offset, LittleEndian::read_u64(data), queues),
+            8 => self.write_common_config_qword(
+                offset,
+                u64::from_le_bytes(data.try_into().expect("data should be 8 bytes")),
+                queues,
+            ),
             _ => debug!("invalid data length for virtio write: len {}", data.len()),
         }
     }
@@ -305,27 +328,33 @@ impl VirtioPciCommonConfig {
                     None
                 };
                 if let Some(access_platform) = access_platform {
-                    let desc_table = match access_platform
-                        .translate_gva(q.desc_table(), get_vring_size(VringType::Desc, q.size()))
-                    {
+                    let desc_table = match access_platform.translate_gva(
+                        q.desc_table(),
+                        get_vring_size(VringType::Desc, q.size()),
+                        AccessType::Read,
+                    ) {
                         Ok(addr) => addr,
                         Err(e) => {
                             error!("Failed to translate desc_table GVA: {e}");
                             return;
                         }
                     };
-                    let avail_ring = match access_platform
-                        .translate_gva(q.avail_ring(), get_vring_size(VringType::Avail, q.size()))
-                    {
+                    let avail_ring = match access_platform.translate_gva(
+                        q.avail_ring(),
+                        get_vring_size(VringType::Avail, q.size()),
+                        AccessType::Read,
+                    ) {
                         Ok(addr) => addr,
                         Err(e) => {
                             error!("Failed to translate avail_ring GVA: {e}");
                             return;
                         }
                     };
-                    let used_ring = match access_platform
-                        .translate_gva(q.used_ring(), get_vring_size(VringType::Used, q.size()))
-                    {
+                    let used_ring = match access_platform.translate_gva(
+                        q.used_ring(),
+                        get_vring_size(VringType::Used, q.size()),
+                        AccessType::Write,
+                    ) {
                         Ok(addr) => addr,
                         Err(e) => {
                             error!("Failed to translate used_ring GVA: {e}");
@@ -380,10 +409,29 @@ impl VirtioPciCommonConfig {
             0x00 => self.device_feature_select = value,
             0x08 => self.driver_feature_select = value,
             0x0c => {
+                // Virtio 1.4, 3.1.1: features are fixed once FEATURES_OK is
+                // set. Enabled queues were set up for the features accepted
+                // at that point and stay enabled until reset, even if the
+                // driver clears FEATURES_OK again.
+                if self.driver_status.load(Ordering::Acquire) & DEVICE_FEATURES_OK as u8 != 0
+                    || queues.iter().any(|q| q.ready())
+                {
+                    debug!("Cannot change driver features after feature negotiation");
+                    return;
+                }
                 if self.driver_feature_select < 2 {
-                    let mut locked_device = self.device.lock().unwrap();
-                    locked_device
-                        .ack_features(u64::from(value) << (self.driver_feature_select * 32));
+                    let shift = self.driver_feature_select * 32;
+                    let remaining_half = self.driver_features & !(0xffff_ffff << shift);
+                    self.driver_features = remaining_half | (u64::from(value) << shift);
+                    self.device
+                        .lock()
+                        .unwrap()
+                        .ack_features(self.driver_features);
+                } else if value != 0 {
+                    debug!(
+                        "Ignoring driver features above bit 63: select {}, value 0x{value:x}",
+                        self.driver_feature_select
+                    );
                 }
             }
             0x20 => self.with_queue_mut(queues, |q| q.set_desc_table_address(Some(value), None)),
@@ -454,7 +502,7 @@ impl Snapshottable for VirtioPciCommonConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ActivateResult, ActivationContext};
+    use crate::{ActivateResult, ActivationContext, DEVICE_ACKNOWLEDGE, DEVICE_DRIVER};
 
     struct DummyDevice(u32);
     const QUEUE_SIZE: u16 = 256;
@@ -492,6 +540,7 @@ mod tests {
             config_changed: Arc::new(AtomicBool::new(false)),
             device_feature_select: 0x0,
             driver_feature_select: 0x0,
+            driver_features: 0,
             queue_select: 0xff,
             msix_config: Arc::new(AtomicU16::new(0)),
             msix_queues: Arc::new(Mutex::new(vec![0; 3])),
@@ -513,19 +562,19 @@ mod tests {
 
         // Device features is read-only and passed through from the device.
         regs.write(0x04, &[0, 0, 0, 0], &mut queues);
-        let mut read_back = vec![0, 0, 0, 0];
+        let mut read_back = [0; 4];
         regs.read(0x04, &mut read_back, &queues);
-        assert_eq!(LittleEndian::read_u32(&read_back), DUMMY_FEATURES as u32);
+        assert_eq!(u32::from_le_bytes(read_back), DUMMY_FEATURES as u32);
 
         // Feature select registers are read/write.
         regs.write(0x00, &[1, 2, 3, 4], &mut queues);
-        let mut read_back = vec![0, 0, 0, 0];
+        let mut read_back = [0; 4];
         regs.read(0x00, &mut read_back, &queues);
-        assert_eq!(LittleEndian::read_u32(&read_back), 0x0403_0201);
+        assert_eq!(u32::from_le_bytes(read_back), 0x0403_0201);
         regs.write(0x08, &[1, 2, 3, 4], &mut queues);
-        let mut read_back = vec![0, 0, 0, 0];
+        let mut read_back = [0; 4];
         regs.read(0x08, &mut read_back, &queues);
-        assert_eq!(LittleEndian::read_u32(&read_back), 0x0403_0201);
+        assert_eq!(u32::from_le_bytes(read_back), 0x0403_0201);
 
         // 'queue_select' can be read and written.
         regs.write(0x16, &[0xaa, 0x55], &mut queues);
@@ -545,6 +594,7 @@ mod tests {
             config_changed: Arc::new(AtomicBool::new(false)),
             device_feature_select: 0,
             driver_feature_select: 0,
+            driver_features: 0,
             queue_select: 0,
             msix_config: Arc::new(AtomicU16::new(0)),
             msix_queues: Arc::new(Mutex::new(vec![0; 1])),
@@ -556,9 +606,9 @@ mod tests {
         regs.write(0x16, &[0xFF, 0xFF], &mut queues);
 
         // Read queue_msix_vector — must not panic, should return VIRTQ_MSI_NO_VECTOR.
-        let mut read_back = vec![0x00, 0x00];
+        let mut read_back = [0x00, 0x00];
         regs.read(0x1a, &mut read_back, &queues);
-        assert_eq!(LittleEndian::read_u16(&read_back), VIRTQ_MSI_NO_VECTOR);
+        assert_eq!(u16::from_le_bytes(read_back), VIRTQ_MSI_NO_VECTOR);
 
         // Write queue_msix_vector — must not panic.
         regs.write(0x1a, &[0xAB, 0xCD], &mut queues);
@@ -574,6 +624,7 @@ mod tests {
             config_changed: Arc::new(AtomicBool::new(true)),
             device_feature_select: 1,
             driver_feature_select: 1,
+            driver_features: 0,
             queue_select: 7,
             msix_config: Arc::new(AtomicU16::new(3)),
             msix_queues: Arc::new(Mutex::new(vec![1, 2, 3])),
@@ -609,10 +660,24 @@ mod tests {
             config_changed: Arc::new(AtomicBool::new(false)),
             device_feature_select: 0,
             driver_feature_select: 0,
+            driver_features: 0,
             queue_select: 0,
             msix_config: Arc::new(AtomicU16::new(0)),
             msix_queues: Arc::new(Mutex::new(vec![0; 1])),
         }
+    }
+
+    #[test]
+    fn restore_preserves_pending_config_change() {
+        let mut regs = make_regs(0x10);
+        regs.config_changed.store(true, Ordering::Release);
+        let state = regs.snapshot().unwrap().to_state().unwrap();
+        let restored = VirtioPciCommonConfig::new(state, Arc::clone(&regs.device));
+
+        restored.consume_config_change();
+        assert_eq!(restored.config_generation.load(Ordering::Acquire), 0x11);
+        restored.consume_config_change();
+        assert_eq!(restored.config_generation.load(Ordering::Acquire), 0x11);
     }
 
     #[test]
@@ -701,5 +766,66 @@ mod tests {
             ],
             addresses
         );
+    }
+
+    struct FeatureDevice(u64);
+
+    impl VirtioDevice for FeatureDevice {
+        fn device_type(&self) -> u32 {
+            0
+        }
+        fn queue_max_sizes(&self) -> &[u16] {
+            QUEUE_SIZES
+        }
+        fn activate(&mut self, _context: ActivationContext) -> ActivateResult {
+            Ok(())
+        }
+        fn ack_features(&mut self, value: u64) {
+            self.0 = value;
+        }
+    }
+
+    #[test]
+    fn driver_feature_writes_replace_earlier_values() {
+        let device = Arc::new(Mutex::new(FeatureDevice(0)));
+        let mut regs = make_regs(0);
+        regs.device = Arc::clone(&device) as Arc<Mutex<dyn VirtioDevice>>;
+        let mut queues = vec![Queue::new(QUEUE_SIZE).unwrap()];
+
+        // A driver may write its features again with fewer bits before
+        // FEATURES_OK, as FreeBSD's vtnet does with hw.vtnet.lro_disable=0.
+        // Only the last write counts.
+        regs.write(0x0c, &0b11u32.to_le_bytes(), &mut queues);
+        regs.write(0x08, &1u32.to_le_bytes(), &mut queues);
+        regs.write(0x0c, &1u32.to_le_bytes(), &mut queues);
+        regs.write(0x08, &0u32.to_le_bytes(), &mut queues);
+        regs.write(0x0c, &0b10u32.to_le_bytes(), &mut queues);
+        assert_eq!(device.lock().unwrap().0, (1 << 32) | 0b10);
+
+        // After a reset, the next negotiation starts from no features, as
+        // OpenBSD's vio needs when it negotiates again without TSO.
+        regs.reset();
+        regs.write(0x0c, &0b100u32.to_le_bytes(), &mut queues);
+        assert_eq!(device.lock().unwrap().0, 0b100);
+    }
+
+    #[test]
+    fn driver_features_are_fixed_after_negotiation() {
+        let device = Arc::new(Mutex::new(FeatureDevice(0)));
+        let mut regs = make_regs(0);
+        regs.device = Arc::clone(&device) as Arc<Mutex<dyn VirtioDevice>>;
+        let mut queues = vec![Queue::new(QUEUE_SIZE).unwrap()];
+        let status = (DEVICE_ACKNOWLEDGE | DEVICE_DRIVER) as u8;
+
+        regs.write(0x14, &[status], &mut queues);
+        regs.write(0x0c, &1u32.to_le_bytes(), &mut queues);
+        regs.write(0x14, &[status | DEVICE_FEATURES_OK as u8], &mut queues);
+        regs.write(0x0c, &2u32.to_le_bytes(), &mut queues);
+        assert_eq!(device.lock().unwrap().0, 1);
+
+        regs.write(0x1c, &1u16.to_le_bytes(), &mut queues);
+        regs.write(0x14, &[status], &mut queues);
+        regs.write(0x0c, &2u32.to_le_bytes(), &mut queues);
+        assert_eq!(device.lock().unwrap().0, 1);
     }
 }

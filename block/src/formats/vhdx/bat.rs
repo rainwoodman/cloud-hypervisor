@@ -5,8 +5,6 @@
 use std::os::unix::fs::FileExt;
 use std::{io, result};
 
-use byteorder::{ByteOrder, LittleEndian};
-use remain::sorted;
 use thiserror::Error;
 
 use super::header::RegionTableEntry;
@@ -26,13 +24,14 @@ pub(super) const BAT_STATE_BIT_MASK: u64 = 0x07;
 // Mask for the offset within the file in units of 1 MB
 pub(super) const BAT_FILE_OFF_MASK: u64 = 0xFFFFFFFFFFF00000;
 
-#[sorted]
 #[derive(Error, Debug)]
 pub enum VhdxBatError {
     #[error("Invalid BAT entry")]
     InvalidBatEntry,
     #[error("Invalid BAT entry count")]
     InvalidEntryCount,
+    #[error("BAT entry payload block extends past end of file")]
+    PayloadPastEnd,
     #[error("Failed to read BAT entry")]
     ReadBat(#[source] io::Error),
     #[error("Failed to write BAT entry")]
@@ -66,7 +65,14 @@ impl BatEntry {
             let mut entry = [0u8; size_of::<u64>()];
             f.read_exact_at(&mut entry, offset + i * size_of::<u64>() as u64)
                 .map_err(VhdxBatError::ReadBat)?;
-            bat.insert(i as usize, BatEntry(LittleEndian::read_u64(&entry)));
+            let raw_entry = u64::from_le_bytes(entry);
+            if raw_entry & BAT_STATE_BIT_MASK == PAYLOAD_BLOCK_FULLY_PRESENT
+                && (raw_entry & BAT_FILE_OFF_MASK).saturating_add(disk_spec.block_size as u64)
+                    > disk_spec.image_size
+            {
+                return Err(VhdxBatError::PayloadPastEnd);
+            }
+            bat.insert(i as usize, BatEntry(raw_entry));
         }
 
         Ok(bat)
@@ -92,8 +98,7 @@ impl BatEntry {
                 }
             };
 
-            let mut buf = [0u8; size_of::<u64>()];
-            LittleEndian::write_u64(&mut buf, bat_entry);
+            let buf = bat_entry.to_le_bytes();
             f.write_all_at(&buf, bat_offset + i * size_of::<u64>() as u64)
                 .map_err(VhdxBatError::WriteBat)?;
         }

@@ -13,12 +13,15 @@ use rate_limiter::{RateLimiter, TokenType};
 use smallvec::SmallVec;
 use thiserror::Error;
 use virtio_bindings::virtio_net::{
-    VIRTIO_NET_HDR_F_NEEDS_CSUM, VIRTIO_NET_HDR_GSO_NONE, virtio_net_hdr_v1,
+    VIRTIO_NET_F_CSUM, VIRTIO_NET_F_HOST_ECN, VIRTIO_NET_F_HOST_TSO4, VIRTIO_NET_F_HOST_TSO6,
+    VIRTIO_NET_F_HOST_UFO, VIRTIO_NET_F_HOST_USO, VIRTIO_NET_HDR_F_NEEDS_CSUM,
+    VIRTIO_NET_HDR_GSO_ECN, VIRTIO_NET_HDR_GSO_NONE, VIRTIO_NET_HDR_GSO_TCPV4,
+    VIRTIO_NET_HDR_GSO_TCPV6, VIRTIO_NET_HDR_GSO_UDP, VIRTIO_NET_HDR_GSO_UDP_L4, virtio_net_hdr_v1,
 };
 use virtio_queue::{Queue, QueueOwnedT, QueueT};
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryBackend};
-use vm_virtio::{AccessPlatform, Translatable};
+use vm_virtio::{AccessPlatform, AccessType, Translatable};
 
 use super::{Tap, register_listener, unregister_listener, vnet_hdr_len};
 
@@ -36,9 +39,9 @@ type Iovecs = SmallVec<[libc::iovec; CHAIN_INLINE_DESCS]>;
 
 /// Resolves guest ranges to host iovecs for readv()/writev(). The pointers
 /// stay valid as long as `mem` is mapped.
-fn guest_ranges_to_iovecs<B: Bitmap + 'static>(
+fn guest_ranges_to_iovecs<M: GuestMemoryBackend>(
     guest_ranges: &[(GuestAddress, usize)],
-    mem: &vm_memory::GuestMemoryMmap<B>,
+    mem: &M,
 ) -> Result<Iovecs, NetQueuePairError> {
     guest_ranges
         .iter()
@@ -61,38 +64,56 @@ fn guest_ranges_to_iovecs<B: Bitmap + 'static>(
 pub struct TxVirtio {
     pub counter_bytes: Wrapping<u64>,
     pub counter_frames: Wrapping<u64>,
-    host_checksum_offload: bool,
+    acked_features: u64,
 }
 
 impl TxVirtio {
-    /// Create a TX queue with the negotiated VIRTIO_NET_F_CSUM policy.
-    pub fn new(host_checksum_offload: bool) -> Self {
+    /// Create a TX queue that only accepts the offloads in `acked_features`.
+    pub fn new(acked_features: u64) -> Self {
         TxVirtio {
             counter_bytes: Wrapping(0),
             counter_frames: Wrapping(0),
-            host_checksum_offload,
+            acked_features,
         }
     }
 
-    pub fn set_host_checksum_offload(&mut self, host_checksum_offload: bool) {
-        self.host_checksum_offload = host_checksum_offload;
+    pub fn set_acked_features(&mut self, acked_features: u64) {
+        self.acked_features = acked_features;
     }
 
     fn tx_is_header_valid(
         header: &[u8; size_of::<virtio_net_hdr_v1>()],
         header_len: usize,
-        host_checksum_offload: bool,
+        acked_features: u64,
     ) -> bool {
+        let acked = |feature: u32| acked_features & (1 << feature) != 0;
+        let flags = u32::from(header[0]);
+        let gso_type = u32::from(header[1]);
+
+        // The tap does not know which offloads were negotiated and accepts
+        // any segmentation type, so only allow the negotiated ones.
+        let gso_acked = match gso_type & !VIRTIO_NET_HDR_GSO_ECN {
+            VIRTIO_NET_HDR_GSO_NONE => true,
+            VIRTIO_NET_HDR_GSO_TCPV4 => acked(VIRTIO_NET_F_HOST_TSO4),
+            VIRTIO_NET_HDR_GSO_TCPV6 => acked(VIRTIO_NET_F_HOST_TSO6),
+            VIRTIO_NET_HDR_GSO_UDP => acked(VIRTIO_NET_F_HOST_UFO),
+            VIRTIO_NET_HDR_GSO_UDP_L4 => acked(VIRTIO_NET_F_HOST_USO),
+            _ => false,
+        };
+        let ecn_acked = gso_type & VIRTIO_NET_HDR_GSO_ECN == 0 || acked(VIRTIO_NET_F_HOST_ECN);
+
         // Segmentation offloads also require checksum offload support.
         header_len == header.len()
-            && (host_checksum_offload
-                || (u32::from(header[0]) & VIRTIO_NET_HDR_F_NEEDS_CSUM == 0
-                    && u32::from(header[1]) == VIRTIO_NET_HDR_GSO_NONE))
+            && gso_acked
+            && ecn_acked
+            && (acked(VIRTIO_NET_F_CSUM)
+                || (flags & VIRTIO_NET_HDR_F_NEEDS_CSUM == 0
+                    && gso_type == VIRTIO_NET_HDR_GSO_NONE))
     }
 
-    pub fn process_desc_chain<B: Bitmap + 'static>(
+    pub fn process_desc_chain<M: GuestMemoryBackend>(
         &mut self,
-        mem: &vm_memory::GuestMemoryMmap<B>,
+        mem: &M,
         tap: &Tap,
         queue: &mut Queue,
         rate_limiter: &mut Option<RateLimiter>,
@@ -126,7 +147,7 @@ impl TxVirtio {
                 while let Some(desc) = next_desc {
                     let desc_addr = desc
                         .addr()
-                        .translate_gva(access_platform, desc.len() as usize)
+                        .translate_gva(access_platform, desc.len() as usize, AccessType::Read)
                         .map_err(|e| {
                             NetQueuePairError::GuestMemory(vm_memory::GuestMemoryError::IOError(e))
                         })?;
@@ -174,7 +195,7 @@ impl TxVirtio {
                 }
             };
 
-            if Self::tx_is_header_valid(&header, header_len, self.host_checksum_offload) {
+            if Self::tx_is_header_valid(&header, header_len, self.acked_features) {
                 iovecs.insert(
                     0,
                     libc::iovec {
@@ -211,16 +232,9 @@ impl TxVirtio {
                         break;
                     }
 
-                    if e.raw_os_error() == Some(libc::EINVAL) {
-                        error!("net: tx: dropping malformed packet: {e}");
-                        0
-                    } else if e.raw_os_error() == Some(libc::EIO) {
-                        error!("net: tx: dropping frame, tap I/O error: {e}");
-                        0
-                    } else {
-                        error!("net: tx: failed writing to tap: {e}");
-                        return Err(NetQueuePairError::WriteTap(e));
-                    }
+                    // Like QEMU, drop the frame on any other error
+                    error!("net: tx: dropping frame, failed writing to tap: {e}");
+                    0
                 } else if (result as usize) < vnet_hdr_len() {
                     error!("net: tx: short tap write ({result} < {})", vnet_hdr_len());
                     0
@@ -279,9 +293,9 @@ impl RxVirtio {
         }
     }
 
-    pub fn process_desc_chain<B: Bitmap + 'static>(
+    pub fn process_desc_chain<M: GuestMemoryBackend>(
         &mut self,
-        mem: &vm_memory::GuestMemoryMmap<B>,
+        mem: &M,
         tap: &Tap,
         queue: &mut Queue,
         rate_limiter: &mut Option<RateLimiter>,
@@ -325,7 +339,7 @@ impl RxVirtio {
                     .memory()
                     .checked_offset(
                         desc.addr()
-                            .translate_gva(access_platform, vnet_hdr_len())
+                            .translate_gva(access_platform, vnet_hdr_len(), AccessType::Write)
                             .map_err(|e| {
                                 NetQueuePairError::GuestMemory(
                                     vm_memory::GuestMemoryError::IOError(e),
@@ -339,7 +353,7 @@ impl RxVirtio {
                 while let Some(desc) = next_desc {
                     let desc_addr = desc
                         .addr()
-                        .translate_gva(access_platform, desc.len() as usize)
+                        .translate_gva(access_platform, desc.len() as usize, AccessType::Write)
                         .map_err(|e| {
                             NetQueuePairError::GuestMemory(vm_memory::GuestMemoryError::IOError(e))
                         })?;
@@ -488,8 +502,6 @@ pub enum NetQueuePairError {
     RegisterListener(#[source] io::Error),
     #[error("Error unregistering listener")]
     UnregisterListener(#[source] io::Error),
-    #[error("Error writing to the TAP device")]
-    WriteTap(#[source] io::Error),
     #[error("Error reading from the TAP device")]
     ReadTap(#[source] io::Error),
     #[error("Error related to guest memory")]
@@ -532,9 +544,9 @@ pub struct NetQueuePair {
 }
 
 impl NetQueuePair {
-    pub fn process_tx<B: Bitmap + 'static>(
+    pub fn process_tx<M: GuestMemoryBackend>(
         &mut self,
-        mem: &vm_memory::GuestMemoryMmap<B>,
+        mem: &M,
         queue: &mut Queue,
     ) -> Result<bool, NetQueuePairError> {
         let tx_tap_retry = self.tx.process_desc_chain(
@@ -582,9 +594,9 @@ impl NetQueuePair {
             .map_err(NetQueuePairError::QueueNeedsNotification)
     }
 
-    pub fn process_rx<B: Bitmap + 'static>(
+    pub fn process_rx<M: GuestMemoryBackend>(
         &mut self,
-        mem: &vm_memory::GuestMemoryMmap<B>,
+        mem: &M,
         queue: &mut Queue,
     ) -> Result<bool, NetQueuePairError> {
         self.rx_desc_avail = !self.rx.process_desc_chain(
@@ -634,23 +646,26 @@ mod tests {
     use std::os::fd::OwnedFd;
     use std::os::unix::net::UnixDatagram;
 
-    use virtio_bindings::virtio_net::{VIRTIO_NET_HDR_F_DATA_VALID, VIRTIO_NET_HDR_GSO_TCPV4};
+    use virtio_bindings::virtio_net::VIRTIO_NET_HDR_F_DATA_VALID;
     use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
     use virtio_queue::desc::RawDescriptor;
     use virtio_queue::desc::split::Descriptor;
     use virtio_queue::mock::MockSplitQueue;
+    use vm_allocator::page_size::get_page_size;
     use vm_memory::bitmap::AtomicBitmap;
     use vm_memory::{GuestMemoryMmap, GuestMemoryRegion};
 
     use super::*;
 
+    const CSUM: u64 = 1 << VIRTIO_NET_F_CSUM;
+
     #[test]
     fn tx_header_must_be_complete() {
         let header = [0; size_of::<virtio_net_hdr_v1>()];
         let len = header.len();
-        assert!(!TxVirtio::tx_is_header_valid(&header, len - 1, true));
-        assert!(!TxVirtio::tx_is_header_valid(&header, len - 1, false));
-        assert!(TxVirtio::tx_is_header_valid(&header, len, false));
+        assert!(!TxVirtio::tx_is_header_valid(&header, len - 1, CSUM));
+        assert!(!TxVirtio::tx_is_header_valid(&header, len - 1, 0));
+        assert!(TxVirtio::tx_is_header_valid(&header, len, 0));
     }
 
     #[test]
@@ -658,36 +673,148 @@ mod tests {
         let mut header = [0; size_of::<virtio_net_hdr_v1>()];
         let len = header.len();
         header[0] = VIRTIO_NET_HDR_F_NEEDS_CSUM as u8;
-        assert!(!TxVirtio::tx_is_header_valid(&header, len, false));
-        assert!(TxVirtio::tx_is_header_valid(&header, len, true));
+        assert!(!TxVirtio::tx_is_header_valid(&header, len, 0));
+        assert!(TxVirtio::tx_is_header_valid(&header, len, CSUM));
 
         header[0] = VIRTIO_NET_HDR_F_DATA_VALID as u8;
-        assert!(TxVirtio::tx_is_header_valid(&header, len, false));
+        assert!(TxVirtio::tx_is_header_valid(&header, len, 0));
 
         header[1] = VIRTIO_NET_HDR_GSO_TCPV4 as u8;
-        assert!(!TxVirtio::tx_is_header_valid(&header, len, false));
-        assert!(TxVirtio::tx_is_header_valid(&header, len, true));
+        let tso4 = 1 << VIRTIO_NET_F_HOST_TSO4;
+        assert!(!TxVirtio::tx_is_header_valid(&header, len, tso4));
+        assert!(TxVirtio::tx_is_header_valid(&header, len, CSUM | tso4));
     }
 
     #[test]
-    fn rx_marks_all_written_pages_dirty() {
-        const BUF0: u64 = 0x10000;
-        const BUF1: u64 = 0x20000;
-        const FILL: u8 = 0xab;
+    fn tx_header_respects_segmentation_offload() {
+        let mut header = [0; size_of::<virtio_net_hdr_v1>()];
+        let len = header.len();
+        header[0] = VIRTIO_NET_HDR_F_NEEDS_CSUM as u8;
+
+        for (gso_type, feature) in [
+            (VIRTIO_NET_HDR_GSO_TCPV4, VIRTIO_NET_F_HOST_TSO4),
+            (VIRTIO_NET_HDR_GSO_TCPV6, VIRTIO_NET_F_HOST_TSO6),
+            (VIRTIO_NET_HDR_GSO_UDP, VIRTIO_NET_F_HOST_UFO),
+            (VIRTIO_NET_HDR_GSO_UDP_L4, VIRTIO_NET_F_HOST_USO),
+        ] {
+            header[1] = gso_type as u8;
+            assert!(!TxVirtio::tx_is_header_valid(&header, len, CSUM));
+            assert!(TxVirtio::tx_is_header_valid(
+                &header,
+                len,
+                CSUM | (1 << feature)
+            ));
+        }
+
+        header[1] = (VIRTIO_NET_HDR_GSO_TCPV4 | VIRTIO_NET_HDR_GSO_ECN) as u8;
+        let tso4 = CSUM | (1 << VIRTIO_NET_F_HOST_TSO4);
+        assert!(!TxVirtio::tx_is_header_valid(&header, len, tso4));
+        assert!(TxVirtio::tx_is_header_valid(
+            &header,
+            len,
+            tso4 | (1 << VIRTIO_NET_F_HOST_ECN)
+        ));
+    }
+
+    #[test]
+    fn tx_drops_frame_the_tap_refuses() {
+        const HDR0: u64 = 0x10000;
+        const DATA0: u64 = 0x20000;
+        const HDR1: u64 = 0x30000;
+        const DATA1: u64 = 0x40000;
+        const SMALL_FRAME: usize = 64;
 
         let mem =
             GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x10_0000)]).unwrap();
-        // One RX chain: one page at BUF0, two pages at BUF1
+        // Two TX chains: a frame larger than the socket send buffer, then a
+        // small one
         let vq = MockSplitQueue::new(&mem, 16);
         vq.add_desc_chains(
             &[
                 RawDescriptor::from(Descriptor::new(
-                    BUF0,
-                    0x1000,
+                    HDR0,
+                    vnet_hdr_len() as u32,
+                    VRING_DESC_F_NEXT as u16,
+                    1,
+                )),
+                RawDescriptor::from(Descriptor::new(DATA0, 0x8000, 0, 0)),
+                RawDescriptor::from(Descriptor::new(
+                    HDR1,
+                    vnet_hdr_len() as u32,
+                    VRING_DESC_F_NEXT as u16,
+                    3,
+                )),
+                RawDescriptor::from(Descriptor::new(DATA1, SMALL_FRAME as u32, 0, 0)),
+            ],
+            0,
+        )
+        .unwrap();
+        let mut queue: Queue = vq.create_queue().unwrap();
+        let (tap_end, peer) = UnixDatagram::pair().unwrap();
+        peer.set_nonblocking(true).unwrap();
+        let sndbuf: libc::c_int = 4096;
+        // SAFETY: valid socket fd and a pointer to a c_int of the given size
+        let ret = unsafe {
+            libc::setsockopt(
+                tap_end.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                (&raw const sndbuf).cast(),
+                size_of::<libc::c_int>() as libc::socklen_t,
+            )
+        };
+        assert_eq!(ret, 0);
+        let tap = Tap::new_for_fuzzing(File::from(OwnedFd::from(tap_end)), "test");
+
+        // writev() of the first frame fails with EMSGSIZE, like a tap fails
+        // with ENOBUFS for a frame it cannot allocate. The device must drop
+        // that frame and still send the next one.
+        TxVirtio::new(0)
+            .process_desc_chain(&mem, &tap, &mut queue, &mut None, None)
+            .expect("an undeliverable frame should be dropped");
+
+        assert_eq!(u16::from_le(vq.used().idx().load()), 2);
+        for (i, head) in [(0, 0), (1, 2)] {
+            let used = vq.used().ring().ref_at(i).unwrap().load();
+            assert_eq!((used.id(), used.len()), (head, 0));
+        }
+        let mut buf = [0u8; 0x10000];
+        assert_eq!(peer.recv(&mut buf).unwrap(), vnet_hdr_len() + SMALL_FRAME);
+        assert_eq!(
+            peer.recv(&mut buf).unwrap_err().kind(),
+            io::ErrorKind::WouldBlock
+        );
+    }
+
+    #[test]
+    fn rx_marks_all_written_pages_dirty() {
+        const SPILL: usize = 1904;
+        const FILL: u8 = 0xab;
+
+        let page_size = get_page_size();
+        let buf0 = 16 * page_size;
+        let buf1 = 32 * page_size;
+        let mem = GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(
+            GuestAddress(0),
+            256 * page_size as usize,
+        )])
+        .unwrap();
+        // One RX chain: one page at buf0, two pages at buf1
+        let vq = MockSplitQueue::new(&mem, 16);
+        vq.add_desc_chains(
+            &[
+                RawDescriptor::from(Descriptor::new(
+                    buf0,
+                    page_size as u32,
                     (VRING_DESC_F_WRITE | VRING_DESC_F_NEXT) as u16,
                     1,
                 )),
-                RawDescriptor::from(Descriptor::new(BUF1, 0x2000, VRING_DESC_F_WRITE as u16, 0)),
+                RawDescriptor::from(Descriptor::new(
+                    buf1,
+                    2 * page_size as u32,
+                    VRING_DESC_F_WRITE as u16,
+                    0,
+                )),
             ],
             0,
         )
@@ -697,7 +824,7 @@ mod tests {
         let tap = {
             let (tx, rx) = UnixDatagram::pair().unwrap();
             rx.set_nonblocking(true).unwrap();
-            tx.send(&[FILL; 6000]).unwrap();
+            tx.send(&vec![FILL; page_size as usize + SPILL]).unwrap();
             Tap::new_for_fuzzing(File::from(OwnedFd::from(rx)), "test")
         };
 
@@ -708,13 +835,13 @@ mod tests {
             .process_desc_chain(&mem, &tap, &mut queue, &mut None, None)
             .unwrap();
 
-        // readv() fills BUF0 (4096 bytes) and spills the remaining 1904 bytes into BUF1
-        assert_eq!(mem.read_obj::<u8>(GuestAddress(BUF1 + 100)).unwrap(), FILL);
+        // readv() fills buf0 and spills the remaining SPILL bytes into buf1
+        assert_eq!(mem.read_obj::<u8>(GuestAddress(buf1 + 100)).unwrap(), FILL);
         let bitmap = mem.find_region(GuestAddress(0)).unwrap().bitmap();
-        assert!(bitmap.dirty_at(BUF0 as usize));
-        assert!(bitmap.dirty_at(BUF1 as usize));
-        // Only 6000 - 4096 bytes were written to the second buffer
-        assert!(!bitmap.dirty_at(BUF1 as usize + 0x1000));
+        assert!(bitmap.dirty_at(buf0 as usize));
+        assert!(bitmap.dirty_at(buf1 as usize));
+        // Only SPILL bytes, less than a page, were written to the second buffer
+        assert!(!bitmap.dirty_at((buf1 + page_size) as usize));
     }
 
     #[test]

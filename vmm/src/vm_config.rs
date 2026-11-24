@@ -2,12 +2,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
-use std::collections::HashSet;
-use std::net::IpAddr;
+use std::net::{IpAddr, SocketAddr};
+use std::ops::{Deref, DerefMut};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 #[cfg(feature = "fw_cfg")]
 use std::str::FromStr;
-use std::{fmt, fs, result};
+use std::sync::Arc;
+use std::{fmt, fs, io, result};
 
 use arch::CpuProfileConfig;
 #[cfg(target_arch = "x86_64")]
@@ -16,12 +18,14 @@ use block::ImageType;
 pub use block::fcntl::LockGranularityChoice;
 #[cfg(target_arch = "x86_64")]
 use devices::debug_console;
-use log::{debug, warn};
+use landlock::AccessFs;
+use log::warn;
 use net_util::MacAddr;
 use serde::de::{Error as DeError, Visitor};
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
 use virtio_devices::RateLimiterConfig;
+pub use virtio_devices::vsock::SocketType;
 
 use crate::Landlock;
 use crate::landlock::LandlockError;
@@ -81,6 +85,9 @@ pub struct CpusConfig {
     pub topology: Option<CpuTopology>,
     #[serde(default)]
     pub kvm_hyperv: bool,
+    #[cfg(target_arch = "x86_64")]
+    #[serde(default)]
+    pub kvm_hint_realtime: bool,
     #[serde(default = "default_cpuconfig_max_phys_bits")]
     pub max_phys_bits: u8,
     #[serde(default)]
@@ -112,6 +119,8 @@ impl Default for CpusConfig {
             max_vcpus: DEFAULT_VCPUS,
             topology: None,
             kvm_hyperv: false,
+            #[cfg(target_arch = "x86_64")]
+            kvm_hint_realtime: false,
             max_phys_bits: DEFAULT_MAX_PHYS_BITS,
             affinity: None,
             features: CpuFeatures::default(),
@@ -170,9 +179,9 @@ pub struct PlatformConfig {
     pub sev_snp: bool,
     #[serde(default)]
     pub iommufd: bool,
-    // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
-    #[serde(default, deserialize_with = "deserialize_platformconfig_iommufd_fd")]
-    pub iommufd_fd: Option<i32>,
+    // Deserialized FDs are discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iommufd_fd: ExternalFd,
     #[serde(default = "default_platformconfig_vfio_p2p_dma")]
     pub vfio_p2p_dma: bool,
 }
@@ -218,21 +227,6 @@ impl PlatformConfig {
         };
 
         (!smbios.is_empty()).then_some(smbios)
-    }
-}
-
-fn deserialize_platformconfig_iommufd_fd<'de, D>(d: D) -> Result<Option<i32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fd: Option<i32> = Option::deserialize(d)?;
-    if invalid_fd.is_some() {
-        debug!(
-            "FD in 'PlatformConfig::iommufd_fd' won't be deserialized as it is most likely invalid now. Deserializing it as -1."
-        );
-        Ok(Some(-1))
-    } else {
-        Ok(None)
     }
 }
 
@@ -499,7 +493,7 @@ pub struct DiskConfig {
 impl ApplyLandlock for DiskConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if let Some(path) = &self.path {
-            landlock.add_rule_with_access(path, "rw")?;
+            landlock.add_rule_with_access(path, if self.readonly { "r" } else { "rw" })?;
         }
         Ok(())
     }
@@ -519,6 +513,60 @@ pub fn default_diskconfig_queue_size() -> u16 {
 
 pub fn default_diskconfig_sparse() -> bool {
     true
+}
+
+/// A descriptor shared by config clones. Deserialization leaves it empty.
+#[derive(Clone, Debug, Default)]
+pub struct ExternalFd(Option<Arc<OwnedFd>>);
+
+impl Deref for ExternalFd {
+    type Target = Option<Arc<OwnedFd>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl DerefMut for ExternalFd {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl PartialEq for ExternalFd {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.as_ref().map(|fd| fd.as_raw_fd()) == other.0.as_ref().map(|fd| fd.as_raw_fd())
+    }
+}
+
+impl Eq for ExternalFd {}
+
+impl Serialize for ExternalFd {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        self.0
+            .as_ref()
+            .map_or(-1, |fd| fd.as_raw_fd())
+            .serialize(serializer)
+    }
+}
+
+impl<'de> Deserialize<'de> for ExternalFd {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let _ = Option::<RawFd>::deserialize(deserializer)?;
+        Ok(Self::default())
+    }
+}
+
+impl From<OwnedFd> for ExternalFd {
+    fn from(fd: OwnedFd) -> Self {
+        Self(Some(Arc::new(fd)))
+    }
+}
+
+impl From<fs::File> for ExternalFd {
+    fn from(file: fs::File) -> Self {
+        Self::from(OwnedFd::from(file))
+    }
 }
 
 #[serde_with::skip_serializing_none]
@@ -545,14 +593,9 @@ pub struct NetConfig {
     pub vhost_socket: Option<String>,
     #[serde(default)]
     pub vhost_mode: VhostMode,
-    // Special deserialize handling:
-    // Therefore, we don't serialize FDs, and whatever value is here after
-    // deserialization is invalid.
-    //
-    // Valid FDs are transmitted via a different channel (SCM_RIGHTS message)
-    // and will be populated into this struct on the destination VMM eventually.
-    #[serde(default, deserialize_with = "deserialize_netconfig_fds")]
-    pub fds: Option<Vec<i32>>,
+    // Deserialization keeps the FD count for restore.
+    #[serde(default)]
+    pub fds: Option<Vec<ExternalFd>>,
     #[serde(default)]
     pub rate_limiter_config: Option<RateLimiterConfig>,
     #[serde(default)]
@@ -577,21 +620,6 @@ pub const DEFAULT_NET_QUEUE_SIZE: u16 = 256;
 
 pub fn default_netconfig_queue_size() -> u16 {
     DEFAULT_NET_QUEUE_SIZE
-}
-
-fn deserialize_netconfig_fds<'de, D>(d: D) -> Result<Option<Vec<i32>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fds: Option<Vec<i32>> = Option::deserialize(d)?;
-    if let Some(invalid_fds) = invalid_fds {
-        debug!(
-            "FDs in 'NetConfig' won't be deserialized as they are most likely invalid now. Deserializing them as -1."
-        );
-        Ok(Some(vec![-1; invalid_fds.len()]))
-    } else {
-        Ok(None)
-    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
@@ -709,39 +737,77 @@ impl ApplyLandlock for PmemConfig {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub enum ConsoleOutputMode {
+#[serde(deny_unknown_fields)]
+pub struct TcpConsoleConfig {
+    #[serde(deserialize_with = "deserialize_tcp_address")]
+    pub address: SocketAddr,
+    /// Client mode is not supported.
+    #[serde(default = "TcpConsoleConfig::default_server")]
+    pub server: bool,
+}
+
+pub(crate) fn parse_tcp_address(address: &str) -> io::Result<SocketAddr> {
+    address
+        .parse()
+        .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error))
+}
+
+fn deserialize_tcp_address<'de, D: Deserializer<'de>>(
+    deserializer: D,
+) -> Result<SocketAddr, D::Error> {
+    let address = String::deserialize(deserializer)?;
+    parse_tcp_address(&address).map_err(DeError::custom)
+}
+
+impl TcpConsoleConfig {
+    fn default_server() -> bool {
+        true
+    }
+}
+
+/// Output of a serial or virtio console.
+///
+/// Serialized as a `mode` tag next to the fields of the variant. The HTTP API,
+/// snapshots, and migration all rely on this flat JSON format.
+#[serde_with::skip_serializing_none]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(tag = "mode")]
+pub enum ConsoleOutput {
     Off,
-    Pty,
+    Pty {
+        /// Path of the PTY. Unknown until the device has been created.
+        #[serde(default)]
+        file: Option<PathBuf>,
+    },
     Tty,
-    File,
-    Socket,
+    File {
+        file: PathBuf,
+    },
+    Socket {
+        socket: PathBuf,
+    },
+    Tcp {
+        tcp: TcpConsoleConfig,
+    },
     Null,
 }
 
-/// Common configuration for plain console configs.
-///
-/// Independent of PCI or legacy devices.
-#[serde_with::skip_serializing_none]
-#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
-pub struct CommonConsoleConfig {
-    #[serde(default)]
-    pub file: Option<PathBuf>,
-    pub mode: ConsoleOutputMode,
-    #[serde(default)]
-    pub socket: Option<PathBuf>,
-}
-
-impl ApplyLandlock for CommonConsoleConfig {
+impl ApplyLandlock for ConsoleOutput {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
-        if self.mode == ConsoleOutputMode::Pty {
-            landlock.add_rule_with_access(Path::new("/dev/pts"), "rw")?;
-            landlock.add_rule_with_access(Path::new("/dev/ptmx"), "rw")?;
-        }
-        if let Some(file) = &self.file {
-            landlock.add_rule_with_access(file, "rw")?;
-        }
-        if let Some(socket) = &self.socket {
-            landlock.add_rule_with_access(socket, "rw")?;
+        match self {
+            ConsoleOutput::Pty { file } => {
+                landlock.add_rule_with_access(Path::new("/dev/pts"), "rw")?;
+                landlock.add_rule_with_access(Path::new("/dev/ptmx"), "rw")?;
+                if let Some(file) = file {
+                    landlock.add_rule_with_access(file, "rw")?;
+                }
+            }
+            ConsoleOutput::File { file } => landlock.add_rule_with_access(file, "rw")?,
+            ConsoleOutput::Socket { socket } => landlock.add_rule_with_access(socket, "rw")?,
+            ConsoleOutput::Off
+            | ConsoleOutput::Tty
+            | ConsoleOutput::Tcp { .. }
+            | ConsoleOutput::Null => {}
         }
         Ok(())
     }
@@ -751,28 +817,25 @@ impl ApplyLandlock for CommonConsoleConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct SerialConfig {
     #[serde(flatten)]
-    pub common: CommonConsoleConfig,
+    pub output: ConsoleOutput,
 }
 
 impl SerialConfig {
-    pub const SYNTAX: &str = "Control serial port: \"off|null|pty|tty|file=<path>|socket=<path>\"";
+    pub const SYNTAX: &'static str = "Control serial port: \
+        \"off|null|pty|tty|file=<path>|socket=<path>|tcp=<loopback_ip>:<port>,server=on\"";
 }
 
 impl Default for SerialConfig {
     fn default() -> Self {
         Self {
-            common: CommonConsoleConfig {
-                file: None,
-                mode: ConsoleOutputMode::Null,
-                socket: None,
-            },
+            output: ConsoleOutput::Null,
         }
     }
 }
 
 impl ApplyLandlock for SerialConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
-        self.common.apply_landlock(landlock)
+        self.output.apply_landlock(landlock)
     }
 }
 
@@ -780,23 +843,21 @@ impl ApplyLandlock for SerialConfig {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct ConsoleConfig {
     #[serde(flatten)]
-    pub common: CommonConsoleConfig,
+    pub output: ConsoleOutput,
     #[serde(default, flatten)]
     pub pci_common: PciDeviceCommonConfig,
 }
 
 impl ConsoleConfig {
-    pub const SYNTAX: &str = "Control (virtio) console: \"off|null|pty|tty|file=<path>|socket=<path>,iommu=on|off,id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
+    pub const SYNTAX: &'static str = "Control (virtio) console: \
+        \"off|null|pty|tty|file=<path>|socket=<path>|tcp=<loopback_ip>:<port>,server=on,\
+        iommu=off|virtio,id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 }
 
 impl Default for ConsoleConfig {
     fn default() -> Self {
         Self {
-            common: CommonConsoleConfig {
-                file: None,
-                mode: ConsoleOutputMode::Tty,
-                socket: None,
-            },
+            output: ConsoleOutput::Tty,
             pci_common: PciDeviceCommonConfig::default(),
         }
     }
@@ -804,7 +865,7 @@ impl Default for ConsoleConfig {
 
 impl ApplyLandlock for ConsoleConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
-        self.common.apply_landlock(landlock)
+        self.output.apply_landlock(landlock)
     }
 }
 
@@ -812,9 +873,8 @@ impl ApplyLandlock for ConsoleConfig {
 #[serde_with::skip_serializing_none]
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct DebugConsoleConfig {
-    #[serde(default)]
-    pub file: Option<PathBuf>,
-    pub mode: ConsoleOutputMode,
+    #[serde(flatten)]
+    pub output: ConsoleOutput,
     /// Optionally dedicated I/O-port, if the default port should not be used.
     pub iobase: Option<u16>,
 }
@@ -823,8 +883,7 @@ pub struct DebugConsoleConfig {
 impl Default for DebugConsoleConfig {
     fn default() -> Self {
         Self {
-            file: None,
-            mode: ConsoleOutputMode::Off,
+            output: ConsoleOutput::Off,
             iobase: Some(debug_console::DEFAULT_PORT as u16),
         }
     }
@@ -832,14 +891,7 @@ impl Default for DebugConsoleConfig {
 #[cfg(target_arch = "x86_64")]
 impl ApplyLandlock for DebugConsoleConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
-        if self.mode == ConsoleOutputMode::Pty {
-            landlock.add_rule_with_access(Path::new("/dev/pts"), "rw")?;
-            landlock.add_rule_with_access(Path::new("/dev/ptmx"), "rw")?;
-        }
-        if let Some(file) = &self.file {
-            landlock.add_rule_with_access(file, "rw")?;
-        }
-        Ok(())
+        self.output.apply_landlock(landlock)
     }
 }
 
@@ -850,30 +902,15 @@ pub struct DeviceConfig {
     pub pci_common: PciDeviceCommonConfig,
     #[serde(default)]
     pub path: Option<PathBuf>,
-    // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
-    #[serde(default, deserialize_with = "deserialize_deviceconfig_fd")]
-    pub fd: Option<i32>,
+    // Deserialized FDs are discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd: ExternalFd,
     #[serde(default)]
     pub x_nv_gpudirect_clique: Option<u8>,
     #[serde(default)]
     pub x_exclude_mmap_bars: Vec<u64>,
     #[serde(skip)]
     pub iommufd_dev_id: Option<u32>,
-}
-
-fn deserialize_deviceconfig_fd<'de, D>(d: D) -> Result<Option<i32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fd: Option<i32> = Option::deserialize(d)?;
-    if invalid_fd.is_some() {
-        debug!(
-            "FD in 'DeviceConfig' won't be deserialized as it is most likely invalid now. Deserializing it as -1."
-        );
-        Ok(Some(-1))
-    } else {
-        Ok(None)
-    }
 }
 
 impl ApplyLandlock for DeviceConfig {
@@ -883,8 +920,9 @@ impl ApplyLandlock for DeviceConfig {
         let Some(path) = self.path.as_deref() else {
             return Ok(());
         };
-        let device_path = fs::read_link(path).map_err(LandlockError::OpenPath)?;
-        let iommu_group = device_path.file_name();
+        let iommu_group_path =
+            fs::read_link(path.join("iommu_group")).map_err(LandlockError::OpenPath)?;
+        let iommu_group = iommu_group_path.file_name();
         let iommu_group_str = iommu_group
             .ok_or(LandlockError::InvalidPath)?
             .to_str()
@@ -938,12 +976,14 @@ pub struct VsockConfig {
     pub pci_common: PciDeviceCommonConfig,
     pub cid: u32,
     pub socket: PathBuf,
+    #[serde(default)]
+    pub socket_type: SocketType,
 }
 
 impl ApplyLandlock for VsockConfig {
     fn apply_landlock(&self, landlock: &mut Landlock) -> LandlockResult<()> {
         if let Some(parent) = self.socket.parent() {
-            landlock.add_rule_with_access(parent, "w")?;
+            landlock.add_rule(parent, AccessFs::MakeSock.into())?;
         }
 
         landlock.add_rule_with_access(&self.socket, "rw")?;
@@ -1242,7 +1282,7 @@ impl ApplyLandlock for LandlockConfig {
 }
 
 #[serde_with::skip_serializing_none]
-#[derive(Debug, PartialEq, Eq, Deserialize, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize)]
 pub struct VmConfig {
     #[serde(default)]
     pub cpus: CpusConfig,
@@ -1287,16 +1327,6 @@ pub struct VmConfig {
     pub pci_segments: Option<Box<[PciSegmentConfig]>>,
     pub platform: Option<PlatformConfig>,
     pub tpm: Option<TpmConfig>,
-    // Preserved FDs are the ones that share the same life-time as its holding
-    // VmConfig instance, such as FDs for creating TAP devices.
-    // Preserved FDs will stay open as long as the holding VmConfig instance is
-    // valid, and will be closed when the holding VmConfig instance is destroyed.
-    //
-    // This is populated as devices are added at runtime. Removing them again
-    // causes the FDs to be closed early. This allows management software to
-    // gracefully clean up resources (e.g., libvirt closes tap devices).
-    #[serde(skip)]
-    pub preserved_fds: Option<HashSet<i32>>,
     #[serde(default)]
     pub landlock_enable: bool,
     pub landlock_rules: Option<Box<[LandlockConfig]>>,

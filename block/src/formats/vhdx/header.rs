@@ -6,8 +6,6 @@ use std::collections::btree_map::BTreeMap;
 use std::os::unix::fs::FileExt;
 use std::{io, result};
 
-use byteorder::{ByteOrder, LittleEndian};
-use remain::sorted;
 use thiserror::Error;
 use uuid::Uuid;
 use zerocopy::{FromBytes, Immutable, IntoBytes};
@@ -37,7 +35,6 @@ const MDR_GUID: [u8; 16] = [
     0x06, 0xa2, 0x7c, 0x8b, 0x90, 0x47, 0x9a, 0x4b, 0xb8, 0xfe, 0x57, 0x5f, 0x05, 0x0f, 0x88, 0x6e,
 ];
 
-#[sorted]
 #[derive(Error, Debug)]
 pub enum VhdxHeaderError {
     #[error("BAT entry is not unique")]
@@ -93,7 +90,7 @@ impl FileTypeIdentifier {
         let mut buf = [0u8; size_of::<u64>()];
         f.read_exact_at(&mut buf, FILE_START)
             .map_err(VhdxHeaderError::ReadFileTypeIdentifier)?;
-        let _signature = LittleEndian::read_u64(&buf);
+        let _signature = u64::from_le_bytes(buf);
         if _signature != VHDX_SIGN {
             return Err(VhdxHeaderError::InvalidVHDXSign);
         }
@@ -301,15 +298,10 @@ impl RegionInfo {
             }
         }
 
-        if bat_entry.is_none() || mdr_entry.is_none() {
+        let (Some(bat_entry), Some(mdr_entry)) = (bat_entry, mdr_entry) else {
             region_entries.clear();
             return Err(VhdxHeaderError::RegionEntryCollectionFailed);
-        }
-
-        // It's safe to unwrap as we checked both entries have been filled.
-        // Otherwise, an error is already returned.
-        let bat_entry = bat_entry.unwrap();
-        let mdr_entry = mdr_entry.unwrap();
+        };
 
         Ok(RegionInfo {
             bat_entry,
@@ -327,17 +319,12 @@ pub(super) struct RegionTableEntry {
     pub required: u32,
 }
 
-enum HeaderNo {
-    First,
-    Second,
-}
-
 /// Contains the information from the header of a VHDx file
 #[derive(Clone, Debug)]
 pub(super) struct VhdxHeader {
     _file_type_identifier: FileTypeIdentifier,
-    header_1: Header,
-    header_2: Header,
+    header: Header,
+    header_offset: u64,
     region_table_1: RegionTableHeader,
     _region_table_2: RegionTableHeader,
 }
@@ -345,84 +332,66 @@ pub(super) struct VhdxHeader {
 impl VhdxHeader {
     /// Creates a VhdxHeader from a reference to a file
     pub(super) fn new(f: &AlignedFile) -> Result<VhdxHeader> {
+        let file_type_identifier = FileTypeIdentifier::new(f)?;
+        let header_1 = Header::new(f, HEADER_1_START)?;
+        let header_2 = Header::new(f, HEADER_2_START)?;
+        let (header_offset, header) = Self::current_header(Ok(header_1), Ok(header_2))?;
         Ok(VhdxHeader {
-            _file_type_identifier: FileTypeIdentifier::new(f)?,
-            header_1: Header::new(f, HEADER_1_START)?,
-            header_2: Header::new(f, HEADER_2_START)?,
+            _file_type_identifier: file_type_identifier,
+            header,
+            header_offset,
             region_table_1: RegionTableHeader::new(f, REGION_TABLE_1_START)?,
             _region_table_2: RegionTableHeader::new(f, REGION_TABLE_2_START)?,
         })
     }
 
-    /// Identify the current header and return both headers along with an
-    /// integer indicating the current header.
-    fn current_header(
-        header_1: Result<Header>,
-        header_2: Result<Header>,
-    ) -> Result<(HeaderNo, Header)> {
+    /// Select the current header and its file offset.
+    fn current_header(header_1: Result<Header>, header_2: Result<Header>) -> Result<(u64, Header)> {
         let header_1 = header_1.ok();
         let header_2 = header_2.ok();
 
         match (header_1, header_2) {
             (None, None) => Err(VhdxHeaderError::NoValidHeader),
-            (Some(header_1), None) => Ok((HeaderNo::First, header_1)),
-            (None, Some(header_2)) => Ok((HeaderNo::Second, header_2)),
+            (Some(header_1), None) => Ok((HEADER_1_START, header_1)),
+            (None, Some(header_2)) => Ok((HEADER_2_START, header_2)),
             (Some(header_1), Some(header_2)) => {
                 if header_1.sequence_number >= header_2.sequence_number {
-                    Ok((HeaderNo::First, header_1))
+                    Ok((HEADER_1_START, header_1))
                 } else {
-                    Ok((HeaderNo::Second, header_2))
+                    Ok((HEADER_2_START, header_2))
                 }
             }
         }
     }
 
-    /// This takes two headers and update the noncurrent header with the
-    /// current one. Returns both headers as a tuple sequenced the way it was
-    /// received from the parameter list.
-    fn update_header(
-        f: &AlignedFile,
-        header_1: Result<Header>,
-        header_2: Result<Header>,
-        guid: u128,
-    ) -> Result<(Header, Header)> {
-        let (header_no, current_header) = VhdxHeader::current_header(header_1, header_2)?;
-
-        match header_no {
-            HeaderNo::First => {
-                let other_header =
-                    Header::update_header(f, &current_header, true, guid, HEADER_2_START)?;
-                Ok((current_header, other_header))
-            }
-            HeaderNo::Second => {
-                let other_header =
-                    Header::update_header(f, &current_header, true, guid, HEADER_1_START)?;
-                Ok((other_header, current_header))
-            }
-        }
-    }
-
-    // Update the provided headers according to the spec
-    fn update_headers(
-        f: &AlignedFile,
-        header_1: Result<Header>,
-        header_2: Result<Header>,
-        guid: u128,
-    ) -> Result<(Header, Header)> {
-        // According to the spec, update twice
-        let (header_1, header_2) = VhdxHeader::update_header(f, header_1, header_2, guid)?;
-        VhdxHeader::update_header(f, Ok(header_1), Ok(header_2), guid)
-    }
-
     pub(super) fn update(&mut self, f: &AlignedFile) -> Result<()> {
-        let headers = VhdxHeader::update_headers(f, Ok(self.header_1), Ok(self.header_2), 0)?;
-        self.header_1 = headers.0;
-        self.header_2 = headers.1;
+        let mut header = self.header;
+        let mut offset = self.header_offset;
+        for _ in 0..2 {
+            offset = if offset == HEADER_1_START {
+                HEADER_2_START
+            } else {
+                HEADER_1_START
+            };
+            header = Header::update_header(f, &header, true, 0, offset)?;
+        }
+        self.header = header;
+        self.header_offset = offset;
         Ok(())
     }
 
     pub(super) fn region_entry_count(&self) -> u32 {
         self.region_table_1.entry_count
+    }
+
+    /// Return the current header's log region as (offset, length).
+    pub(super) fn log_region(&self) -> (u64, u32) {
+        (self.header.log_offset, self.header.log_length)
+    }
+
+    /// A non-zero log GUID means a log is present and may need replay.
+    pub(super) fn has_active_log(&self) -> bool {
+        self.header.log_guid != 0 && self.header.log_length != 0
     }
 }
 
@@ -431,33 +400,32 @@ impl VhdxHeader {
 /// corresponding field is made zero. After the calculation, the existing checksum
 /// is put back to the buffer.
 fn calculate_checksum(buffer: &mut [u8], csum_offset: usize) -> u32 {
+    let csum_range = csum_offset..csum_offset + size_of::<u32>();
     // Read the original checksum from the buffer
-    let orig_csum = LittleEndian::read_u32(&buffer[csum_offset..csum_offset + 4]);
+    let mut orig_csum = [0u8; size_of::<u32>()];
+    orig_csum.copy_from_slice(&buffer[csum_range.clone()]);
     // Zero the checksum in the buffer
-    LittleEndian::write_u32(&mut buffer[csum_offset..csum_offset + 4], 0);
+    buffer[csum_range.clone()].fill(0);
     // Calculate the checksum on the resulting buffer
     let mut crc = crc_any::CRC::crc32c();
     crc.digest(&buffer);
     let new_csum = crc.get_crc() as u32;
 
     // Put back the original checksum in the buffer
-    LittleEndian::write_u32(&mut buffer[csum_offset..csum_offset + 4], orig_csum);
+    buffer[csum_range].copy_from_slice(&orig_csum);
 
     new_csum
 }
 
 #[cfg(test)]
 mod tests {
-    use std::os::unix::fs::FileExt;
-
-    use vmm_sys_util::tempfile::TempFile;
     use zerocopy::{FromBytes, IntoBytes};
 
     use super::{
         BAT_GUID, HEADER_SIGN, Header, MDR_GUID, REGION_TABLE_1_START, RegionInfo,
         RegionTableHeader, VhdxHeaderError, ranges_overlap,
     };
-    use crate::aligned_file::AlignedFile;
+    use crate::formats::vhdx::test_util::{region_entry, region_file};
 
     #[test]
     fn test_header_bytes_round_trip() {
@@ -525,17 +493,6 @@ mod tests {
         }
     }
 
-    /// Builds the 32-byte on-disk region table entry for `guid` describing
-    /// the region `[file_offset, file_offset + length)`.
-    fn region_entry(guid: [u8; 16], file_offset: u64, length: u32) -> [u8; 32] {
-        let mut e = [0u8; 32];
-        e[0..16].copy_from_slice(&guid);
-        e[16..24].copy_from_slice(&file_offset.to_le_bytes());
-        e[24..28].copy_from_slice(&length.to_le_bytes());
-        // `required` (e[28..32]) left zero.
-        e
-    }
-
     #[test]
     fn test_region_info_rejects_overlapping_regions() {
         // BAT region [1 MiB, 3 MiB) and metadata region [2 MiB, 4 MiB) overlap
@@ -545,18 +502,13 @@ mod tests {
         let region_start = REGION_TABLE_1_START;
         let entries_at = region_start + size_of::<RegionTableHeader>() as u64;
 
-        let temp = TempFile::new().unwrap();
-        let f = temp.into_file();
-        f.set_len(entries_at + 64 * 1024).unwrap();
-        f.write_all_at(&region_entry(BAT_GUID, MIB, (2 * MIB) as u32), entries_at)
-            .unwrap();
-        f.write_all_at(
-            &region_entry(MDR_GUID, 2 * MIB, (2 * MIB) as u32),
-            entries_at + 32,
-        )
-        .unwrap();
-
-        let af = AlignedFile::new(f, false);
+        let af = region_file(
+            entries_at + 64 * 1024,
+            &[
+                region_entry(BAT_GUID, MIB, (2 * MIB) as u32),
+                region_entry(MDR_GUID, 2 * MIB, (2 * MIB) as u32),
+            ],
+        );
         let res = RegionInfo::new(&af, region_start, 2);
         assert!(
             matches!(res, Err(VhdxHeaderError::RegionOverlap)),
@@ -572,13 +524,10 @@ mod tests {
         let region_start = REGION_TABLE_1_START;
         let entries_at = region_start + size_of::<RegionTableHeader>() as u64;
 
-        let temp = TempFile::new().unwrap();
-        let f = temp.into_file();
-        f.set_len(entries_at + 64 * 1024).unwrap();
-        f.write_all_at(&region_entry(BAT_GUID, u64::MAX, 0x1000), entries_at)
-            .unwrap();
-
-        let af = AlignedFile::new(f, false);
+        let af = region_file(
+            entries_at + 64 * 1024,
+            &[region_entry(BAT_GUID, u64::MAX, 0x1000)],
+        );
         let res = RegionInfo::new(&af, region_start, 1);
         assert!(
             matches!(res, Err(VhdxHeaderError::RegionEntryOverflow(..))),

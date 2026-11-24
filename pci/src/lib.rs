@@ -9,7 +9,6 @@
 mod bus;
 mod configuration;
 mod device;
-mod mmap;
 mod msi;
 mod msix;
 mod vfio;
@@ -22,7 +21,8 @@ use std::str::FromStr;
 use serde::de::{self, Visitor};
 
 pub use self::bus::{
-    NUM_DEVICE_IDS, PCI_ROOT_DEVICE_ID, PciBus, PciConfigIo, PciConfigMmio, PciRoot, PciRootError,
+    NUM_DEVICE_IDS, PCI_CONFIG_IO_SNAPSHOT_ID, PCI_ROOT_DEVICE_ID, PciBus, PciConfigIo,
+    PciConfigIoState, PciConfigMmio, PciRoot, PciRootError,
 };
 pub use self::configuration::{
     PCI_CONFIGURATION_ID, PasidCap, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType,
@@ -38,7 +38,7 @@ pub use self::msix::{
     MSIX_CONFIG_ID, MSIX_TABLE_ENTRY_SIZE, MaybeMutInterruptSourceGroup, MsixCap, MsixConfig,
     MsixTableEntry,
 };
-pub use self::vfio::{MmioRegion, VfioDmaMapping, VfioPciDevice, VfioPciError};
+pub use self::vfio::{VfioBar, VfioDmaMapping, VfioPciDevice, VfioPciError};
 pub use self::vfio_user::{VfioUserDmaMapping, VfioUserPciDevice, VfioUserPciDeviceError};
 
 #[cfg(target_arch = "x86_64")]

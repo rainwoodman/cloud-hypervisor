@@ -18,9 +18,7 @@ use crate::arch::x86::{
 pub mod emulator;
 pub mod io_port;
 
-///
 /// Export generically-named wrappers of mshv_bindings for Unix-based platforms
-///
 pub use {
     mshv_bindings::AllVpStateComponents, mshv_bindings::CpuId, mshv_bindings::DebugRegisters,
     mshv_bindings::FloatingPointUnit, mshv_bindings::LapicState as MshvLapicState,
@@ -55,7 +53,7 @@ pub struct MshvClockData {
 impl fmt::Display for VcpuMshvState {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         let expected_num_msrs = self.msrs.len();
-        let mut msr_entries = vec![vec![0; 2]; expected_num_msrs];
+        let mut msr_entries = vec![[0; 2]; expected_num_msrs];
 
         for (i, entry) in self.msrs.iter().enumerate() {
             msr_entries[i][1] = entry.data;

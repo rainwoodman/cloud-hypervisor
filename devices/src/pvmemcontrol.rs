@@ -11,20 +11,17 @@ use std::sync::{Arc, Barrier, RwLock};
 use std::{fmt, io, mem, ptr, result};
 
 use log::{debug, warn};
-use num_enum::TryFromPrimitive;
 use pci::{
     BarReprogrammingParams, PciBarConfiguration, PciBarPrefetchable, PciBarRegionType, PciBdf,
     PciClassCode, PciConfiguration, PciDevice, PciDeviceError, PciHeaderType, PciSubclass,
 };
 use thiserror::Error;
 use vm_allocator::page_size::get_page_size;
-use vm_allocator::{AddressAllocator, SystemAllocator};
+use vm_allocator::{AddressAllocator, GuestMemory, SystemAllocator};
 use vm_device::{BusDeviceSync, Resource};
-use vm_memory::bitmap::AtomicBitmap;
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
-    GuestMemoryBackend, GuestMemoryError, GuestMemoryMmap, GuestMemoryRegion, Le32, Le64,
-    VolatileMemory,
+    GuestMemoryBackend, GuestMemoryError, GuestMemoryRegion, Le32, Le64, VolatileMemory,
 };
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 
@@ -67,7 +64,7 @@ impl PciSubclass for PvmemcontrolSubclass {
 
 /// commands have 0 as the most significant byte
 #[repr(u32)]
-#[derive(PartialEq, Eq, Copy, Clone, TryFromPrimitive)]
+#[derive(PartialEq, Eq, Copy, Clone)]
 enum PvmemcontrolTransportCommand {
     Reset = 0x060f_e6d2,
     Register = 0x0e35_9539,
@@ -75,6 +72,23 @@ enum PvmemcontrolTransportCommand {
     Disconnect = 0x030f_5da0,
     Ack = 0x03cf_5196,
     Error = 0x01fb_a249,
+}
+
+impl TryFrom<u32> for PvmemcontrolTransportCommand {
+    type Error = ();
+
+    // `Self::Error` would be ambiguous with the `Error` variant.
+    fn try_from(value: u32) -> Result<Self, ()> {
+        Ok(match value {
+            0x060f_e6d2 => Self::Reset,
+            0x0e35_9539 => Self::Register,
+            0x0ca8_d227 => Self::Ready,
+            0x030f_5da0 => Self::Disconnect,
+            0x03cf_5196 => Self::Ack,
+            0x01fb_a249 => Self::Error,
+            _ => return Err(()),
+        })
+    }
 }
 
 #[repr(C)]
@@ -116,7 +130,6 @@ struct PvmemcontrolTransport {
 }
 
 const PVMEMCONTROL_DEVICE_MMIO_SIZE: u64 = size_of::<PvmemcontrolTransport>() as u64;
-const PVMEMCONTROL_DEVICE_MMIO_ALIGN: u64 = align_of::<PvmemcontrolTransport>() as u64;
 
 impl PvmemcontrolTransport {
     fn ack() -> Self {
@@ -160,7 +173,7 @@ unsafe impl ByteValued for PvmemcontrolTransportUnion {}
 unsafe impl ByteValued for PvmemcontrolTransport {}
 
 #[repr(u64)]
-#[derive(Copy, Clone, TryFromPrimitive, Debug)]
+#[derive(Copy, Clone, Debug)]
 enum FunctionCode {
     Info = 0,
     Dontneed = 1,
@@ -181,6 +194,35 @@ enum FunctionCode {
     NoHugepage = 16,
     DontneedLockedBatch = 17,
     DontneedLocked = 18,
+}
+
+impl TryFrom<u64> for FunctionCode {
+    type Error = ();
+
+    fn try_from(value: u64) -> Result<Self, Self::Error> {
+        Ok(match value {
+            0 => Self::Info,
+            1 => Self::Dontneed,
+            2 => Self::Remove,
+            3 => Self::Free,
+            4 => Self::Pageout,
+            5 => Self::Dontdump,
+            6 => Self::SetVMAAnonName,
+            7 => Self::Mlock,
+            8 => Self::Munlock,
+            9 => Self::MprotectNone,
+            10 => Self::MprotectR,
+            11 => Self::MprotectW,
+            12 => Self::MprotectRW,
+            13 => Self::Mergeable,
+            14 => Self::Unmergeable,
+            15 => Self::Hugepage,
+            16 => Self::NoHugepage,
+            17 => Self::DontneedLockedBatch,
+            18 => Self::DontneedLocked,
+            _ => return Err(()),
+        })
+    }
 }
 
 #[repr(C)]
@@ -309,7 +351,7 @@ impl PvmemcontrolDevice {
 
 impl PvmemcontrolDevice {
     fn register_percpu_buf(
-        guest_memory: &GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
+        guest_memory: &GuestMemoryAtomic<GuestMemory>,
         mut state: PercpuInitState,
         PvmemcontrolTransportRegister { buf_phys_addr }: PvmemcontrolTransportRegister,
     ) -> Self {
@@ -370,7 +412,7 @@ impl PvmemcontrolDevice {
 
     fn run_command(
         &mut self,
-        guest_memory: &GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
+        guest_memory: &GuestMemoryAtomic<GuestMemory>,
         command: PvmemcontrolTransportCommand,
     ) {
         let state = mem::replace(&mut self.state, PvmemcontrolState::Broken);
@@ -440,7 +482,7 @@ impl PvmemcontrolDevice {
 }
 
 pub struct PvmemcontrolBusDevice {
-    mem: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
+    mem: GuestMemoryAtomic<GuestMemory>,
     dev: RwLock<PvmemcontrolDevice>,
 }
 
@@ -758,10 +800,10 @@ impl PvmemcontrolDevice {
     pub fn make_device(
         id: String,
         bdf: PciBdf,
-        mem: GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>,
+        mem: GuestMemoryAtomic<GuestMemory>,
     ) -> (PvmemcontrolPciDevice, PvmemcontrolBusDevice) {
         let dev = RwLock::new(PvmemcontrolDevice::error());
-        let mut configuration = PciConfiguration::new(
+        let configuration = PciConfiguration::new(
             PVMEMCONTROL_VENDOR_ID,
             PVMEMCONTROL_DEVICE_ID,
             0x1,
@@ -774,9 +816,6 @@ impl PvmemcontrolDevice {
             None,
             None,
         );
-        let command: [u8; 2] = [0x03, 0x01]; // memory, io, SERR#
-
-        configuration.write_config_register(1, 0, &command);
         (
             PvmemcontrolPciDevice {
                 id,
@@ -835,12 +874,29 @@ impl PciDevice for PvmemcontrolPciDevice {
         let bar_id = 0;
         let region_size = PVMEMCONTROL_DEVICE_MMIO_SIZE;
         let restoring = resources.is_some();
+
+        let mut bar_addr = None;
+        if let Some(resources) = resources {
+            for resource in resources {
+                if let Resource::PciBar { index, base, .. } = resource
+                    && index == bar_id
+                {
+                    bar_addr = Some(GuestAddress(base));
+                    break;
+                }
+            }
+            if bar_addr.is_none() {
+                return Err(PciDeviceError::MissingResource);
+            }
+        }
+
+        let alignment = if restoring { None } else { Some(region_size) };
         let bar_addr = mmio32_allocator
-            .allocate(None, region_size, Some(PVMEMCONTROL_DEVICE_MMIO_ALIGN))
+            .allocate(bar_addr, region_size, alignment)
             .ok_or(PciDeviceError::IoAllocationFailed(region_size))?;
 
         let bar = PciBarConfiguration::default()
-            .set_index(bar_id as usize)
+            .set_index(bar_id)
             .set_address(bar_addr.raw_value())
             .set_size(region_size)
             .set_region_type(region_type)
@@ -928,6 +984,29 @@ mod tests {
     use super::*;
 
     #[test]
+    fn command_and_function_code_from_raw() {
+        use PvmemcontrolTransportCommand as Cmd;
+        for command in [
+            Cmd::Reset,
+            Cmd::Register,
+            Cmd::Ready,
+            Cmd::Disconnect,
+            Cmd::Ack,
+            Cmd::Error,
+        ] {
+            let raw = command as u32;
+            assert_eq!(Cmd::try_from(raw).map(|c| c as u32), Ok(raw));
+        }
+        assert_eq!(Cmd::try_from(0).map(|c| c as u32), Err(()));
+
+        let last = FunctionCode::DontneedLocked as u64;
+        for code in 0..=last {
+            assert_eq!(FunctionCode::try_from(code).map(|f| f as u64), Ok(code));
+        }
+        assert_eq!(FunctionCode::try_from(last + 1).map(|f| f as u64), Err(()));
+    }
+
+    #[test]
     fn dontneed_does_not_punch_past_region() {
         const REGION_SIZE: usize = 1 << 20;
 
@@ -938,7 +1017,7 @@ mod tests {
         file.write_all_at(&vec![0xaa; REGION_SIZE], REGION_SIZE as u64)
             .unwrap();
 
-        let mem = GuestMemoryMmap::from_ranges_with_files([(
+        let mem = GuestMemory::from_ranges_with_files([(
             GuestAddress(0),
             REGION_SIZE,
             Some(FileOffset::new(file.try_clone().unwrap(), 0)),

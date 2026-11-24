@@ -2,15 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::result;
-use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::atomic::{AtomicU16, Ordering};
+use std::sync::{Arc, Mutex};
 
 use log::{error, info};
 use net_util::{CtrlQueue, MacAddr, VirtioNetConfig};
 use seccompiler::SeccompAction;
-use vhost::vhost_user::message::{
-    VhostUserConfigFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
-};
+use vhost::vhost_user::message::{VhostUserConfigFlags, VhostUserProtocolFeatures};
 use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler};
 use virtio_bindings::virtio_net::{
     VIRTIO_NET_F_CSUM, VIRTIO_NET_F_CTRL_VQ, VIRTIO_NET_F_GUEST_ANNOUNCE, VIRTIO_NET_F_GUEST_CSUM,
@@ -31,9 +29,11 @@ use crate::device::ActivationContext;
 use crate::net::{AnnounceOps, AnnouncementState, Announcer, VirtioNetGuestAnnounceOps};
 use crate::seccomp_filters::Thread;
 use crate::vhost_user::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
-use crate::vhost_user::{DEFAULT_VIRTIO_FEATURES, Error, Result, VhostUserCommon, VhostUserState};
+use crate::vhost_user::{
+    DEFAULT_VIRTIO_FEATURES, Error, PostcopyHandler, Result, VhostUserCommon, VhostUserState,
+};
 use crate::{
-    ActivateError, ActivateResult, GuestRegionMmap, NetCtrlEpollHandler, VIRTIO_F_ACCESS_PLATFORM,
+    ActivateError, ActivateResult, GuestRegion, NetCtrlEpollHandler, VIRTIO_F_ACCESS_PLATFORM,
     VirtioCommon, VirtioDevice, VirtioDeviceType,
 };
 
@@ -85,6 +85,7 @@ impl Net {
         exit_evt: EventFd,
         access_platform_enabled: bool,
         state: Option<State>,
+        postcopy_handler: Option<Arc<dyn PostcopyHandler>>,
         offload_tso: bool,
         offload_ufo: bool,
         offload_csum: bool,
@@ -113,8 +114,8 @@ impl Net {
             info!("Restoring vhost-user-net {id}");
 
             vu.set_protocol_features_vhost_user(
-                state.acked_features,
                 state.acked_protocol_features,
+                postcopy_handler.is_some(),
             )?;
 
             vu.restore_state(&state)?;
@@ -177,8 +178,12 @@ impl Net {
                 | VhostUserProtocolFeatures::DEVICE_STATE
                 | VhostUserProtocolFeatures::CONFIG;
 
-            let (backend_acked_features, acked_protocol_features) =
-                vu.negotiate_features_vhost_user(backend_avail_features, avail_protocol_features)?;
+            let (backend_acked_features, acked_protocol_features) = vu
+                .negotiate_features_vhost_user(
+                    backend_avail_features,
+                    avail_protocol_features,
+                    postcopy_handler.is_some(),
+                )?;
 
             let backend_num_queues =
                 if acked_protocol_features & VhostUserProtocolFeatures::MQ.bits() != 0 {
@@ -251,11 +256,7 @@ impl Net {
 
             (
                 guest_avail_features,
-                // If part of the available features that have been acked,
-                // the PROTOCOL_FEATURES bit must be already set through
-                // the VIRTIO acked features as we know the guest would
-                // never ack it, thus the feature would be lost.
-                backend_acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits(),
+                0,
                 acked_protocol_features,
                 vu_num_queues,
                 config,
@@ -265,26 +266,29 @@ impl Net {
             )
         };
 
+        if let Some(postcopy_handler) = postcopy_handler {
+            vu.start_postcopy(id.clone(), postcopy_handler)?;
+        }
+
+        let virtio_common = VirtioCommon {
+            device_type: VirtioDeviceType::Net as u32,
+            queue_sizes: vec![vu_cfg.queue_size; num_queues as usize],
+            avail_features,
+            acked_features,
+            min_queues: DEFAULT_QUEUE_NUMBER,
+            ..VirtioCommon::new(paused).map_err(Error::CreateEventFd)?
+        };
+
         Ok(Net {
             id,
             vu_common: VhostUserCommon {
-                virtio_common: VirtioCommon {
-                    device_type: VirtioDeviceType::Net as u32,
-                    queue_sizes: vec![vu_cfg.queue_size; num_queues as usize],
-                    avail_features,
-                    acked_features,
-                    paused_sync: Some(Arc::new(Barrier::new(2))),
-                    min_queues: DEFAULT_QUEUE_NUMBER,
-                    paused: Arc::new(AtomicBool::new(paused)),
-                    ..Default::default()
-                },
                 vu: Some(Arc::new(Mutex::new(vu))),
                 acked_protocol_features,
                 socket_path: vu_cfg.socket,
                 vu_num_queues,
                 server,
                 vring_bases,
-                ..Default::default()
+                ..VhostUserCommon::new(virtio_common)
             },
             config,
             seccomp_action,
@@ -402,6 +406,7 @@ impl VirtioDevice for Net {
                     Arc::clone(&self.announce.pending),
                     self.config.max_virtqueue_pairs,
                     Arc::new(AtomicU16::new(1)),
+                    self.vu_common.virtio_common.acked_features,
                 ),
                 queue: ctrl_queue,
                 queue_evt: ctrl_queue_evt,
@@ -417,13 +422,6 @@ impl VirtioDevice for Net {
                 announcer,
             };
 
-            let paused = Arc::clone(&self.vu_common.virtio_common.paused);
-            // Let's update the barrier as we need 1 for the control queue
-            // thread + 1 for the common vhost-user thread + 1 for the main
-            // thread signalling the pause.
-            self.vu_common.virtio_common.paused_sync = Some(Arc::new(Barrier::new(3)));
-            let paused_sync = self.vu_common.virtio_common.paused_sync.clone();
-
             self.vu_common.virtio_common.spawn_worker(
                 &format!("{}_ctrl", self.id),
                 &self.seccomp_action,
@@ -431,7 +429,7 @@ impl VirtioDevice for Net {
                 &self.exit_evt,
                 Arc::clone(&device_status),
                 Arc::clone(&interrupt_cb),
-                move || ctrl_handler.run_ctrl(&paused, paused_sync.as_ref().unwrap()),
+                move |pause_common| ctrl_handler.run_ctrl(pause_common),
             )?;
         }
 
@@ -451,9 +449,6 @@ impl VirtioDevice for Net {
             pause_evt,
         )?;
 
-        let paused = Arc::clone(&self.vu_common.virtio_common.paused);
-        let paused_sync = self.vu_common.virtio_common.paused_sync.clone();
-
         self.vu_common.spawn_worker(
             &self.id,
             &self.seccomp_action,
@@ -461,7 +456,7 @@ impl VirtioDevice for Net {
             &self.exit_evt,
             Arc::clone(&device_status),
             Arc::clone(&interrupt_cb),
-            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            move |pause_common| handler.run(pause_common),
         )?;
 
         self.announce.notify(
@@ -482,10 +477,7 @@ impl VirtioDevice for Net {
         self.vu_common.shutdown();
     }
 
-    fn add_memory_region(
-        &mut self,
-        region: &Arc<GuestRegionMmap>,
-    ) -> result::Result<(), crate::Error> {
+    fn add_memory_region(&mut self, region: &Arc<GuestRegion>) -> result::Result<(), crate::Error> {
         self.vu_common.add_memory_region(region)
     }
 }
@@ -562,15 +554,14 @@ mod tests {
         acked_features: u64,
         interrupt_cb: Option<Arc<dyn VirtioInterrupt>>,
     ) -> Result<Net> {
+        let virtio_common = VirtioCommon {
+            acked_features,
+            interrupt_cb,
+            ..VirtioCommon::new(false).unwrap()
+        };
+
         Ok(Net {
-            vu_common: VhostUserCommon {
-                virtio_common: VirtioCommon {
-                    acked_features,
-                    interrupt_cb,
-                    ..Default::default()
-                },
-                ..Default::default()
-            },
+            vu_common: VhostUserCommon::new(virtio_common),
             id: "test-vu-net".to_string(),
             config: VirtioNetConfig::default(),
             seccomp_action: SeccompAction::Allow,

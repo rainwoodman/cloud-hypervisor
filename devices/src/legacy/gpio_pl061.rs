@@ -5,7 +5,6 @@
 //! ARM PrimeCell General Purpose Input/Output(PL061)
 //!
 //! This module implements an ARM PrimeCell General Purpose Input/Output(PL061) to support gracefully poweroff microvm from external.
-//!
 
 use std::sync::{Arc, Barrier};
 use std::{io, result};
@@ -355,8 +354,8 @@ mod tests {
             Ok(())
         }
 
-        fn notifier(&self, _index: InterruptIndex) -> Option<EventFd> {
-            Some(self.event_fd.try_clone().unwrap())
+        fn notifier(&self, _index: InterruptIndex) -> io::Result<Option<EventFd>> {
+            self.event_fd.try_clone().map(Some)
         }
     }
 

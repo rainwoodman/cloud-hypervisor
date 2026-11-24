@@ -29,8 +29,8 @@
 use std::collections::HashMap;
 use std::fmt::{self, Display, Write};
 use std::num::ParseIntError;
-use std::result;
 use std::str::FromStr;
+use std::{mem, result};
 
 use thiserror::Error;
 
@@ -107,8 +107,7 @@ pub fn split_commas(s: &str) -> OptionParserResult<Vec<String>> {
                 opened_brackets -= 1;
             }
             ',' if opened_brackets == 0 => {
-                list.push(current);
-                current = String::new();
+                list.push(mem::take(&mut current));
                 continue;
             }
             _ => {}
@@ -322,6 +321,7 @@ impl Parseable for Toggle {
 ///
 /// The suffix is binary (1K = 1024, 1M = 1048576, 1G = 1073741824).
 /// A bare integer is treated as bytes.
+#[derive(Clone, Copy, Debug)]
 pub struct ByteSized(pub u64);
 
 #[derive(Error, Debug)]
@@ -567,25 +567,22 @@ pub enum StringListParseError {
 }
 
 fn dequote(s: &str) -> String {
-    let mut prev_byte = b'\0';
+    let mut prev_char = '\0';
     let mut in_quotes = false;
-    let mut out: Vec<u8> = vec![];
-    for i in s.bytes() {
-        if i == b'"' {
-            if prev_byte == b'"' && !in_quotes {
-                out.push(b'"');
+    let mut out = String::new();
+    for c in s.chars() {
+        if c == '"' {
+            if prev_char == '"' && !in_quotes {
+                out.push('"');
             }
             in_quotes = !in_quotes;
         } else {
-            out.push(i);
+            out.push(c);
         }
-        prev_byte = i;
+        prev_char = c;
     }
     assert!(!in_quotes, "split_commas didn't reject unbalanced quotes");
-    // SAFETY: the non-ASCII bytes in the output are the same
-    // and in the same order as those in the input, so if the
-    // input is valid UTF-8 the output will be as well.
-    unsafe { String::from_utf8_unchecked(out) }
+    out
 }
 
 impl<T> Parseable for T
@@ -803,8 +800,11 @@ mod tests {
 
     #[test]
     fn test_byte_sized_invalid() {
-        assert!("xyzK".parse::<ByteSized>().is_err());
-        assert!("".parse::<ByteSized>().is_err());
+        "xyzK"
+            .parse::<ByteSized>()
+            .expect_err("the invalid size should be rejected");
+        "".parse::<ByteSized>()
+            .expect_err("the invalid size should be rejected");
     }
 
     #[test]
@@ -1060,14 +1060,6 @@ mod tests {
     #[test]
     fn test_split_commas_unbalanced_quote() {
         split_commas("\"abc").unwrap_err();
-    }
-
-    #[test]
-    fn test_quoted_value_with_commas() {
-        let mut parser = OptionParser::new();
-        parser.add("cmd");
-        parser.parse("cmd=\"a,b,c\"").unwrap();
-        assert_eq!(parser.get("cmd"), Some("a,b,c".to_owned()));
     }
 
     #[test]

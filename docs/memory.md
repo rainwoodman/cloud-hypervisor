@@ -7,34 +7,16 @@ meet the needs of very different use cases.
 ## Basic Parameters
 
 `MemoryConfig` or what is known as `--memory` from the CLI perspective is the
-easiest way to get started with Cloud Hypervisor.
-
-```rust
-struct MemoryConfig {
-    size: u64,
-    mergeable: bool,
-    hotplug_method: HotplugMethod,
-    hotplug_size: Option<u64>,
-    hotplugged_size: Option<u64>,
-    shared: bool,
-    hugepages: bool,
-    hugepage_size: Option<u64>,
-    prefault: bool,
-    reserve: bool,
-    thp: bool,
-    zones: Option<Vec<MemoryZoneConfig>>,
-}
-```
-
-```
---memory <memory>	Memory parameters "size=<guest_memory_size>,mergeable=on|off,shared=on|off,hugepages=on|off,hugepage_size=<hugepage_size>,hotplug_method=acpi|virtio-mem,hotplug_size=<hotpluggable_memory_size>,hotplugged_size=<hotplugged_memory_size>,prefault=on|off,reserve=on|off,thp=on|off" [default: size=512M,thp=on]
-```
+easiest way to get started with Cloud Hypervisor. See `cloud-hypervisor --help`
+for its syntax and defaults and `MemoryConfig` in the
+[OpenAPI spec](../vmm/src/api/openapi/cloud-hypervisor.yaml) for the JSON
+structure.
 
 ### `size`
 
 Size of the RAM in the guest VM.
 
-This option is mandatory when using the `--memory` parameter.
+If this option is not specified, the guest gets 512 MiB of RAM.
 
 Value is an unsigned integer of 64 bits.
 
@@ -54,6 +36,8 @@ KSM daemon.
 This option can be used when trying to reach a higher density of VMs running
 on a single host, as it will reduce the amount of memory consumed by each VM.
 
+This option cannot be combined with `shared=on`.
+
 By default this option is turned off.
 
 _Example_
@@ -68,10 +52,13 @@ Selects the way of adding and/or removing memory to/from a booted VM.
 
 Possible values are `acpi` and `virtio-mem`. Default value is `acpi`.
 
+ACPI memory hotplug is deprecated and will be removed in a future release.
+Use `hotplug_method=virtio-mem` instead.
+
 _Example_
 
 ```
---memory size=1G,hotplug_method=acpi
+--memory size=1G,hotplug_method=virtio-mem
 ```
 
 ### `hotplug_size`
@@ -83,7 +70,7 @@ Value is an unsigned integer of 64 bits. A value of 0 is invalid.
 _Example_
 
 ```
---memory size=1G,hotplug_size=1G
+--memory size=1G,hotplug_size=1G,hotplug_method=virtio-mem
 ```
 
 ### `hotplugged_size`
@@ -133,16 +120,18 @@ _Example_
 Specifies if the memory must be created and `mmap(2)` with `MAP_HUGETLB` and size
 flags. This performs a memory mapping relying on the specified huge page size.
 If no huge page size is supplied the system's default huge page size is used.
+Setting `hugepage_size` without `hugepages=on` is rejected.
 
 By using hugepages, one can improve the overall performance of the VM, assuming
 the guest will allocate hugepages as well. Another interesting use case is VFIO
 as it speeds up the VM's boot time since the amount of IOMMU mappings is reduced.
 
 The user is responsible for ensuring there are sufficient huge pages of the
-specified size for the VMM to use. Failure to do so may result in strange VMM
-behaviour, e.g. error with `ReadKernelImage` is common. If there is a strange
-error with `hugepages` enabled, just disable it or check whether there are enough
-huge pages.
+specified size for the VMM to use. Otherwise VM creation fails, as
+`hugepages=on` reserves the memory by default. With `reserve=off`, a shortfall
+may instead result in strange VMM behaviour, e.g. error with `ReadKernelImage`
+is common. If there is a strange error with `hugepages` enabled, just disable it
+or check whether there are enough huge pages.
 
 If `hugepages=on` then the value of `shared` is ignored as huge pages always
 requires `MAP_SHARED`.
@@ -186,19 +175,20 @@ Specifies if guest memory should be `mmap(2)`-ed _without_ the `MAP_NORESERVE`
 flag, asking the kernel to reserve the backing pages (swap space, or huge pages
 for hugepage-backed memory) for the whole region up front at `mmap` time.
 
-By default Cloud Hypervisor maps guest memory with `MAP_NORESERVE`, so VM
-creation succeeds even when the backing pool cannot satisfy the full guest size.
-The shortfall then surfaces only later, as a `SIGBUS` delivered to the guest when
-it faults a page the pool cannot back. With `reserve=on` the reservation is made
-when the memory is mapped, so an over-committed configuration fails cleanly at VM
-creation with an out-of-memory error instead of crashing the guest at run time.
-This is most useful for hugepage-backed memory, where the huge pages are reserved
-from the pool.
+With `reserve=off` Cloud Hypervisor maps guest memory with `MAP_NORESERVE`, so
+VM creation succeeds even when the backing pool cannot satisfy the full guest
+size. The shortfall then surfaces only later, as a `SIGBUS` delivered to the
+guest when it faults a page the pool cannot back. With `reserve=on` the
+reservation is made when the memory is mapped, so an over-committed
+configuration fails cleanly at VM creation with an out-of-memory error instead
+of crashing the guest at run time. This is most useful for hugepage-backed
+memory, where the huge pages are reserved from the pool.
 
 Unlike `prefault`, this does not populate or fault in the memory, so it does not
 slow down boot; it only reserves it.
 
-By default this option is turned off.
+By default this option has the same value as `hugepages`: it is on with
+`hugepages=on` and off otherwise.
 
 _Example_
 
@@ -242,33 +232,25 @@ boot memory maps and ACPI tables mark it reserved.
 is a power user parameter. It allows for a full description of the guest RAM,
 describing how every memory region is backed and exposed to the guest.
 
-```rust
-struct MemoryZoneConfig {
-    id: String,
-    size: u64,
-    file: Option<PathBuf>,
-    shared: bool,
-    hugepages: bool,
-    hugepage_size: Option<u64>,
-    host_numa_node: Option<u32>,
-    hotplug_size: Option<u64>,
-    hotplugged_size: Option<u64>,
-    prefault: bool,
-    reserve: bool,
-    mergeable: bool,
-}
-```
-
-```
---memory-zone <memory-zone>	User defined memory zone parameters "size=<guest_memory_region_size>,file=<backing_file>,shared=on|off,hugepages=on|off,hugepage_size=<hugepage_size>,host_numa_node=<node_id>,id=<zone_identifier>,hotplug_size=<hotpluggable_memory_size>,hotplugged_size=<hotplugged_memory_size>,prefault=on|off,reserve=on|off,mergeable=on|off"
-```
-
 This parameter expects one or more occurrences, allowing for a list of memory
 zones to be defined. It must be used with `--memory size=0`, clearly indicating
 that the memory will be described through advanced parameters.
 
 Each zone is given a list of options which we detail through the following
-sections.
+sections. See `cloud-hypervisor --help` for the syntax and `MemoryZoneConfig` in
+the [OpenAPI spec](../vmm/src/api/openapi/cloud-hypervisor.yaml) for the
+JSON structure.
+
+The `shared`, `hugepages`, `hugepage_size`, `hotplugged_size`, `prefault`, and
+`reserve` options work like the `--memory` options of the same name in
+[Basic Parameters](#basic-parameters), but apply to the zone only. Caveats
+specific to zones:
+
+- `hotplug_method` and `thp` can only be set on `--memory` and apply to all
+  zones.
+- `hotplugged_size` needs `hotplug_size` on the same zone and must not exceed
+  it.
+- A zone with `shared=on` and a `file` can't use `host_numa_node`.
 
 ### `id`
 
@@ -312,10 +294,11 @@ the backing file for the `mmap(2)` operation.
 
 This option can be particularly useful when trying to back a part of the guest
 RAM with a well known file. In the context of the snapshot/restore feature, and
-if the provided path is a file, the snapshot operation will not perform any
-copy of the guest RAM content for this specific memory zone since the user has
-access to it and it would duplicate data already stored on the current
-filesystem.
+if the provided path is a file and the zone uses `shared=on`, the snapshot
+operation will not perform any copy of the guest RAM content for this specific
+memory zone since the user has access to it and it would duplicate data
+already stored on the current filesystem. With `shared=off`, guest writes do
+not reach the file, so the snapshot copies the zone content.
 
 Value is a string.
 
@@ -326,56 +309,6 @@ _Example_
 --memory-zone id=mem0,size=1G,file=/foo/bar
 ```
 
-### `shared`
-
-Specifies if the memory zone must be `mmap(2)` with `MAP_SHARED` flag.
-
-By sharing a memory zone mapping, one can share part of the guest RAM with
-other processes running on the host. One can use this option when running
-vhost-user devices as part of the VM device model, as they will be driven
-by standalone daemons needing access to the guest RAM content.
-
-If `hugepages=on` then the value of this field is ignored as huge pages always
-require `MAP_SHARED`.
-
-By default this option is turned off, which results in performing `mmap(2)`
-with `MAP_PRIVATE` flag.
-
-_Example_
-
-```
---memory size=0
---memory-zone id=mem0,size=1G,shared=on
-```
-
-### `hugepages` and `hugepage_size`
-
-Specifies if the memory must be created and `mmap(2)` with `MAP_HUGETLB` and size
-flags. This performs a memory mapping relying on the specified huge page size.
-If no huge page size is supplied the system's default huge page size is used.
-
-By using hugepages, one can improve the overall performance of the VM, assuming
-the guest will allocate hugepages as well. Another interesting use case is VFIO
-as it speeds up the VM's boot time since the amount of IOMMU mappings is reduced.
-
-The user is responsible for ensuring there are sufficient huge pages of the
-specified size for the VMM to use. Failure to do so may result in strange VMM
-behaviour, e.g. error with `ReadKernelImage` is common. If there is a strange
-error with `hugepages` enabled, just disable it or check whether there are enough
-huge pages.
-
-If `hugepages=on` then the value of `shared` is ignored as huge pages always
-require `MAP_SHARED`.
-
-By default this option is turned off.
-
-_Example_
-
-```
---memory size=0
---memory-zone id=mem0,size=1G,hugepages=on,hugepage_size=2M
-```
-
 ### `host_numa_node`
 
 Node identifier of a node present on the host. This option will let the user
@@ -383,6 +316,7 @@ pick a specific NUMA node from which the memory must be allocated. After the
 memory zone is `mmap(2)`, the NUMA policy for this memory mapping will be
 applied through `mbind(2)`, relying on the provided node identifier. If the
 node does not exist on the host, the call to `mbind(2)` will fail.
+This option cannot be combined with a `file` mapped with `shared=on`.
 
 This option is useful when trying to back a VM memory with a specific type of
 memory from the host. Assuming a host has two types of memory, with one slower
@@ -418,82 +352,6 @@ _Example_
 --memory-zone id=mem0,size=1G,hotplug_size=1G
 ```
 
-### `hotplugged_size`
-
-Amount of memory that will be dynamically added to a memory zone at VM's boot.
-This option allows for starting a VM with a certain amount of memory that can
-be reduced during runtime.
-
-This is only valid when the `hotplug_method` is `virtio-mem` as it does not
-make sense for the `acpi` use case. When using ACPI, the memory can't be
-resized after it has been extended.
-
-This option is only valid when `hotplug_size` is specified, and its value can't
-exceed the value of `hotplug_size`.
-
-Value is an unsigned integer of 64 bits. A value of 0 is invalid.
-
-_Example_
-
-```
---memory size=0,hotplug_method=virtio-mem
---memory-zone id=mem0,size=1G,hotplug_size=1G,hotplugged_size=512M
-```
-
-### `prefault`
-
-Specifies whether this memory zone should be prefaulted with `madvise(2)` using
-`MADV_POPULATE_WRITE` after it is `mmap(2)`-ed.
-
-With prefault enabled, Cloud Hypervisor allocates the required physical memory
-and creates its page tables before the VM starts. This reduces page faults at
-runtime and can surface insufficient backing memory during VM creation. If
-prefaulting fails, VM creation fails with an error.
-
-Note that boot of VM will be slower with `prefault` enabled because of allocating
-physical memory and creating page tables in advance, and physical memory of the
-specified size will be consumed quickly.
-
-This option only takes effect at boot of VM. There is also a `prefault` option in
-restore and its choice will overwrite `prefault` in memory.
-
-By default, this option is turned off.
-
-_Example_
-
-```
---memory size=0
---memory-zone id=mem0,size=1G,prefault=on
-```
-
-### `reserve`
-
-Specifies if the memory for this zone should be `mmap(2)`-ed _without_ the
-`MAP_NORESERVE` flag, asking the kernel to reserve the backing pages (swap space,
-or huge pages for hugepage-backed memory) for the whole zone up front at `mmap`
-time.
-
-By default Cloud Hypervisor maps guest memory with `MAP_NORESERVE`, so VM
-creation succeeds even when the backing pool cannot satisfy the full zone size.
-The shortfall then surfaces only later, as a `SIGBUS` delivered to the guest when
-it faults a page the pool cannot back. With `reserve=on` the reservation is made
-when the memory is mapped, so an over-committed configuration fails cleanly at VM
-creation with an out-of-memory error instead of crashing the guest at run time.
-This is most useful for hugepage-backed zones, where the huge pages are reserved
-from the pool.
-
-Unlike `prefault`, this does not populate or fault in the memory, so it does not
-slow down boot; it only reserves it.
-
-By default this option is turned off.
-
-_Example_
-
-```
---memory size=0
---memory-zone id=mem0,size=1G,hugepages=on,reserve=on
-```
-
 ### `mergeable`
 
 Specifies if the pages from this memory zone must be marked as _mergeable_,
@@ -504,8 +362,9 @@ It allows KSM to be enabled selectively — for example, enabling it only on a
 hotplug zone while leaving boot memory unaffected:
 
 ```
---memory size=2G,mergeable=off
---memory-zone id=hotplug,size=0,hotplug_size=8G,mergeable=on
+--memory size=0,hotplug_method=virtio-mem
+--memory-zone id=boot,size=2G,mergeable=off \
+    id=hotplug,size=1G,hotplug_size=8G,mergeable=on
 ```
 
 For KSM to have any effect, the host kernel must have KSM enabled:
@@ -513,7 +372,9 @@ For KSM to have any effect, the host kernel must have KSM enabled:
 echo 1 > /sys/kernel/mm/ksm/run
 ```
 
-By default this option is turned off.
+On the command line, a zone without `mergeable` inherits the value of
+`--memory`, which is off by default. In the REST API, a zone without
+`mergeable` is always off, independent of the top-level `memory.mergeable`.
 
 _Example_
 
@@ -531,19 +392,9 @@ it allows for specifying the distance between each NUMA node.
 
 Furthermore, it supports ACPI Generic Initiator Affinity (SRAT Type 5), which allows VFIO-PCI devices (such as GPUs) to be associated with NUMA nodes that are {memory,cpu}-less. Detailed configuration for this feature can be found under the device_id parameter.
 
-```rust
-struct NumaConfig {
-    guest_numa_id: u32,
-    cpus: Option<Vec<u32>>,
-    distances: Option<Vec<NumaDistance>>,
-    memory_zones: Option<Vec<String>>,
-    device_id: Option<String>,
-}
-```
-
-```
---numa <numa>	Settings related to a given NUMA node "guest_numa_id=<node_id>,cpus=<cpus_id>,distances=<list_of_distances_to_destination_nodes>,memory_zones=<list_of_memory_zones>,device_id=<device_identifier>"
-```
+See `cloud-hypervisor --help` for the `--numa` syntax and `NumaConfig` in the
+[OpenAPI spec](../vmm/src/api/openapi/cloud-hypervisor.yaml) for the JSON
+structure.
 
 ### `guest_numa_id`
 
@@ -630,10 +481,14 @@ _Example_
 
 ```
 # Explicit bidirectional distances
---numa guest_numa_id=0,distances=[1@15,2@25] guest_numa_id=1,distances=[0@15,2@20] guest_numa_id=2,distances=[0@25,1@20]
+--numa guest_numa_id=0,cpus=[0],distances=[1@15,2@25] \
+    guest_numa_id=1,cpus=[1],distances=[0@15,2@20] \
+    guest_numa_id=2,cpus=[2],distances=[0@25,1@20]
 
 # Simplified with symmetry - only specify in one direction
---numa guest_numa_id=0,distances=[1@15,2@25] guest_numa_id=1,distances=[2@20]
+--numa guest_numa_id=0,cpus=[0],distances=[1@15,2@25] \
+    guest_numa_id=1,cpus=[1],distances=[2@20] \
+    guest_numa_id=2,cpus=[2]
 # Results in the same topology: 0↔1=15, 0↔2=25, 1↔2=20
 
 # Using defaults - only specify non-default distances
@@ -713,18 +568,21 @@ _Example_
 In this configuration:
 - Node 0: CPUs 0-1, 2GB memory
 - Node 1: CPUs 2-3, 2GB memory
-- Node 2 (auto-assigned): GPU device, closer to node 0 (distance=25) than node 1 (distance=30)
+- Node 2: GPU device, closer to node 0 (distance=25) than node 1 (distance=30)
 
 ### PCI bus
 
 Cloud Hypervisor supports guests with one or more PCI segments. The default PCI segment always
 has affinity to NUMA node 0. By default, all other PCI segments have affinity to NUMA node 0.
-The user may configure the NUMA affinity for any additional PCI segments.
+The user may configure the NUMA affinity for any additional PCI segments with
+the `pci_segments` option of `--numa`. Each segment must exist on the platform
+and belong to a single NUMA node, and segment 0 can only belong to node 0.
 
 _Example_
 
 ```
 --platform num_pci_segments=2
+--memory size=0
 --memory-zone size=16G,host_numa_node=0,id=mem0
 --memory-zone size=16G,host_numa_node=1,id=mem1
 --numa guest_numa_id=0,memory_zones=mem0,pci_segments=[0]

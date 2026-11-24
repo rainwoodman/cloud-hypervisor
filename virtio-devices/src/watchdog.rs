@@ -10,8 +10,7 @@ use std::io::{self, Read};
 #[cfg(fuzzing)]
 use std::mem;
 use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 use std::{ptr, result};
 
@@ -34,7 +33,8 @@ use super::{
 };
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
-use crate::{GuestMemoryMmap, VirtioInterrupt, VirtioInterruptType};
+use crate::thread_helper::PauseCommon;
+use crate::{GuestMemory, VirtioInterrupt, VirtioInterruptType};
 
 const QUEUE_SIZE: u16 = 8;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
@@ -66,7 +66,7 @@ enum Error {
 }
 
 struct WatchdogEpollHandler {
-    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    mem: GuestMemoryAtomic<GuestMemory>,
     queue: Queue,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     queue_evt: EventFd,
@@ -100,13 +100,14 @@ impl WatchdogEpollHandler {
                 .map_err(Error::GuestMemoryWrite)?;
 
             // If this is the first "ping" then setup the timer
-            if self.last_ping_time.lock().unwrap().is_none() {
+            let mut last_ping_time = self.last_ping_time.lock().unwrap();
+            if last_ping_time.is_none() {
                 info!(
                     "First ping received. Starting timer (every {WATCHDOG_TIMER_INTERVAL} seconds)"
                 );
                 timerfd_setup(&self.timer, WATCHDOG_TIMER_INTERVAL).map_err(Error::TimerfdSetup)?;
             }
-            self.last_ping_time.lock().unwrap().replace(Instant::now());
+            last_ping_time.replace(Instant::now());
 
             queue
                 .add_used(desc_chain.memory(), desc_chain.head_index(), desc.len())
@@ -126,15 +127,11 @@ impl WatchdogEpollHandler {
             })
     }
 
-    fn run(
-        &mut self,
-        paused: &AtomicBool,
-        paused_sync: &Barrier,
-    ) -> result::Result<(), EpollHelperError> {
+    fn run(&mut self, pause_common: &PauseCommon) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
         helper.add_event(self.queue_evt.as_raw_fd(), QUEUE_AVAIL_EVENT)?;
         helper.add_event(self.timer.as_raw_fd(), TIMER_EXPIRED_EVENT)?;
-        helper.run(paused, paused_sync, self)?;
+        helper.run(pause_common, self)?;
 
         Ok(())
     }
@@ -250,12 +247,10 @@ impl Watchdog {
             common: VirtioCommon {
                 device_type: VirtioDeviceType::Watchdog as u32,
                 queue_sizes: QUEUE_SIZES.to_vec(),
-                paused_sync: Some(Arc::new(Barrier::new(2))),
                 avail_features,
                 acked_features,
                 min_queues: 1,
-                paused: Arc::new(AtomicBool::new(paused)),
-                ..Default::default()
+                ..VirtioCommon::new(paused)?
             },
             id,
             seccomp_action,
@@ -400,9 +395,6 @@ impl VirtioDevice for Watchdog {
             reset_evt,
         };
 
-        let paused = Arc::clone(&self.common.paused);
-        let paused_sync = self.common.paused_sync.clone();
-
         self.common.spawn_worker(
             &self.id,
             &self.seccomp_action,
@@ -410,7 +402,7 @@ impl VirtioDevice for Watchdog {
             &self.exit_evt,
             Arc::clone(&device_status),
             Arc::clone(&interrupt_cb),
-            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            move |pause_common| handler.run(pause_common),
         )?;
 
         event!("virtio-device", "activated", "id", &self.id);
@@ -433,9 +425,9 @@ impl Pausable for Watchdog {
 
     fn resume(&mut self) -> result::Result<(), MigratableError> {
         // Reset the timer on pause if it was previously used
-        if self.last_ping_time.lock().unwrap().is_some() {
+        if let Some(last_ping_time) = self.last_ping_time.lock().unwrap().as_mut() {
             info!("Watchdog resumed - enabling timer (every {WATCHDOG_TIMER_INTERVAL} seconds)");
-            self.last_ping_time.lock().unwrap().replace(Instant::now());
+            *last_ping_time = Instant::now();
             #[cfg(fuzzing)]
             let setup = if self.fuzz_one_shot {
                 timerfd_setup_one_shot(&self.timer, 0, 1)

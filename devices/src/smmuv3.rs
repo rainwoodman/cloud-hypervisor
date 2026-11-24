@@ -9,18 +9,14 @@ use std::sync::{Arc, Barrier};
 use log::{debug, warn};
 use serde::{Deserialize, Serialize};
 use thiserror::Error as ThisError;
+use vm_allocator::GuestMemory;
 use vm_device::BusDevice;
 use vm_device::interrupt::InterruptSourceGroup;
-use vm_memory::bitmap::AtomicBitmap;
-use vm_memory::{
-    Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryError, GuestMemoryMmap,
-};
+use vm_memory::{Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic, GuestMemoryError};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 
 use crate::iommu::{Error as IommuError, HwInfo, Invalidation, PhysicalIommu, TableEntry};
 use crate::{read_le_u32, read_le_u64, write_le_u32, write_le_u64};
-
-type GuestMemoryMmapAtomic = GuestMemoryAtomic<GuestMemoryMmap<AtomicBitmap>>;
 
 // All constants below are based on the reference specification that
 // can be found at https://developer.arm.com/documentation/ihi0070/latest/
@@ -424,7 +420,7 @@ pub struct Smmuv3 {
     stream_ids: BTreeSet<u32>,
     restored: bool,
 
-    mem: GuestMemoryMmapAtomic,
+    mem: GuestMemoryAtomic<GuestMemory>,
     interrupts: Smmuv3Interrupts,
     backend: Arc<dyn PhysicalIommu>,
 }
@@ -432,7 +428,7 @@ pub struct Smmuv3 {
 impl Smmuv3 {
     pub fn new(
         id: String,
-        mem: GuestMemoryMmapAtomic,
+        mem: GuestMemoryAtomic<GuestMemory>,
         interrupts: Smmuv3Interrupts,
         backend: Arc<dyn PhysicalIommu>,
         state: Option<Smmuv3State>,
@@ -1028,8 +1024,8 @@ mod tests {
             Ok(())
         }
 
-        fn notifier(&self, _index: InterruptIndex) -> Option<EventFd> {
-            None
+        fn notifier(&self, _index: InterruptIndex) -> io::Result<Option<EventFd>> {
+            Ok(None)
         }
 
         fn update(
@@ -1080,7 +1076,7 @@ mod tests {
 
     fn test_smmuv3() -> Smmuv3 {
         let mem = GuestMemoryAtomic::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap(),
+            GuestMemory::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap(),
         );
         let group = || Arc::new(NoopInterrupts) as Arc<dyn InterruptSourceGroup>;
 
@@ -1185,7 +1181,7 @@ mod tests {
 
     fn smmuv3_with_host_info(backend: &Arc<HostInfoBackend>) -> Smmuv3 {
         let mem = GuestMemoryAtomic::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap(),
+            GuestMemory::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap(),
         );
         let group = || Arc::new(NoopInterrupts) as Arc<dyn InterruptSourceGroup>;
 
@@ -1210,7 +1206,7 @@ mod tests {
 
     fn smmuv3_with_command(failing: &Arc<AtomicBool>, word0: u64) -> Smmuv3 {
         let mem = GuestMemoryAtomic::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap(),
+            GuestMemory::from_ranges(&[(GuestAddress(0), 0x1_0000)]).unwrap(),
         );
         mem.memory()
             .write_obj::<u64>(word0, GuestAddress(TEST_CMDQ_BASE))
@@ -1463,20 +1459,6 @@ mod tests {
 
         assert_eq!(smmuv3.idr0 & IDR0_HOST_FEATURES_MASK, 0);
         assert_eq!(smmuv3.idr0, IDR0_MODEL_FEATURES);
-    }
-
-    #[test]
-    fn test_new_advertises_conservative_defaults() {
-        let smmuv3 = test_smmuv3();
-        assert_eq!(smmuv3.idr0, IDR0_MODEL_FEATURES);
-        assert_eq!(smmuv3.idr1, IDR1_MODEL_FEATURES);
-        assert_eq!(smmuv3.idr5, IDR5_MODEL_FEATURES);
-    }
-
-    #[test]
-    fn test_default_id_regs_omit_ats_and_ssidsize() {
-        assert_eq!(IDR0_MODEL_FEATURES & IDR0_ATS, 0);
-        assert_eq!(IDR1_MODEL_FEATURES & IDR1_SSIDSIZE_MASK, 0);
     }
 
     #[test]

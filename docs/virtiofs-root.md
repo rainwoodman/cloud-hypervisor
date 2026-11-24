@@ -7,12 +7,9 @@ setup.
 
 ## Prerequisites
 
-1. virtiofsd from the qemu project
-   * We are using the Qemu version for now
-   * There is a Rust version being worked on that may be a better option in the future
-   * Part of the qemu-system-common package on Ubuntu
-   * Part of the qemu-common package on Fedora
-2. cloud-hypervisor - the newer the better, but I tested with 0.12
+1. virtiofsd from the virtio-fs project
+   * Build it as described in [How to use virtio-fs](fs.md#the-daemon)
+2. cloud-hypervisor - the newer the better
 3. a rootfs - This howto uses an alpine rootfs available here:
    * https://dl-cdn.alpinelinux.org/alpine/v3.13/releases/x86_64/alpine-minirootfs-3.13.2-x86_64.tar.gz
    * Others should work
@@ -73,7 +70,6 @@ sudo cloud-hypervisor \
     --memory size=2G,shared=on \
     --cmdline "console=hvc0 rootfstype=virtiofs root=/dev/root ro debug" \
     --api-socket $PWD/ch.sock \
-    --rng \
     --net ...
 ```
 

@@ -68,9 +68,9 @@ pub enum Error {
 }
 
 pub const SYNTAX: &str = "vhost-user-net backend parameters \
-\"ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,host_mac=<mac_addr>,mtu=<mtu>,\
-socket=<socket_path>,client=on|off,num_queues=<number_of_queues>,\
-queue_size=<size_of_each_queue>,tap=<if_name>\"";
+    \"ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,host_mac=<mac_addr>,mtu=<mtu>,\
+    socket=<socket_path>,client=on|off,num_queues=<number_of_queues>,\
+    queue_size=<size_of_each_queue>,tap=<if_name>\"";
 
 impl From<Error> for io::Error {
     fn from(e: Error) -> Self {
@@ -92,7 +92,7 @@ impl VhostUserNetThread {
                 tap_for_write_epoll: tap.clone(),
                 tap,
                 rx: RxVirtio::new(),
-                tx: TxVirtio::new(false),
+                tx: TxVirtio::new(0),
                 rx_tap_listening: false,
                 tx_tap_listening: false,
                 epoll_fd: None,
@@ -212,14 +212,13 @@ impl VhostUserBackendMut for VhostUserNetBackend {
     }
 
     fn acked_features(&mut self, features: u64) {
-        let host_checksum_offload = features & (1 << VIRTIO_NET_F_CSUM) != 0;
         for thread in &mut self.threads {
             thread
                 .get_mut()
                 .unwrap()
                 .net
                 .tx
-                .set_host_checksum_offload(host_checksum_offload);
+                .set_acked_features(features);
         }
     }
 
@@ -231,6 +230,7 @@ impl VhostUserBackendMut for VhostUserNetBackend {
         VhostUserProtocolFeatures::MQ
             | VhostUserProtocolFeatures::REPLY_ACK
             | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
+            | VhostUserProtocolFeatures::PAGEFAULT
             | if self.config.is_some() {
                 VhostUserProtocolFeatures::CONFIG
             } else {
@@ -420,45 +420,62 @@ pub fn start_net_backend(backend_command: &str) {
 
     let mem = GuestMemoryAtomic::new(GuestMemoryMmap::new());
 
-    let net_backend = Arc::new(RwLock::new(
-        VhostUserNetBackend::new(
-            backend_config.ip,
-            backend_config.host_mac,
-            backend_config.mac,
-            backend_config.mask,
-            backend_config.mtu,
-            backend_config.num_queues,
-            backend_config.queue_size,
-            tap,
-            mem.clone(),
-        )
-        .unwrap(),
-    ));
+    let net_backend = match VhostUserNetBackend::new(
+        backend_config.ip,
+        backend_config.host_mac,
+        backend_config.mac,
+        backend_config.mask,
+        backend_config.mtu,
+        backend_config.num_queues,
+        backend_config.queue_size,
+        tap,
+        mem.clone(),
+    ) {
+        Ok(backend) => Arc::new(RwLock::new(backend)),
+        Err(e) => {
+            error!("Failed to create vhost-user-net backend: {e:?}");
+            process::exit(1);
+        }
+    };
 
-    let mut net_daemon = VhostUserDaemon::new(
+    let mut net_daemon = match VhostUserDaemon::new(
         "vhost-user-net-backend".to_string(),
         Arc::clone(&net_backend),
         mem,
-    )
-    .unwrap();
+    ) {
+        Ok(daemon) => daemon,
+        Err(e) => {
+            error!("Failed to create vhost-user-net daemon: {e:?}");
+            process::exit(1);
+        }
+    };
 
     let epoll_handlers = net_daemon.get_epoll_handlers();
-    if epoll_handlers.len() != net_backend.read().unwrap().threads.len() {
-        error!("Number of vring workers must be identical to the number of backend threads");
-        process::exit(1);
-    }
+    {
+        let net_backend = net_backend.read().unwrap();
+        if epoll_handlers.len() != net_backend.threads.len() {
+            error!("Number of vring workers must be identical to the number of backend threads");
+            process::exit(1);
+        }
 
-    for (index, thread) in net_backend.read().unwrap().threads.iter().enumerate() {
-        thread
-            .lock()
-            .unwrap()
-            .set_epoll_fd(epoll_handlers[index].as_raw_fd());
+        for (index, thread) in net_backend.threads.iter().enumerate() {
+            thread
+                .lock()
+                .unwrap()
+                .set_epoll_fd(epoll_handlers[index].as_raw_fd());
+        }
     }
 
     if let Err(e) = if backend_config.client {
         net_daemon.start_client(&backend_config.socket)
     } else {
-        net_daemon.start(&mut Listener::new(&backend_config.socket, true).unwrap())
+        match Listener::new(&backend_config.socket, true) {
+            Ok(mut listener) => net_daemon.start(&mut listener),
+            Err(e) => {
+                error!("Failed to listen on vhost-user-net socket: {e:?}");
+                process::exit(1);
+            }
+        }
     } {
         error!("failed to start daemon for vhost-user-net with error: {e:?}");
         process::exit(1);

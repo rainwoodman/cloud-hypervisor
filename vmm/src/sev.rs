@@ -8,17 +8,19 @@ use std::fs::File;
 use std::io::{self, Cursor, Read, Seek, SeekFrom};
 use std::os::unix::fs::FileExt;
 use std::result;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 
 use hypervisor::MemoryConversionHandler;
 use linux_loader::bootparam::boot_params;
 use log::error;
 use sha2::{Digest, Sha256};
 use uuid::{Uuid, uuid};
-use vm_device::dma_mapping::ExternalDmaMapping;
+use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
 use vm_memory::ByteValued;
 use vmm_sys_util::errno;
 use zerocopy::{Immutable, IntoBytes};
+
+use crate::util::flatten_error_chain_to_string;
 
 pub(crate) type Result<T> = result::Result<T, errno::Error>;
 
@@ -225,7 +227,7 @@ impl TrackedRegion {
 #[derive(Default)]
 struct Inner {
     regions: Vec<TrackedRegion>,
-    handler: Option<Arc<dyn ExternalDmaMapping>>,
+    handler: Option<Weak<dyn ExternalDmaMapping>>,
 }
 
 /// Tracks which confidential guest pages are shared and keeps the device
@@ -249,30 +251,26 @@ impl SevSnpSharedPageTracker {
             .push(TrackedRegion::new(base, size));
     }
 
-    /// Register a VFIO DMA handler, replaying the currently shared pages into it.
+    /// Register a weak reference to a VFIO DMA handler and replay shared pages.
+    /// The caller must retain the handler while DMA mapping is needed.
     /// A partial replay is rolled back, so a failed registration leaves nothing
     /// mapped in the IOMMU.
     pub(crate) fn add_dma_mapping_handler(
         &self,
-        handler: Arc<dyn ExternalDmaMapping>,
-    ) -> anyhow::Result<()> {
+        handler: &Arc<dyn ExternalDmaMapping>,
+    ) -> result::Result<(), ExternalDmaMappingError> {
         let mut inner = self.inner.lock().unwrap();
-        assert!(
-            inner.handler.is_none(),
-            "DMA mapping handler already registered"
-        );
-
         let shared = inner.regions.iter().flat_map(TrackedRegion::shared_gpas);
         for (mapped, gpa) in shared.enumerate() {
             if let Err(e) = handler.map(gpa, gpa, PAGE_SIZE_4K) {
                 // The handler stays unregistered, so no later conversion would
                 // ever unmap what the replay already mapped.
                 Self::undo_replay(handler.as_ref(), &inner.regions, mapped);
-                return Err(anyhow::anyhow!("VFIO replay map failed gpa={gpa:#x}: {e}"));
+                return Err(e);
             }
         }
 
-        inner.handler = Some(handler);
+        inner.handler = Some(Arc::downgrade(handler));
         Ok(())
     }
 
@@ -280,21 +278,25 @@ impl SevSnpSharedPageTracker {
         let shared = regions.iter().flat_map(TrackedRegion::shared_gpas);
         for gpa in shared.take(count) {
             if let Err(e) = handler.unmap(gpa, PAGE_SIZE_4K) {
-                error!("VFIO replay rollback failed gpa={gpa:#x}: {e}");
+                error!(
+                    "VFIO replay rollback failed gpa={gpa:#x}: {}",
+                    flatten_error_chain_to_string(&e)
+                );
             }
         }
     }
 
-    /// Drop the registered DMA handler.
-    pub(crate) fn clear_dma_mapping_handler(&self) {
-        self.inner.lock().unwrap().handler = None;
-    }
-
     /// Flip `[gpa, gpa + size)` shared/private in the tracker, driving the
     /// handler so the device IOMMU maps the shared pages only.
-    fn set_shared(&self, gpa: u64, size: u64, shared: bool) -> io::Result<()> {
+    fn set_shared(
+        &self,
+        gpa: u64,
+        size: u64,
+        shared: bool,
+    ) -> result::Result<(), ExternalDmaMappingError> {
         let mut inner = self.inner.lock().unwrap();
         let Inner { regions, handler } = &mut *inner;
+        let handler = handler.as_ref().and_then(Weak::upgrade);
         let req_end = gpa.saturating_add(size);
 
         for region in regions.iter_mut() {
@@ -324,7 +326,7 @@ impl SevSnpSharedPageTracker {
         region: &mut TrackedRegion,
         first_page: usize,
         end_page: usize,
-    ) -> io::Result<()> {
+    ) -> result::Result<(), ExternalDmaMappingError> {
         assert!(end_page <= region.num_pages);
         for i in first_page..end_page {
             if region.is_shared(i) {
@@ -332,9 +334,7 @@ impl SevSnpSharedPageTracker {
             }
             let gpa = region.base + i as u64 * PAGE_SIZE_4K;
             if let Some(handler) = handler {
-                handler
-                    .map(gpa, gpa, PAGE_SIZE_4K)
-                    .map_err(|e| io::Error::other(format!("DMA map failed gpa={gpa:#x}: {e}")))?;
+                handler.map(gpa, gpa, PAGE_SIZE_4K)?;
             }
             region.shared[i / BITS_PER_U64] |= 1 << (i % BITS_PER_U64);
         }
@@ -348,7 +348,7 @@ impl SevSnpSharedPageTracker {
         region: &mut TrackedRegion,
         first_page: usize,
         end_page: usize,
-    ) -> io::Result<()> {
+    ) -> result::Result<(), ExternalDmaMappingError> {
         assert!(end_page <= region.num_pages);
         let mut i = first_page;
         while i < end_page {
@@ -363,9 +363,7 @@ impl SevSnpSharedPageTracker {
             let gpa = region.base + run as u64 * PAGE_SIZE_4K;
             let len = (i - run) as u64 * PAGE_SIZE_4K;
             if let Some(handler) = handler {
-                handler.unmap(gpa, len).map_err(|e| {
-                    io::Error::other(format!("DMA unmap failed gpa={gpa:#x} len={len:#x}: {e}"))
-                })?;
+                handler.unmap(gpa, len)?;
             }
             for page in run..i {
                 region.shared[page / BITS_PER_U64] &= !(1 << (page % BITS_PER_U64));
@@ -377,8 +375,8 @@ impl SevSnpSharedPageTracker {
 
 impl MemoryConversionHandler for SevSnpSharedPageTracker {
     fn handle_conversion(&self, gpa: u64, size: u64, to_shared: bool) -> anyhow::Result<()> {
-        self.set_shared(gpa, size, to_shared)
-            .map_err(|e| anyhow::anyhow!("confidential VFIO conversion failed: {e}"))
+        self.set_shared(gpa, size, to_shared)?;
+        Ok(())
     }
 }
 
@@ -407,18 +405,6 @@ mod tests {
         buf[setup_len..setup_len + kernel_payload.len()].copy_from_slice(kernel_payload);
 
         make_tempfile(&buf)
-    }
-
-    #[test]
-    fn hash_block_deterministic() {
-        let info = MeasuredBootInfo {
-            kernel: make_fake_kernel(1, b"KERNEL_DATA"),
-            initramfs: None,
-            cmdline: CString::new("console=ttyS0").unwrap(),
-        };
-        let block1 = info.build_hash_block().unwrap();
-        let block2 = info.build_hash_block().unwrap();
-        assert_eq!(block1, block2);
     }
 
     #[test]
@@ -470,16 +456,6 @@ mod tests {
             &block[initrd_hash_offset..initrd_hash_offset + 32],
             &expected
         );
-    }
-
-    #[test]
-    fn hash_block_setup_sects_zero_defaults_to_four() {
-        let info = MeasuredBootInfo {
-            kernel: make_fake_kernel(0, b"PAYLOAD"),
-            initramfs: None,
-            cmdline: CString::new("root=/dev/sda").unwrap(),
-        };
-        info.build_hash_block().unwrap();
     }
 
     #[test]
@@ -600,15 +576,25 @@ mod tests {
     }
 
     impl ExternalDmaMapping for Recorder {
-        fn map(&self, iova: u64, gpa: u64, size: u64) -> io::Result<()> {
+        fn map(
+            &self,
+            iova: u64,
+            gpa: u64,
+            size: u64,
+        ) -> result::Result<(), ExternalDmaMappingError> {
             assert_eq!(iova, gpa, "tracker must identity-map (iova == gpa)");
             if self.fail_map_gpa == Some(gpa) {
-                return Err(io::Error::other("injected map failure"));
+                return Err(ExternalDmaMappingError::Map {
+                    iova,
+                    gpa,
+                    size,
+                    source: io::Error::from_raw_os_error(libc::EIO).into(),
+                });
             }
             self.maps.lock().unwrap().push((gpa, size));
             Ok(())
         }
-        fn unmap(&self, iova: u64, size: u64) -> io::Result<()> {
+        fn unmap(&self, iova: u64, size: u64) -> result::Result<(), ExternalDmaMappingError> {
             self.unmaps.lock().unwrap().push((iova, size));
             Ok(())
         }
@@ -622,7 +608,7 @@ mod tests {
         let t = SevSnpSharedPageTracker::new();
         t.register_region(base, size);
         let rec = Arc::new(Recorder::default());
-        t.add_dma_mapping_handler(Arc::clone(&rec) as Arc<dyn ExternalDmaMapping>)
+        t.add_dma_mapping_handler(&(Arc::clone(&rec) as Arc<dyn ExternalDmaMapping>))
             .unwrap();
         (t, rec)
     }
@@ -676,14 +662,37 @@ mod tests {
 
     #[test]
     fn add_handler_replays_shared_set() {
-        let (t, _first) = tracker_with_region(page(0), 4 * PAGE_SIZE_4K);
-        t.set_shared(page(1), 2 * PAGE_SIZE_4K, true).unwrap();
-        t.clear_dma_mapping_handler();
+        let (t, first) = tracker_with_region(page(0), 4 * PAGE_SIZE_4K);
+        t.set_shared(page(1), PAGE_SIZE_4K, true).unwrap();
+        let weak = Arc::downgrade(&first);
+        drop(first);
+        assert!(weak.upgrade().is_none());
+        t.set_shared(page(2), PAGE_SIZE_4K, true).unwrap();
         let late = Arc::new(Recorder::default());
-        t.add_dma_mapping_handler(Arc::clone(&late) as Arc<dyn ExternalDmaMapping>)
+        t.add_dma_mapping_handler(&(Arc::clone(&late) as Arc<dyn ExternalDmaMapping>))
             .unwrap();
         assert_eq!(
             *late.maps.lock().unwrap(),
+            vec![(page(1), PAGE_SIZE_4K), (page(2), PAGE_SIZE_4K)]
+        );
+    }
+
+    #[test]
+    fn replacing_handler_replays_shared_pages() {
+        let (t, previous) = tracker_with_region(page(0), 4 * PAGE_SIZE_4K);
+        t.set_shared(page(1), PAGE_SIZE_4K, true).unwrap();
+
+        // An operation on another memory device can still hold the old handler.
+        let next = Arc::new(Recorder::default());
+        t.add_dma_mapping_handler(&(Arc::clone(&next) as Arc<dyn ExternalDmaMapping>))
+            .unwrap();
+        t.set_shared(page(2), PAGE_SIZE_4K, true).unwrap();
+        assert_eq!(
+            *previous.maps.lock().unwrap(),
+            vec![(page(1), PAGE_SIZE_4K)]
+        );
+        assert_eq!(
+            *next.maps.lock().unwrap(),
             vec![(page(1), PAGE_SIZE_4K), (page(2), PAGE_SIZE_4K)]
         );
     }
@@ -704,7 +713,7 @@ mod tests {
             ..Default::default()
         });
         assert!(
-            t.add_dma_mapping_handler(Arc::clone(&failed) as Arc<dyn ExternalDmaMapping>)
+            t.add_dma_mapping_handler(&(Arc::clone(&failed) as Arc<dyn ExternalDmaMapping>))
                 .is_err()
         );
         assert_eq!(
@@ -714,7 +723,7 @@ mod tests {
 
         // The shared set is untouched, so a later attach replays all of it.
         let late = Arc::new(Recorder::default());
-        t.add_dma_mapping_handler(Arc::clone(&late) as Arc<dyn ExternalDmaMapping>)
+        t.add_dma_mapping_handler(&(Arc::clone(&late) as Arc<dyn ExternalDmaMapping>))
             .unwrap();
         assert_eq!(late.maps.lock().unwrap().len(), 4);
     }

@@ -34,6 +34,7 @@ List of experimental features:
 - vDPA
 - Emulated ARM SMMUv3
 - [CPU profiles](cpu.md#profile)
+- Postcopy live migration
 
 ### Security
 
@@ -60,22 +61,10 @@ every 6 weeks. Point releases are issued on demand, when important bug fixes are
 the queue. A major release would receive bug fixes for the next two cycles (~12 weeks)
 and then be considered EOL.
 
-```
-+ - Active release support
-E - EOL
-
-        2021                2022                2023
-         |    |    |    |    |    |    |    |    |
-18.0     |    |    |  ++++++++E
-19.0     |    |    |    |++++++++E
-20.0     |    |    |    |   ++++++++E
-21.0     |    |    |    |    | ++++++++E
-22.0     |    |    |    |    |    +++++++++E
-23.0     |    |    |    |    |    |  +++++++++E
-
-```
-
 ### Major Release Stability Considerations
 
-Snapshot/restore support is not compatible across `MAJOR` versions.
-Live migration support is not compatible across `MAJOR` versions.
+Starting with `v54`, snapshot/restore and live migration from the previous two
+major releases to the current release ("n-2")  is guaranteed to work, excluding
+experimental features such as postcopy. See
+[Version Compatibility](docs/live_migration.md#version-compatibility) for
+details.

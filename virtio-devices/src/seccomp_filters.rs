@@ -7,6 +7,8 @@
 use std::env;
 
 use block::{BLKDISCARD, BLKZEROOUT};
+#[cfg(feature = "mshv")]
+use hypervisor::mshv::mshv_ioctls::MSHV_SET_GUEST_MEMORY;
 use libc::{FIONBIO, TIOCGWINSZ, TUNSETOFFLOAD, TUNSETQUEUE};
 use seccompiler::SeccompCmpOp::{Eq, MaskedEq};
 use seccompiler::{
@@ -58,8 +60,13 @@ const VFIO_IOMMU_MAP_DMA: u64 = 0x3b71;
 const VFIO_IOMMU_UNMAP_DMA: u64 = 0x3b72;
 
 // See include/uapi/linux/iommufd.h in the kernel code.
+const IOMMU_DESTROY: u64 = 0x3b80;
 const IOMMU_IOAS_MAP: u64 = 0x3b85;
 const IOMMU_IOAS_UNMAP: u64 = 0x3b86;
+
+// See include/uapi/linux/kvm.h in the kernel code.
+#[cfg(feature = "kvm")]
+const KVM_SET_USER_MEMORY_REGION2: u64 = 0x40a0_ae49;
 
 #[cfg(feature = "sev_snp")]
 fn mshv_sev_snp_ioctl_seccomp_rule() -> SeccompRule {
@@ -99,10 +106,15 @@ fn create_virtio_iommu_ioctl_seccomp_rule() -> Vec<SeccompRule> {
 
 fn create_virtio_mem_ioctl_seccomp_rule() -> Vec<SeccompRule> {
     or![
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_DESTROY).unwrap()],
         and![Cond::new(1, ArgLen::Dword, Eq, VFIO_IOMMU_MAP_DMA).unwrap()],
         and![Cond::new(1, ArgLen::Dword, Eq, VFIO_IOMMU_UNMAP_DMA).unwrap()],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP).unwrap()],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_UNMAP).unwrap()],
+        #[cfg(feature = "kvm")]
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION2).unwrap()],
+        #[cfg(feature = "mshv")]
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_GUEST_MEMORY()).unwrap()],
     ]
 }
 
@@ -156,6 +168,7 @@ fn virtio_console_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_sched_getaffinity, vec![]),
         (libc::SYS_sendto, vec![]),
         (libc::SYS_set_robust_list, vec![]),
+        (libc::SYS_setsockopt, vec![]),
         (libc::SYS_shutdown, vec![]),
     ]
 }
@@ -237,10 +250,25 @@ fn virtio_vhost_fs_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
     ]
 }
 
+#[cfg(any(feature = "kvm", feature = "mshv"))]
+fn create_generic_vhost_user_ioctl_seccomp_rule() -> Vec<SeccompRule> {
+    or![
+        #[cfg(feature = "kvm")]
+        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION2).unwrap()],
+        #[cfg(feature = "mshv")]
+        and![Cond::new(1, ArgLen::Dword, Eq, MSHV_SET_GUEST_MEMORY()).unwrap()],
+    ]
+}
+
 fn virtio_generic_vhost_user_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
     vec![
         (libc::SYS_clock_nanosleep, vec![]),
         (libc::SYS_connect, vec![]),
+        #[cfg(any(feature = "kvm", feature = "mshv"))]
+        (
+            libc::SYS_ioctl,
+            create_generic_vhost_user_ioctl_seccomp_rule(),
+        ),
         (libc::SYS_nanosleep, vec![]),
         (libc::SYS_pread64, vec![]),
         (libc::SYS_pwrite64, vec![]),
@@ -312,6 +340,17 @@ fn virtio_vsock_thread_rules() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_connect, vec![]),
         (libc::SYS_fcntl, vec![]),
         (libc::SYS_ioctl, create_vsock_ioctl_seccomp_rule()),
+        (libc::SYS_recvmsg, vec![]),
+        (
+            libc::SYS_setsockopt,
+            vec![
+                SeccompRule::new(vec![
+                    Cond::new(1, ArgLen::Dword, Eq, libc::SOL_SOCKET as u64).unwrap(),
+                    Cond::new(2, ArgLen::Dword, Eq, libc::SO_PASSCRED as u64).unwrap(),
+                ])
+                .unwrap(),
+            ],
+        ),
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_sendto, vec![]),
         (libc::SYS_shutdown, vec![]),
@@ -362,6 +401,7 @@ fn virtio_thread_common() -> Vec<(i64, Vec<SeccompRule>)> {
         (libc::SYS_epoll_pwait, vec![]),
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_epoll_wait, vec![]),
+        (libc::SYS_eventfd2, vec![]),
         (libc::SYS_exit, vec![]),
         (libc::SYS_fcntl, vec![]),
         (libc::SYS_futex, vec![]),
@@ -422,5 +462,29 @@ pub fn get_seccomp_filter(
         )
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_console_has_no_outbound_socket_rules() {
+        let rules = get_seccomp_rules(Thread::VirtioConsole);
+        for syscall in [libc::SYS_socket, libc::SYS_connect] {
+            assert!(!rules.iter().any(|(number, _)| *number == syscall));
+        }
+        for syscall in [libc::SYS_accept4, libc::SYS_setsockopt] {
+            assert!(rules.iter().any(|(number, _)| *number == syscall));
+        }
+    }
+
+    #[test]
+    fn test_generic_vhost_user_ioctl_rules() {
+        let rules = get_seccomp_rules(Thread::VirtioGenericVhostUser);
+        let has_ioctl = rules.iter().any(|(number, _)| *number == libc::SYS_ioctl);
+        assert_eq!(has_ioctl, cfg!(any(feature = "kvm", feature = "mshv")));
+        get_seccomp_filter(&SeccompAction::Trap, Thread::VirtioGenericVhostUser).unwrap();
     }
 }

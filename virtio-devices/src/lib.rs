@@ -37,8 +37,9 @@ pub mod vhost_user;
 pub mod vsock;
 pub mod watchdog;
 
+use vm_allocator::{GuestMemory, GuestRegion};
 use vm_memory::bitmap::AtomicBitmap;
-use vm_memory::{GuestAddress, GuestMemoryBackend};
+use vm_memory::{GuestAddress, GuestMemoryBackend, GuestMemoryError};
 use vm_virtio::VirtioDeviceType;
 
 pub use self::balloon::{Balloon, BalloonStats, BalloonStatsSnapshot};
@@ -46,7 +47,7 @@ pub use self::block::{Block, BlockState};
 pub use self::console::{Console, ConsoleResizer, Endpoint};
 pub use self::device::{
     ActivationContext, DmaRemapping, VirtioCommon, VirtioDevice, VirtioInterrupt,
-    VirtioInterruptType, VirtioSharedMemoryList,
+    VirtioInterruptType, VirtioSharedMemory, VirtioSharedMemoryList,
 };
 pub use self::epoll_helper::{
     EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
@@ -57,12 +58,11 @@ pub use self::net::{Net, NetCtrlEpollHandler};
 pub use self::pmem::Pmem;
 pub use self::rng::Rng;
 pub use self::rtc::Rtc;
+pub use self::thread_helper::PauseCommon;
 pub use self::vdpa::{Vdpa, VdpaDmaMapping};
 pub use self::vsock::Vsock;
 pub use self::watchdog::Watchdog;
 
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
-type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
 type MmapRegion = vm_memory::MmapRegion<AtomicBitmap>;
 
 const DEVICE_INIT: u32 = 0x00;
@@ -130,6 +130,37 @@ pub struct TokenBucketConfig {
     pub size: u64,
     pub one_time_burst: Option<u64>,
     pub refill_time: u64,
+    /// Peak rate in tokens per second.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_rate: Option<u64>,
+    /// Burst duration in seconds, defaulting to one when a burst rate is set.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_seconds: Option<u64>,
+    /// Seconds to regain full burst credit from empty while idle.
+    /// When absent, recharge takes burst_rate * burst_seconds / sustained rate seconds.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub burst_recharge_seconds: Option<u64>,
+}
+
+impl TokenBucketConfig {
+    /// Build the token bucket, using bounded burst accounting when configured.
+    pub fn token_bucket(&self) -> Option<rate_limiter::TokenBucket> {
+        if let Some(rate) = self.burst_rate {
+            rate_limiter::TokenBucket::new_with_burst(
+                self.size,
+                self.refill_time,
+                rate,
+                self.burst_seconds.unwrap_or(1),
+                self.burst_recharge_seconds.unwrap_or(0),
+            )
+        } else {
+            rate_limiter::TokenBucket::new(
+                self.size,
+                self.one_time_burst.unwrap_or(0),
+                self.refill_time,
+            )
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -143,17 +174,27 @@ impl TryInto<rate_limiter::RateLimiter> for RateLimiterConfig {
     type Error = io::Error;
 
     fn try_into(self) -> result::Result<rate_limiter::RateLimiter, Self::Error> {
-        let bw = self.bandwidth.unwrap_or_default();
-        let ops = self.ops.unwrap_or_default();
-        rate_limiter::RateLimiter::new(
-            bw.size,
-            bw.one_time_burst.unwrap_or(0),
-            bw.refill_time,
-            ops.size,
-            ops.one_time_burst.unwrap_or(0),
-            ops.refill_time,
+        rate_limiter::RateLimiter::from_buckets(
+            self.bandwidth.and_then(|b| b.token_bucket()),
+            self.ops.and_then(|o| o.token_bucket()),
         )
     }
+}
+
+/// Failure to resolve a guest range to a host address.
+#[derive(Debug, Error)]
+pub enum HostAddressRangeError {
+    /// An empty range has no usable host pointer.
+    #[error("Zero size guest range: gpa={gpa:#x}")]
+    ZeroSize { gpa: u64 },
+    /// The guest memory backend could not provide the range.
+    #[error("Failed to access guest range: gpa={gpa:#x}, size={size:#x}")]
+    GuestMemory {
+        gpa: u64,
+        size: usize,
+        #[source]
+        source: GuestMemoryError,
+    },
 }
 
 /// Return the host virtual address corresponding to the given guest address range
@@ -161,19 +202,24 @@ impl TryInto<rate_limiter::RateLimiter> for RateLimiterConfig {
 /// Convert an absolute address into an address space (GuestMemoryBackend)
 /// to a host pointer and verify that the provided size defines a valid
 /// range within a single memory region.
-/// Return None if it is out of bounds, spans multiple regions, or has
-/// zero size at an unmapped GPA.
+/// Return an error if the range is empty or the backend cannot provide it.
 pub fn get_host_address_range<M: GuestMemoryBackend + ?Sized>(
     mem: &M,
     addr: GuestAddress,
     size: usize,
-) -> Option<*mut u8> {
+) -> Result<*mut u8, HostAddressRangeError> {
     // Reject zero-length, no use of a pointer to an empty range.
     if size == 0 {
-        return None;
+        return Err(HostAddressRangeError::ZeroSize { gpa: addr.0 });
     }
-    let slice = mem.get_slice(addr, size).ok()?;
-    Some(slice.ptr_guard_mut().as_ptr())
+    let slice = mem
+        .get_slice(addr, size)
+        .map_err(|source| HostAddressRangeError::GuestMemory {
+            gpa: addr.0,
+            size,
+            source,
+        })?;
+    Ok(slice.ptr_guard_mut().as_ptr())
 }
 
 /// Marks a virtio device as `NEEDS_RESET` and notifies the guest via a config

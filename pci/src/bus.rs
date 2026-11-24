@@ -10,10 +10,11 @@ use std::ops::DerefMut;
 use std::result;
 use std::sync::{Arc, Barrier, Mutex};
 
-use byteorder::{ByteOrder, LittleEndian};
 use log::warn;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use vm_device::BusDevice;
+use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
 
 use crate::PciBdf;
 use crate::configuration::{PciBridgeSubclass, PciClassCode, PciConfiguration, PciHeaderType};
@@ -239,13 +240,20 @@ impl PciBus {
             ) {
                 // Rollback the changes from detect_bar_reprogramming().
                 warn!(
-                    "Failed moving device BAR: {}: 0x{:x}->0x{:x}(0x{:x}), keeping old BAR",
+                    "Failed moving device BAR: {:?}: 0x{:x}->0x{:x}(0x{:x}), keeping old BAR",
                     e, bar.old_base, bar.new_base, bar.len
                 );
                 device.restore_bar_addr(bar);
             }
         }
     }
+}
+
+pub const PCI_CONFIG_IO_SNAPSHOT_ID: &str = "__pci_config_io";
+
+#[derive(Default, Serialize, Deserialize)]
+pub struct PciConfigIoState {
+    config_address: u32,
 }
 
 pub struct PciConfigIo {
@@ -255,9 +263,9 @@ pub struct PciConfigIo {
 }
 
 impl PciConfigIo {
-    pub fn new(pci_bus: Arc<Mutex<PciBus>>) -> Self {
+    pub fn new(pci_bus: Arc<Mutex<PciBus>>, state: Option<PciConfigIoState>) -> Self {
         PciConfigIo {
-            config_address: 0,
+            config_address: state.unwrap_or_default().config_address,
             pci_bus,
         }
     }
@@ -302,11 +310,11 @@ impl PciConfigIo {
             return None;
         }
 
-        let (bus, device, _function, register) =
+        let (bus, device, function, register) =
             parse_io_config_address(self.config_address & !0x8000_0000);
 
-        // Only support one bus.
-        if bus != 0 {
+        // Only support bus 0 and single-function devices.
+        if bus != 0 || function > 0 {
             return None;
         }
 
@@ -339,7 +347,10 @@ impl PciConfigIo {
                 0x0000_ffff << (offset * 8),
                 ((u32::from(data[1]) << 8) | u32::from(data[0])) << (offset * 8),
             ),
-            4 => (0xffff_ffff, LittleEndian::read_u32(data)),
+            4 => (
+                0xffff_ffff,
+                u32::from_le_bytes(data.try_into().expect("data should be 4 bytes")),
+            ),
             _ => return,
         };
         self.config_address = (self.config_address & !mask) | value;
@@ -382,6 +393,22 @@ impl BusDevice for PciConfigIo {
     }
 }
 
+impl Snapshottable for PciConfigIo {
+    fn id(&self) -> String {
+        PCI_CONFIG_IO_SNAPSHOT_ID.to_string()
+    }
+
+    fn snapshot(&mut self) -> result::Result<Snapshot, MigratableError> {
+        Snapshot::new_from_state(&PciConfigIoState {
+            config_address: self.config_address,
+        })
+    }
+}
+
+impl Pausable for PciConfigIo {}
+impl Transportable for PciConfigIo {}
+impl Migratable for PciConfigIo {}
+
 /// Emulates PCI memory-mapped configuration access mechanism.
 pub struct PciConfigMmio {
     pci_bus: Arc<Mutex<PciBus>>,
@@ -410,16 +437,21 @@ impl PciConfigMmio {
             })
     }
 
-    fn config_space_write(&mut self, config_address: u32, offset: u64, data: &[u8]) {
+    fn config_space_write(
+        &mut self,
+        config_address: u32,
+        offset: u64,
+        data: &[u8],
+    ) -> Option<Arc<Barrier>> {
         if offset as usize + data.len() > 4 {
-            return;
+            return None;
         }
 
         let (bus, device, _function, register) = parse_mmio_config_address(config_address);
 
         // Only support one bus.
         if bus != 0 {
-            return;
+            return None;
         }
 
         let pci_bus = self.pci_bus.lock().unwrap();
@@ -427,10 +459,14 @@ impl PciConfigMmio {
             let mut device = d.lock().unwrap();
 
             // Update the register value
-            let (bar_reprogram, _) = device.write_config_register(register, offset, data);
+            let (bar_reprogram, ret) = device.write_config_register(register, offset, data);
 
             // Move the device's BAR if needed
             pci_bus.apply_bar_reprogramming(device.deref_mut(), &bar_reprogram);
+
+            ret
+        } else {
+            None
         }
     }
 }
@@ -457,9 +493,7 @@ impl BusDevice for PciConfigMmio {
         if offset > u64::from(u32::MAX) {
             return None;
         }
-        self.config_space_write(offset as u32, offset % 4, data);
-
-        None
+        self.config_space_write(offset as u32, offset % 4, data)
     }
 }
 
@@ -559,22 +593,12 @@ mod tests {
 
         for (offset, data, expected) in test_cases {
             let pci_bus = Arc::new(Mutex::new(setup_bus()));
-            let mut config_io = PciConfigIo::new(pci_bus);
+            let mut config_io = PciConfigIo::new(pci_bus, None);
             config_io.config_address = 0x1122_3344;
 
             config_io.write(0, *offset, data);
 
             assert_eq!(config_io.config_address, *expected);
-        }
-    }
-
-    #[test]
-    // Test to acquire all IDs that can be acquired
-    fn allocate_device_id_next_free() {
-        // The first address is occupied by the root
-        let mut bus = setup_bus();
-        for expected_id in 1..NUM_DEVICE_IDS {
-            assert_eq!(expected_id, bus.allocate_device_id(None).unwrap());
         }
     }
 

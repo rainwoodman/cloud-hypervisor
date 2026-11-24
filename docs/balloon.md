@@ -8,19 +8,10 @@ features related to guest memory management.
 ## Parameters
 
 `BalloonConfig` (known as `--balloon` from the CLI perspective) contains the
-list of parameters available for the balloon device.
-
-```rust
-struct BalloonConfig {
-    pub size: u64,
-    pub deflate_on_oom: bool,
-    pub free_page_reporting: bool,
-}
-```
-
-```
---balloon <balloon>	Balloon parameters "size=<balloon_size>,deflate_on_oom=on|off,free_page_reporting=on|off"
-```
+list of parameters available for the balloon device. See
+`cloud-hypervisor --help` for the syntax and `BalloonConfig` in the
+[OpenAPI spec](../vmm/src/api/openapi/cloud-hypervisor.yaml) for the JSON
+structure.
 
 ### `size`
 
@@ -29,7 +20,8 @@ instance, if creating a VM with 4GiB of RAM, along with a balloon of 1GiB, the
 guest will be able to use 3GiB of accessible memory. The guest sees all the RAM,
 and unless it is balloon enlightened, it is entitled to all of it.
 
-This parameter is mandatory.
+On the command line, this parameter is optional and defaults to `0`. The REST
+API requires it.
 
 Value is an unsigned integer of 64 bits corresponding to the balloon size in
 bytes.

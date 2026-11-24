@@ -2,16 +2,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::mem::offset_of;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 use std::{io, result};
 
 use block::VirtioBlockConfig;
 use log::{error, info};
 use seccompiler::SeccompAction;
-use vhost::vhost_user::message::{
-    VhostUserConfigFlags, VhostUserProtocolFeatures, VhostUserVirtioFeatures,
-};
+use vhost::vhost_user::message::{VhostUserConfigFlags, VhostUserProtocolFeatures};
 use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler};
 use virtio_bindings::virtio_blk::{
     VIRTIO_BLK_F_BLK_SIZE, VIRTIO_BLK_F_CONFIG_WCE, VIRTIO_BLK_F_DISCARD, VIRTIO_BLK_F_FLUSH,
@@ -28,8 +25,8 @@ use super::vu_common_ctrl::{VhostUserConfig, VhostUserHandle};
 use super::{DEFAULT_VIRTIO_FEATURES, Error, Result};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
-use crate::vhost_user::{VhostUserCommon, VhostUserState};
-use crate::{GuestRegionMmap, VIRTIO_F_ACCESS_PLATFORM, VirtioInterrupt, VirtioInterruptType};
+use crate::vhost_user::{PostcopyHandler, VhostUserCommon, VhostUserState};
+use crate::{GuestRegion, VIRTIO_F_ACCESS_PLATFORM, VirtioInterrupt, VirtioInterruptType};
 
 const DEFAULT_QUEUE_NUMBER: u16 = 1;
 
@@ -98,6 +95,7 @@ impl Blk {
         exit_evt: EventFd,
         access_platform_enabled: bool,
         state: Option<State>,
+        postcopy_handler: Option<Arc<dyn PostcopyHandler>>,
     ) -> Result<Blk> {
         let num_queues = vu_cfg.num_queues;
 
@@ -122,8 +120,8 @@ impl Blk {
             info!("Restoring vhost-user-block {id}");
 
             vu.set_protocol_features_vhost_user(
-                state.acked_features,
                 state.acked_protocol_features,
+                postcopy_handler.is_some(),
             )?;
 
             vu.restore_state(&state)?;
@@ -164,8 +162,11 @@ impl Blk {
                 | VhostUserProtocolFeatures::DEVICE_STATE
                 | VhostUserProtocolFeatures::BACKEND_REQ;
 
-            let (acked_features, acked_protocol_features) =
-                vu.negotiate_features_vhost_user(avail_features, avail_protocol_features)?;
+            let (acked_features, acked_protocol_features) = vu.negotiate_features_vhost_user(
+                avail_features,
+                avail_protocol_features,
+                postcopy_handler.is_some(),
+            )?;
 
             let backend_num_queues =
                 if acked_protocol_features & VhostUserProtocolFeatures::MQ.bits() != 0 {
@@ -192,11 +193,7 @@ impl Blk {
 
             (
                 avail_features,
-                // If part of the available features that have been acked,
-                // the PROTOCOL_FEATURES bit must be already set through
-                // the VIRTIO acked features as we know the guest would
-                // never ack it, thus the feature would be lost.
-                acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits(),
+                0,
                 acked_protocol_features,
                 num_queues,
                 config,
@@ -205,24 +202,27 @@ impl Blk {
             )
         };
 
+        if let Some(postcopy_handler) = postcopy_handler {
+            vu.start_postcopy(id.clone(), postcopy_handler)?;
+        }
+
+        let virtio_common = VirtioCommon {
+            device_type: VirtioDeviceType::Block as u32,
+            queue_sizes: vec![vu_cfg.queue_size; num_queues as usize],
+            avail_features,
+            acked_features,
+            min_queues: DEFAULT_QUEUE_NUMBER,
+            ..VirtioCommon::new(paused).map_err(Error::CreateEventFd)?
+        };
+
         Ok(Blk {
             vu_common: VhostUserCommon {
-                virtio_common: VirtioCommon {
-                    device_type: VirtioDeviceType::Block as u32,
-                    queue_sizes: vec![vu_cfg.queue_size; num_queues as usize],
-                    avail_features,
-                    acked_features,
-                    paused_sync: Some(Arc::new(Barrier::new(2))),
-                    min_queues: DEFAULT_QUEUE_NUMBER,
-                    paused: Arc::new(AtomicBool::new(paused)),
-                    ..Default::default()
-                },
                 vu: Some(Arc::new(Mutex::new(vu))),
                 acked_protocol_features,
                 socket_path: vu_cfg.socket,
                 vu_num_queues,
                 vring_bases,
-                ..Default::default()
+                ..VhostUserCommon::new(virtio_common)
             },
             id,
             config: Arc::new(Mutex::new(config)),
@@ -232,7 +232,9 @@ impl Blk {
     }
 
     fn state(&self) -> result::Result<State, MigratableError> {
-        self.vu_common.state(*self.config.lock().unwrap())
+        // Release the config lock before vu_common.state() locks vu.
+        let config = *self.config.lock().unwrap();
+        self.vu_common.state(config)
     }
 }
 
@@ -310,8 +312,13 @@ impl VirtioDevice for Blk {
             & VhostUserProtocolFeatures::BACKEND_REQ.bits()
             != 0
         {
+            let vu = self
+                .vu_common
+                .vu
+                .as_ref()
+                .ok_or(crate::ActivateError::BadActivate)?;
             let mut handler = FrontendReqHandler::new(Arc::new(BackendReqHandler {
-                vu: Arc::clone(self.vu_common.vu.as_ref().unwrap()),
+                vu: Arc::clone(vu),
                 config: Arc::clone(&self.config),
                 num_queues: u16::try_from(self.vu_common.virtio_common.queue_sizes.len())
                     .map_err(|_| crate::ActivateError::VhostUserSetup(Error::BadQueueNum))?,
@@ -346,9 +353,6 @@ impl VirtioDevice for Blk {
             pause_evt,
         )?;
 
-        let paused = Arc::clone(&self.vu_common.virtio_common.paused);
-        let paused_sync = self.vu_common.virtio_common.paused_sync.clone();
-
         self.vu_common.spawn_worker(
             &self.id,
             &self.seccomp_action,
@@ -356,7 +360,7 @@ impl VirtioDevice for Blk {
             &self.exit_evt,
             Arc::clone(&device_status),
             Arc::clone(&interrupt_cb),
-            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            move |pause_common| handler.run(pause_common),
         )?;
 
         Ok(())
@@ -370,10 +374,7 @@ impl VirtioDevice for Blk {
         self.vu_common.shutdown();
     }
 
-    fn add_memory_region(
-        &mut self,
-        region: &Arc<GuestRegionMmap>,
-    ) -> result::Result<(), crate::Error> {
+    fn add_memory_region(&mut self, region: &Arc<GuestRegion>) -> result::Result<(), crate::Error> {
         self.vu_common.add_memory_region(region)
     }
 }

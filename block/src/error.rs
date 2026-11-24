@@ -154,20 +154,23 @@ impl BlockError {
     }
 
     /// Replace the error classification (builder-style).
+    #[must_use]
     pub fn with_kind(mut self, kind: BlockErrorKind) -> Self {
         self.kind = kind;
         self
     }
 
     /// Shorthand: attach an operation name.
+    #[must_use]
     pub fn with_op(mut self, op: ErrorOp) -> Self {
-        self.ctx.get_or_insert_with(ErrorContext::default).op = Some(op);
+        self.ctx.get_or_insert_default().op = Some(op);
         self
     }
 
     /// Shorthand: attach a file path.
+    #[must_use]
     pub fn with_path(mut self, path: impl Into<PathBuf>) -> Self {
-        self.ctx.get_or_insert_with(ErrorContext::default).path = Some(path.into());
+        self.ctx.get_or_insert_default().path = Some(path.into());
         self
     }
 

@@ -257,12 +257,19 @@ copy_igvm_files() {
     fi
 }
 
-# Prepare the IGVM files needed for the confidential VM integration
-# tests. Copies the IGVM files from the source path to the workloads
-# directory.
+# Prepare the IGVM directory for confidential VM tests.
+# When running on KVM the image is generated in the container.
+# On MSHV the image is copied from the host.
 prepare_igvm_files() {
-    mkdir -p "$DEST_IGVM_FILES_PATH"
-    copy_igvm_files "$SRC_IGVM_FILES_PATH" "$DEST_IGVM_FILES_PATH"
+    exported_device="$(resolve_hypervisor_device "$hypervisor")"
+    if [ "$exported_device" = "/dev/kvm" ]; then
+        DEST_IGVM_FILES_PATH="$CLH_INTEGRATION_WORKLOADS/igvm_files-kvm"
+        mkdir -p "$DEST_IGVM_FILES_PATH" || die "Failed to create the KVM CVM directory"
+    else
+        DEST_IGVM_FILES_PATH="$CLH_INTEGRATION_WORKLOADS/igvm_files"
+        mkdir -p "$DEST_IGVM_FILES_PATH"
+        copy_igvm_files "$SRC_IGVM_FILES_PATH" "$DEST_IGVM_FILES_PATH"
+    fi
 }
 
 cmd_help() {
@@ -276,13 +283,15 @@ cmd_help() {
     echo ""
     echo "Available commands:"
     echo ""
-    echo "    build [--debug|--release] [--libc musl|gnu] [-- [<cargo args>]]"
+    echo "    build [--debug|--release] [--libc musl|gnu] [--features <features>] [-- [<cargo args>]]"
     echo "        Build the Cloud Hypervisor binaries."
     echo "        --debug               Build the debug binaries. This is the default."
     echo "        --release             Build the release binaries."
     echo "        --libc                Select the C library Cloud Hypervisor will be built against. Default is gnu"
     echo "        --volumes             Hash separated volumes to be exported. Example --volumes /mnt:/mnt#/myvol:/myvol"
     echo "        --hypervisor          Underlying hypervisor. Options kvm, mshv. Auto-detected from the host device node when omitted."
+    echo "        --features            Additional cargo features to build with."
+    echo "        --runtime             Container runtime. Options docker, podman. Default is docker"
     echo ""
     echo "    tests [<test type (see below)>] [--libc musl|gnu] [-- [<test scripts args>] [-- [<test binary args>]]] "
     echo "        Run the Cloud Hypervisor tests."

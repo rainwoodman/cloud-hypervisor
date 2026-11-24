@@ -3,18 +3,22 @@
 // SPDX-License-Identifier: Apache-2.0
 //
 
+#![expect(clippy::panic, reason = "test code")]
+
 // Custom harness to run performance tests
 mod micro_bench_block;
 mod performance_tests;
+#[path = "../../cloud-hypervisor/tests/common/mod.rs"]
+pub mod test_utils;
 mod util;
 
 use std::process::{self, Command};
 use std::sync::Arc;
 use std::sync::mpsc::channel;
 use std::time::Duration;
-use std::{env, fmt, fs, io, panic, path, str, thread};
+use std::{fmt, fs, io, panic, path, str, thread};
 
-use clap::{Arg, ArgAction, Command as ClapCommand};
+use clap::{ArgAction, Parser, ValueEnum};
 use performance_tests::*;
 use serde::{Deserialize, Serialize};
 use test_infra::{FioOps, GuestVmType, ProcessRegistry};
@@ -141,27 +145,17 @@ impl Default for MetricsReport {
     }
 }
 
-#[derive(Clone, Copy, Default)]
+#[derive(Clone, Copy, Default, ValueEnum)]
 pub enum ImageFormat {
+    /// Raw image (default)
     #[default]
     Raw,
+    /// Fully preallocated QCOW2 image
     Qcow2,
+    /// Fixed-size VHD image
     Vhd,
+    /// Fixed-size VHDX image
     Vhdx,
-}
-
-impl str::FromStr for ImageFormat {
-    type Err = ();
-
-    fn from_str(s: &str) -> Result<Self, Self::Err> {
-        match s {
-            "raw" => Ok(ImageFormat::Raw),
-            "qcow2" => Ok(ImageFormat::Qcow2),
-            "vhd" => Ok(ImageFormat::Vhd),
-            "vhdx" => Ok(ImageFormat::Vhdx),
-            _ => Err(()),
-        }
-    }
 }
 
 impl fmt::Display for ImageFormat {
@@ -1799,82 +1793,55 @@ fn date() -> String {
     String::from_utf8_lossy(&output.stdout).trim().to_string()
 }
 
+#[derive(Clone, Copy, ValueEnum)]
+enum CliVmType {
+    /// Non-confidential VM
+    Regular,
+    /// Confidential VM (e.g. AMD SEV-SNP, x86_64 only)
+    Confidential,
+}
+
+#[derive(Parser)]
+#[command(
+    name = "performance-metrics",
+    version,
+    about = "Generate the performance metrics data for Cloud Hypervisor"
+)]
+struct Cli {
+    #[arg(long, help = "Continue running remaining tests after a test failure")]
+    continue_on_failure: bool,
+    #[arg(long, help = "Override the image format used for block tests")]
+    image_format: Option<ImageFormat>,
+    #[arg(long, help = "Override number of test iterations")]
+    iterations: Option<u32>,
+    #[arg(long, help = "Print the list of available metrics tests")]
+    list_tests: bool,
+    #[arg(long, help = "Report file. Standard error is used if not specified")]
+    report_file: Option<String>,
+    #[arg(
+        long,
+        help = "Exclude metrics tests matching the provided keywords (comma-separated)",
+        num_args = 1,
+        value_delimiter = ',',
+        action = ArgAction::Set,
+    )]
+    test_exclude: Option<Vec<String>>,
+    #[arg(
+        long,
+        help = "Filter metrics tests to run based on provided keywords (comma-separated)",
+        num_args = 1,
+        value_delimiter = ',',
+        action = ArgAction::Set,
+    )]
+    test_filter: Option<Vec<String>>,
+    #[arg(long, help = "Override test timeout in seconds")]
+    timeout: Option<u32>,
+    #[arg(long, help = "Set the VM type", default_value = "regular")]
+    vm_type: CliVmType,
+}
+
 fn main() {
-    let cmd_arguments = ClapCommand::new("performance-metrics")
-        .version(env!("CARGO_PKG_VERSION"))
-        .author(env!("CARGO_PKG_AUTHORS"))
-        .about("Generate the performance metrics data for Cloud Hypervisor")
-        .arg(
-            Arg::new("test-filter")
-                .long("test-filter")
-                .help("Filter metrics tests to run based on provided keywords (comma-separated)")
-                .num_args(1)
-                .value_delimiter(',')
-                .required(false),
-        )
-        .arg(
-            Arg::new("test-exclude")
-                .long("test-exclude")
-                .help("Exclude metrics tests matching the provided keywords (comma-separated)")
-                .num_args(1)
-                .value_delimiter(',')
-                .required(false),
-        )
-        .arg(
-            Arg::new("list-tests")
-                .long("list-tests")
-                .help("Print the list of available metrics tests")
-                .num_args(0)
-                .action(ArgAction::SetTrue)
-                .required(false),
-        )
-        .arg(
-            Arg::new("continue-on-failure")
-                .long("continue-on-failure")
-                .help("Continue running remaining tests after a test failure")
-                .num_args(0)
-                .action(ArgAction::SetTrue)
-                .required(false),
-        )
-        .arg(
-            Arg::new("report-file")
-                .long("report-file")
-                .help("Report file. Standard error is used if not specified")
-                .num_args(1),
-        )
-        .arg(
-            Arg::new("iterations")
-                .long("iterations")
-                .help("Override number of test iterations")
-                .num_args(1),
-        )
-        .arg(
-            Arg::new("timeout")
-                .long("timeout")
-                .help("Override test timeout, Ex. --timeout 5")
-                .num_args(1),
-        )
-        .arg(
-            Arg::new("image-format")
-                .long("image-format")
-                .help(
-                    "Override the image format used for block tests, supported values: qcow2, raw, vhd, vhdx. \
-                     Default is 'raw'.",
-                )
-                .num_args(1)
-                .value_parser(["raw", "qcow2", "vhd", "vhdx"]),
-        )
-        .arg(
-            Arg::new("vm-type")
-                .long("vm-type")
-                .help(
-                    "Set the VM type: 'regular' (default) or 'confidential' (CVM).",
-                )
-                .num_args(1)
-                .value_parser(["regular","confidential"])
-                .default_value("regular"),
-        )
-        .get_matches();
+    let cmd_arguments = Cli::parse();
 
     // It seems that the tool (ethr) used for testing the virtio-net latency
     // is not stable on AArch64, and therefore the latency test is currently
@@ -1884,24 +1851,18 @@ fn main() {
         .filter(|t| !(cfg!(target_arch = "aarch64") && t.name == "virtio_net_latency_us"))
         .collect();
 
-    let test_filter = match cmd_arguments.get_many::<String>("test-filter") {
-        Some(s) => s.collect(),
-        None => Vec::new(),
-    };
+    let test_filter = cmd_arguments.test_filter.as_deref().unwrap_or_default();
 
-    let test_exclude = match cmd_arguments.get_many::<String>("test-exclude") {
-        Some(s) => s.collect(),
-        None => Vec::new(),
-    };
+    let test_exclude = cmd_arguments.test_exclude.as_deref().unwrap_or_default();
 
     // Determine which tests will actually run.
     let tests_to_run: Vec<&PerformanceTest> = test_list
         .into_iter()
-        .filter(|t| test_filter.is_empty() || test_filter.iter().any(|&s| t.name.contains(s)))
-        .filter(|t| !test_exclude.iter().any(|&s| t.name.contains(s)))
+        .filter(|t| test_filter.is_empty() || test_filter.iter().any(|s| t.name.contains(s)))
+        .filter(|t| !test_exclude.iter().any(|s| t.name.contains(s)))
         .collect();
 
-    if cmd_arguments.get_flag("list-tests") {
+    if cmd_arguments.list_tests {
         for test in tests_to_run.iter() {
             println!("\"{}\" ({})", test.name, test.control);
         }
@@ -1913,24 +1874,13 @@ fn main() {
     let mut metrics_report: MetricsReport = Default::default();
 
     let overrides = Arc::new(PerformanceTestOverrides {
-        test_iterations: cmd_arguments
-            .get_one::<String>("iterations")
-            .map(|s| s.parse())
-            .transpose()
-            .unwrap_or_default(),
-        test_timeout: cmd_arguments
-            .get_one::<String>("timeout")
-            .map(|s| s.parse())
-            .transpose()
-            .unwrap_or_default(),
-        test_image_format: cmd_arguments
-            .get_one::<String>("image-format")
-            .map(|s| s.parse())
-            .transpose()
-            .unwrap_or_default(),
-        vm_type: cmd_arguments
-            .get_one::<String>("vm-type")
-            .map_or_else(Default::default, |s| s.parse().unwrap_or_default()),
+        test_iterations: cmd_arguments.iterations,
+        test_timeout: cmd_arguments.timeout,
+        test_image_format: cmd_arguments.image_format,
+        vm_type: match cmd_arguments.vm_type {
+            CliVmType::Regular => GuestVmType::Regular,
+            CliVmType::Confidential => GuestVmType::Confidential,
+        },
     });
 
     #[cfg(target_arch = "aarch64")]
@@ -1948,7 +1898,6 @@ fn main() {
         init_tests(&overrides);
     }
 
-    let continue_on_failure = cmd_arguments.get_flag("continue-on-failure");
     let mut has_failure = false;
 
     for test in tests_to_run {
@@ -1958,7 +1907,7 @@ fn main() {
                 metrics_report.results.push(r);
             }
             Err(e) => {
-                if continue_on_failure {
+                if cmd_arguments.continue_on_failure {
                     eprintln!("Test '{}' failed: '{e:?}'. Continuing.", test.name);
                     has_failure = true;
                     metrics_report
@@ -1977,7 +1926,7 @@ fn main() {
     }
 
     let mut report_file: Box<dyn io::Write + Send> =
-        if let Some(file) = cmd_arguments.get_one::<String>("report-file") {
+        if let Some(file) = cmd_arguments.report_file.as_ref() {
             Box::new(
                 fs::File::create(path::Path::new(file))
                     .map_err(|e| {
@@ -2004,5 +1953,51 @@ fn main() {
 
     if has_failure {
         process::exit(1);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use clap::CommandFactory;
+
+    use super::*;
+
+    #[test]
+    fn clap_cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    #[test]
+    fn test_cli_options_sorted() {
+        let command = Cli::command();
+        assert!(command.get_arguments().map(|arg| arg.get_id()).is_sorted());
+    }
+
+    #[test]
+    fn test_cli_filters_and_defaults() {
+        let cli = Cli::try_parse_from([
+            "performance-metrics",
+            "--test-filter",
+            "boot,restore",
+            "--list-tests",
+        ])
+        .expect("comma-separated filters should parse");
+        assert_eq!(
+            cli.test_filter,
+            Some(vec!["boot".to_owned(), "restore".to_owned()])
+        );
+        assert!(cli.list_tests);
+        assert!(matches!(cli.vm_type, CliVmType::Regular));
+        assert!(
+            Cli::try_parse_from([
+                "performance-metrics",
+                "--test-filter",
+                "boot",
+                "--test-filter",
+                "restore"
+            ])
+            .is_err()
+        );
+        assert!(Cli::try_parse_from(["performance-metrics", "--vm-type", "invalid"]).is_err());
     }
 }

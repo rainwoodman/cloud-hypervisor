@@ -2,14 +2,14 @@
 //
 // SPDX-License-Identifier: Apache-2.0
 //
+use std::collections::BTreeSet;
 use std::panic::AssertUnwindSafe;
 use std::sync::Arc;
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{self, Sender};
 use std::{fmt, panic, thread};
 
-use futures::channel::oneshot;
-use futures::{FutureExt, executor, future, lock};
-use log::{error, warn};
+use futures_lite::{StreamExt, future};
+use log::error;
 use seccompiler::{SeccompAction, apply_filter};
 use vmm_sys_util::eventfd::EventFd;
 use zbus::connection::Builder;
@@ -23,25 +23,27 @@ use crate::api::VmCoredump;
 use crate::api::{
     AddDisk, Body, VmAddDevice, VmAddFs, VmAddGenericVhostUser, VmAddNet, VmAddPmem,
     VmAddUserDevice, VmAddVdpa, VmAddVsock, VmBalloonStats, VmBoot, VmCancelMigration, VmCounters,
-    VmCreate, VmDelete, VmInfo, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
-    VmRemoveDevice, VmResize, VmResizeZone, VmRestore, VmResume, VmSendMigration, VmShutdown,
-    VmSnapshot, VmmPing, VmmShutdown,
+    VmCreate, VmDelete, VmInfo, VmNmi, VmPause, VmPowerButton, VmReboot, VmReceiveMigration,
+    VmReceiveMigrationData, VmRemoveDevice, VmResize, VmResizeDisk, VmResizeZone, VmRestore,
+    VmResume, VmSendMigration, VmShutdown, VmSnapshot, VmmPing, VmmShutdown,
 };
+use crate::config::RestoreConfig;
+use crate::external_fds::{ExternalFds, ScmRights, UpdateFdsComponent};
 use crate::seccomp_filters::{Thread, get_seccomp_filter};
-use crate::{Error as VmmError, NetConfig, Result as VmmResult, VmConfig};
+use crate::{DeviceConfig, Error as VmmError, NetConfig, Result as VmmResult, VmConfig};
 
-pub type DBusApiShutdownChannels = (oneshot::Sender<()>, oneshot::Receiver<()>);
+pub type DBusApiShutdownChannels = (async_channel::Sender<()>, mpsc::Receiver<()>);
 
 pub struct DBusApiOptions {
     pub service_name: String,
     pub object_path: String,
     pub system_bus: bool,
-    pub event_monitor_rx: flume::Receiver<Arc<String>>,
+    pub event_monitor_rx: mpsc::Receiver<Arc<String>>,
 }
 
 pub struct DBusApi {
     api_notifier: EventFd,
-    api_sender: lock::Mutex<Sender<ApiRequest>>,
+    api_sender: Sender<ApiRequest>,
 }
 
 fn api_error(error: impl fmt::Debug + fmt::Display) -> fdo::Error {
@@ -54,33 +56,24 @@ fn api_error(error: impl fmt::Debug + fmt::Display) -> fdo::Error {
 // response, resulting in an error message stating that the message recipient
 // disconnected from the message bus without providing a reply.
 pub fn dbus_api_graceful_shutdown(ch: DBusApiShutdownChannels) {
-    let (send_shutdown, mut recv_done) = ch;
+    let (send_shutdown, recv_done) = ch;
 
     // send the shutdown signal and return
     // if it errors out
-    if send_shutdown.send(()).is_err() {
+    if send_shutdown.try_send(()).is_err() {
         return;
     }
 
-    // loop until `recv_err` errors out
-    // or as long as the return value indicates
-    // "immediately stale" (None)
-    while let Ok(None) = recv_done.try_recv() {}
+    // wait until the D-Bus thread is done or gone
+    recv_done.recv().ok();
 }
 
 impl DBusApi {
     pub fn new(api_notifier: EventFd, api_sender: Sender<ApiRequest>) -> Self {
         Self {
             api_notifier,
-            api_sender: lock::Mutex::new(api_sender),
+            api_sender,
         }
-    }
-
-    async fn clone_api_sender(&self) -> Sender<ApiRequest> {
-        // lock the async mutex, clone the `Sender` and then immediately
-        // drop the MutexGuard so that other tasks can clone the
-        // `Sender` as well
-        self.api_sender.lock().await.clone()
     }
 
     fn clone_api_notifier(&self) -> Result<EventFd> {
@@ -94,7 +87,7 @@ impl DBusApi {
         action: &'static Action,
         body: Action::RequestBody,
     ) -> Result<Optional<String>> {
-        let api_sender = self.clone_api_sender().await;
+        let api_sender = self.api_sender.clone();
         let api_notifier = self.clone_api_notifier()?;
 
         let result = blocking::unblock(move || action.send(api_notifier, api_sender, body))
@@ -111,7 +104,7 @@ impl DBusApi {
 #[interface(name = "org.cloudhypervisor.DBusApi1")]
 impl DBusApi {
     async fn vmm_ping(&self) -> Result<String> {
-        let api_sender = self.clone_api_sender().await;
+        let api_sender = self.api_sender.clone();
         let api_notifier = self.clone_api_notifier()?;
 
         let result = blocking::unblock(move || VmmPing.send(api_notifier, api_sender, ()))
@@ -121,7 +114,7 @@ impl DBusApi {
     }
 
     async fn vmm_shutdown(&self) -> Result<()> {
-        let api_sender = self.clone_api_sender().await;
+        let api_sender = self.api_sender.clone();
         let api_notifier = self.clone_api_notifier()?;
 
         blocking::unblock(move || VmmShutdown.send(api_notifier, api_sender, ()))
@@ -130,7 +123,11 @@ impl DBusApi {
     }
 
     async fn vm_add_device(&self, device_config: String) -> Result<Optional<String>> {
-        let device_config = serde_json::from_str(&device_config).map_err(api_error)?;
+        let device_config: DeviceConfig =
+            serde_json::from_str(&device_config).map_err(api_error)?;
+        device_config
+            .validate_fds(&ExternalFds::default(), &mut BTreeSet::new())
+            .map_err(api_error)?;
         self.vm_action(&VmAddDevice, device_config).await
     }
 
@@ -155,11 +152,10 @@ impl DBusApi {
     }
 
     async fn vm_add_net(&self, net_config: String) -> Result<Optional<String>> {
-        let mut net_config: NetConfig = serde_json::from_str(&net_config).map_err(api_error)?;
-        if net_config.fds.is_some() {
-            warn!("Ignoring FDs sent via the D-Bus request body");
-            net_config.fds = None;
-        }
+        let net_config: NetConfig = serde_json::from_str(&net_config).map_err(api_error)?;
+        net_config
+            .validate_fds(&ExternalFds::default(), &mut BTreeSet::new())
+            .map_err(api_error)?;
         self.vm_action(&VmAddNet, net_config).await
     }
 
@@ -184,7 +180,7 @@ impl DBusApi {
     }
 
     async fn vm_balloon_stats(&self) -> Result<String> {
-        let api_sender = self.clone_api_sender().await;
+        let api_sender = self.api_sender.clone();
         let api_notifier = self.clone_api_notifier()?;
 
         let result = blocking::unblock(move || VmBalloonStats.send(api_notifier, api_sender, ()))
@@ -221,19 +217,14 @@ impl DBusApi {
     }
 
     async fn vm_create(&self, vm_config: String) -> Result<()> {
-        let api_sender = self.clone_api_sender().await;
+        let api_sender = self.api_sender.clone();
         let api_notifier = self.clone_api_notifier()?;
 
         let mut vm_config: Box<VmConfig> = serde_json::from_str(&vm_config).map_err(api_error)?;
 
-        if let Some(ref mut nets) = vm_config.net {
-            if nets.iter().any(|net| net.fds.is_some()) {
-                warn!("Ignoring FDs sent via the D-Bus request body");
-            }
-            for net in nets {
-                net.fds = None;
-            }
-        }
+        vm_config
+            .update_fds(ExternalFds::default())
+            .map_err(api_error)?;
 
         blocking::unblock(move || VmCreate.send(api_notifier, api_sender, vm_config))
             .await
@@ -247,7 +238,7 @@ impl DBusApi {
     }
 
     async fn vm_info(&self) -> Result<String> {
-        let api_sender = self.clone_api_sender().await;
+        let api_sender = self.api_sender.clone();
         let api_notifier = self.clone_api_notifier()?;
 
         let result = blocking::unblock(move || VmInfo.send(api_notifier, api_sender, ()))
@@ -258,6 +249,10 @@ impl DBusApi {
 
     async fn vm_pause(&self) -> Result<()> {
         self.vm_action(&VmPause, ()).await.map(|_| ())
+    }
+
+    async fn vm_nmi(&self) -> Result<()> {
+        self.vm_action(&VmNmi, ()).await.map(|_| ())
     }
 
     async fn vm_power_button(&self) -> Result<()> {
@@ -280,6 +275,13 @@ impl DBusApi {
         self.vm_action(&VmResize, vm_resize).await.map(|_| ())
     }
 
+    async fn vm_resize_disk(&self, vm_resize_disk: String) -> Result<()> {
+        let vm_resize_disk = serde_json::from_str(&vm_resize_disk).map_err(api_error)?;
+        self.vm_action(&VmResizeDisk, vm_resize_disk)
+            .await
+            .map(|_| ())
+    }
+
     async fn vm_resize_zone(&self, vm_resize_zone: String) -> Result<()> {
         let vm_resize_zone = serde_json::from_str(&vm_resize_zone).map_err(api_error)?;
         self.vm_action(&VmResizeZone, vm_resize_zone)
@@ -288,7 +290,9 @@ impl DBusApi {
     }
 
     async fn vm_restore(&self, restore_config: String) -> Result<()> {
-        let restore_config = serde_json::from_str(&restore_config).map_err(api_error)?;
+        let mut restore_config: RestoreConfig =
+            serde_json::from_str(&restore_config).map_err(api_error)?;
+        restore_config.consume_fds(Vec::new()).map_err(api_error)?;
         self.vm_action(&VmRestore, restore_config).await.map(|_| ())
     }
 
@@ -297,8 +301,11 @@ impl DBusApi {
     }
 
     async fn vm_receive_migration(&self, receive_migration_data: String) -> Result<()> {
-        let receive_migration_data =
+        let mut receive_migration_data: VmReceiveMigrationData =
             serde_json::from_str(&receive_migration_data).map_err(api_error)?;
+        receive_migration_data
+            .consume_fds(Vec::new())
+            .map_err(api_error)?;
         self.vm_action(&VmReceiveMigration, receive_migration_data)
             .await
             .map(|_| ())
@@ -340,7 +347,7 @@ pub fn start_dbus_thread(
     exit_evt: EventFd,
 ) -> VmmResult<(thread::JoinHandle<VmmResult<()>>, DBusApiShutdownChannels)> {
     let dbus_iface = DBusApi::new(api_notifier, api_sender);
-    let (connection, iface_ref) = executor::block_on(async move {
+    let (connection, iface_ref) = future::block_on(async move {
         let conn_builder = if dbus_options.system_bus {
             Builder::system()?
         } else {
@@ -363,8 +370,8 @@ pub fn start_dbus_thread(
     })
     .map_err(VmmError::CreateDBusSession)?;
 
-    let (send_shutdown, recv_shutdown) = oneshot::channel::<()>();
-    let (send_done, recv_done) = oneshot::channel::<()>();
+    let (send_shutdown, recv_shutdown) = async_channel::bounded::<()>(1);
+    let (send_done, recv_done) = mpsc::channel::<()>();
 
     // Retrieve seccomp filter for API thread
     let api_seccomp_filter = get_seccomp_filter(seccomp_action, Thread::DBusApi, None)
@@ -385,26 +392,35 @@ pub fn start_dbus_thread(
             }
 
             panic::catch_unwind(AssertUnwindSafe(move || {
-                executor::block_on(async move {
-                    let recv_shutdown = recv_shutdown.fuse();
-                    let executor_tick = future::Fuse::terminated();
-                    futures::pin_mut!(recv_shutdown, executor_tick);
-                    executor_tick.set(connection.executor().tick().fuse());
-
-                    loop {
-                        futures::select! {
-                            _ = executor_tick => executor_tick.set(connection.executor().tick().fuse()),
-                            _ = recv_shutdown => {
-                                send_done.send(()).ok();
-                                break;
-                            },
-                            ret = dbus_options.event_monitor_rx.recv_async() => {
-                                if let Ok(event) = ret {
-                                    DBusApi::event(iface_ref.signal_emitter(), event).await.ok();
-                                }
-                            }
+                future::block_on(async move {
+                    // std channels have no async API, so receive the events
+                    // on a blocking thread.
+                    let mut events =
+                        blocking::Unblock::new(dbus_options.event_monitor_rx.into_iter());
+                    // The connection has no internal executor, so run its
+                    // tasks here. Yield after each task so that a busy
+                    // executor does not starve the shutdown and the events.
+                    let executor = connection.executor();
+                    let run_executor = async {
+                        loop {
+                            executor.tick().await;
+                            future::yield_now().await;
                         }
-                    }
+                    };
+                    let forward_events = async {
+                        while let Some(event) = events.next().await {
+                            DBusApi::event(iface_ref.signal_emitter(), event).await.ok();
+                        }
+                        // Keep serving the API if the event monitor is gone.
+                        future::pending::<()>().await;
+                    };
+
+                    let shutdown = async {
+                        recv_shutdown.recv().await.ok();
+                    };
+
+                    future::or(shutdown, future::or(run_executor, forward_events)).await;
+                    send_done.send(()).ok();
                 });
             }))
             .map_err(|_| {
@@ -418,4 +434,74 @@ pub fn start_dbus_thread(
         .map_err(VmmError::DBusThreadSpawn)?;
 
     Ok((thread_join_handle, (send_shutdown, recv_done)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn disconnected_api() -> DBusApi {
+        let (api_sender, api_receiver) = mpsc::channel();
+        // Disconnect the VMM so an unexpectedly forwarded request cannot block.
+        drop(api_receiver);
+        DBusApi::new(EventFd::new(libc::EFD_NONBLOCK).unwrap(), api_sender)
+    }
+
+    #[test]
+    fn test_vm_create_rejects_required_fds() {
+        let api = disconnected_api();
+
+        for config in [
+            r#"{"net":[{"id":"net0","fds":[42]}]}"#,
+            r#"{"devices":[{"id":"vfio0","fd":42}]}"#,
+        ] {
+            let error = future::block_on(api.vm_create(config.to_owned())).unwrap_err();
+            assert!(
+                matches!(&error, fdo::Error::Failed(message) if message.contains("Missing file descriptors")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vm_hotplug_rejects_required_fds() {
+        let api = disconnected_api();
+        let errors = [
+            future::block_on(api.vm_add_net(r#"{"id":"net0","fds":[42]}"#.to_owned())).unwrap_err(),
+            future::block_on(api.vm_add_device(r#"{"id":"vfio0","fd":42}"#.to_owned()))
+                .unwrap_err(),
+        ];
+        for error in errors {
+            assert!(
+                matches!(&error, fdo::Error::Failed(message) if message.contains("Missing file descriptors")),
+                "{error}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_vm_restore_and_receive_reject_required_fds() {
+        let api = disconnected_api();
+        for fd_config in [
+            r#""vfio_fds":[{"id":"vfio0"}]"#,
+            r#""external_fds":[{"target":{"Net":{"id":"net0"}},"expected_fds":1}]"#,
+        ] {
+            let errors = [
+                future::block_on(api.vm_restore(format!(
+                    r#"{{"source_url":"file:///tmp/snapshot",{fd_config}}}"#
+                )))
+                .unwrap_err(),
+                future::block_on(api.vm_receive_migration(format!(
+                    r#"{{"receiver_url":"unix:/tmp/migration",{fd_config}}}"#
+                )))
+                .unwrap_err(),
+            ];
+            for error in errors {
+                assert!(
+                    matches!(&error, fdo::Error::Failed(message) if message.contains("Less file descriptors provided than expected")),
+                    "{error}"
+                );
+            }
+        }
+    }
 }

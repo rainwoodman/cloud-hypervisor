@@ -19,16 +19,16 @@ use log::{error, warn};
 use smallvec::SmallVec;
 use virtio_bindings::virtio_blk::{
     VIRTIO_BLK_T_DISCARD, VIRTIO_BLK_T_WRITE_ZEROES, VIRTIO_BLK_WRITE_ZEROES_FLAG_UNMAP,
-    virtio_blk_discard_write_zeroes,
+    virtio_blk_discard_write_zeroes, virtio_blk_outhdr,
 };
 use virtio_queue::DescriptorChain;
 use vm_memory::bitmap::Bitmap;
 use vm_memory::{
-    Address as _, Bytes as _, GuestAddress, GuestMemoryBackend as _, GuestMemoryError,
+    Address as _, Bytes as _, GuestAddress, GuestMemoryBackend, GuestMemoryError,
     GuestMemoryLoadGuard,
 };
-use vm_virtio::AccessPlatform;
 use vm_virtio::checked_descriptor::DescriptorChainExt;
+use vm_virtio::{AccessPlatform, AccessType, Translatable};
 use vmm_sys_util::file_traits::FileSync;
 
 use crate::async_io::{
@@ -75,108 +75,140 @@ pub struct Request {
     request_type: RequestType,
     sector: u64,
     data_descriptors: SmallVec<[(GuestAddress, u32); DEFAULT_DESCRIPTOR_VEC_SIZE]>,
-    status_addr: GuestAddress,
     pub writeback: bool,
     start: Instant,
 }
 
 impl Request {
-    pub fn parse<B: Bitmap + 'static>(
-        desc_chain: &mut DescriptorChain<GuestMemoryLoadGuard<vm_memory::GuestMemoryMmap<B>>>,
+    pub fn parse<M: GuestMemoryBackend>(
+        desc_chain: &mut DescriptorChain<GuestMemoryLoadGuard<M>>,
         access_platform: Option<&dyn AccessPlatform>,
-    ) -> Result<Request, Error> {
-        let hdr_desc = desc_chain
-            .next_checked(access_platform)
-            .map_err(|addr| Error::GuestMemory(GuestMemoryError::InvalidGuestAddress(addr)))?
-            .ok_or_else(|| {
-                error!("Missing head descriptor");
-                Error::DescriptorChainTooShort
-            })?;
-
-        // The head contains the request type which MUST be readable.
-        if hdr_desc.is_write_only() {
-            return Err(Error::UnexpectedWriteOnlyDescriptor);
-        }
-
-        let hdr_desc_addr = hdr_desc.addr();
-
-        let mut req = Request {
-            request_type: request_type(desc_chain.memory(), hdr_desc_addr)?,
-            sector: sector(desc_chain.memory(), hdr_desc_addr)?,
-            data_descriptors: SmallVec::with_capacity(DEFAULT_DESCRIPTOR_VEC_SIZE),
-            status_addr: GuestAddress(0),
-            writeback: true,
-            start: Instant::now(),
+    ) -> (Result<Request, Error>, Option<GuestAddress>) {
+        let status_addr = match Self::find_status_addr(&mut desc_chain.clone(), access_platform) {
+            Ok(status_addr) => status_addr,
+            Err(e) => return (Err(e), None),
         };
 
-        let status_desc;
-        let mut desc = desc_chain
-            .next_checked(access_platform)
-            .map_err(|addr| Error::GuestMemory(GuestMemoryError::InvalidGuestAddress(addr)))?
-            .ok_or_else(|| {
-                error!("Only head descriptor present: request = {req:?}");
-                Error::DescriptorChainTooShort
-            })?;
+        let result = (|| -> Result<Request, Error> {
+            let hdr_desc = desc_chain
+                .next_checked(access_platform)
+                .map_err(|addr| Error::GuestMemory(GuestMemoryError::InvalidGuestAddress(addr)))?
+                .ok_or_else(|| {
+                    error!("Missing head descriptor");
+                    Error::DescriptorChainTooShort
+                })?;
 
-        if desc.has_next() {
-            req.data_descriptors.reserve_exact(1);
-            while desc.has_next() {
-                if desc.is_write_only() && req.request_type == RequestType::Out {
-                    return Err(Error::UnexpectedWriteOnlyDescriptor);
-                }
-                if desc.is_write_only() && req.request_type == RequestType::Discard {
-                    return Err(Error::UnexpectedWriteOnlyDescriptor);
-                }
-                if desc.is_write_only() && req.request_type == RequestType::WriteZeroes {
-                    return Err(Error::UnexpectedWriteOnlyDescriptor);
-                }
-                if !desc.is_write_only() && req.request_type == RequestType::In {
-                    return Err(Error::UnexpectedReadOnlyDescriptor);
-                }
-                if !desc.is_write_only() && req.request_type == RequestType::GetDeviceId {
-                    return Err(Error::UnexpectedReadOnlyDescriptor);
-                }
+            // The head contains the request type which MUST be readable.
+            if hdr_desc.is_write_only() {
+                return Err(Error::UnexpectedWriteOnlyDescriptor);
+            }
 
-                req.data_descriptors.push((desc.addr(), desc.len()));
-                desc = desc_chain
-                    .next_checked(access_platform)
-                    .map_err(|addr| {
-                        Error::GuestMemory(GuestMemoryError::InvalidGuestAddress(addr))
-                    })?
-                    .ok_or_else(|| {
-                        error!("DescriptorChain corrupted: request = {req:?}");
-                        Error::DescriptorChainTooShort
-                    })?;
+            if (hdr_desc.len() as usize) < size_of::<virtio_blk_outhdr>() {
+                return Err(Error::DescriptorLengthTooSmall);
             }
-            status_desc = desc;
-        } else {
-            status_desc = desc;
-            // Only flush requests are allowed to skip the data descriptor.
-            if req.request_type != RequestType::Flush {
-                error!("Need a data descriptor: request = {req:?}");
-                return Err(Error::DescriptorChainTooShort);
+
+            let hdr_desc_addr = hdr_desc.addr();
+
+            let mut req = Request {
+                request_type: request_type(desc_chain.memory(), hdr_desc_addr)?,
+                sector: sector(desc_chain.memory(), hdr_desc_addr)?,
+                data_descriptors: SmallVec::with_capacity(DEFAULT_DESCRIPTOR_VEC_SIZE),
+                writeback: true,
+                start: Instant::now(),
+            };
+
+            let mut desc = desc_chain
+                .next_checked(access_platform)
+                .map_err(|addr| Error::GuestMemory(GuestMemoryError::InvalidGuestAddress(addr)))?
+                .ok_or_else(|| {
+                    error!("Only head descriptor present: request = {req:?}");
+                    Error::DescriptorChainTooShort
+                })?;
+
+            if desc.has_next() {
+                req.data_descriptors.reserve_exact(1);
+                while desc.has_next() {
+                    if desc.is_write_only() && req.request_type == RequestType::Out {
+                        return Err(Error::UnexpectedWriteOnlyDescriptor);
+                    }
+                    if desc.is_write_only() && req.request_type == RequestType::Discard {
+                        return Err(Error::UnexpectedWriteOnlyDescriptor);
+                    }
+                    if desc.is_write_only() && req.request_type == RequestType::WriteZeroes {
+                        return Err(Error::UnexpectedWriteOnlyDescriptor);
+                    }
+                    if !desc.is_write_only() && req.request_type == RequestType::In {
+                        return Err(Error::UnexpectedReadOnlyDescriptor);
+                    }
+                    if !desc.is_write_only() && req.request_type == RequestType::GetDeviceId {
+                        return Err(Error::UnexpectedReadOnlyDescriptor);
+                    }
+
+                    req.data_descriptors.push((desc.addr(), desc.len()));
+                    desc = desc_chain
+                        .next_checked(access_platform)
+                        .map_err(|addr| {
+                            Error::GuestMemory(GuestMemoryError::InvalidGuestAddress(addr))
+                        })?
+                        .ok_or_else(|| {
+                            error!("DescriptorChain corrupted: request = {req:?}");
+                            Error::DescriptorChainTooShort
+                        })?;
+                }
+            } else {
+                // Only flush requests are allowed to skip the data descriptor.
+                if req.request_type != RequestType::Flush {
+                    error!("Need a data descriptor: request = {req:?}");
+                    return Err(Error::DescriptorChainTooShort);
+                }
             }
+
+            Ok(req)
+        })();
+
+        (result, Some(status_addr))
+    }
+
+    fn find_status_addr<M: GuestMemoryBackend>(
+        desc_chain: &mut DescriptorChain<GuestMemoryLoadGuard<M>>,
+        access_platform: Option<&dyn AccessPlatform>,
+    ) -> Result<GuestAddress, Error> {
+        let status_desc = desc_chain
+            .by_ref()
+            .last()
+            .ok_or(Error::DescriptorChainTooShort)?;
+
+        if status_desc.has_next() {
+            return Err(Error::DescriptorChainTooShort);
         }
-
         // The status MUST always be writable.
         if !status_desc.is_write_only() {
             return Err(Error::UnexpectedReadOnlyDescriptor);
         }
-
-        if status_desc.is_empty() {
+        if status_desc.len() == 0 {
             return Err(Error::DescriptorLengthTooSmall);
         }
 
-        req.status_addr = status_desc.addr();
-
-        Ok(req)
+        let addr = status_desc
+            .addr()
+            .translate_gva(access_platform, 1, AccessType::Write)
+            .map_err(|_| {
+                Error::GuestMemory(GuestMemoryError::InvalidGuestAddress(status_desc.addr()))
+            })?;
+        desc_chain
+            .memory()
+            .check_range(addr, 1)
+            .then_some(addr)
+            .ok_or(Error::GuestMemory(GuestMemoryError::InvalidGuestAddress(
+                addr,
+            )))
     }
 
-    pub fn execute<T: FileExt + FileSync, B: Bitmap + 'static>(
+    pub fn execute<T: FileExt + FileSync, M: GuestMemoryBackend>(
         &self,
         disk: &mut T,
         disk_nsectors: u64,
-        mem: &vm_memory::GuestMemoryMmap<B>,
+        mem: &M,
         serial: &[u8],
     ) -> Result<u32, ExecuteError> {
         self.check_data_bounds(disk_nsectors)?;
@@ -229,9 +261,9 @@ impl Request {
         Ok(len)
     }
 
-    pub fn execute_async<B: Bitmap + Send + Sync + 'static>(
+    pub fn execute_async<M: GuestMemoryBackend + Send + Sync + 'static>(
         &mut self,
-        mem: Arc<vm_memory::GuestMemoryMmap<B>>,
+        mem: Arc<M>,
         disk_nsectors: u64,
         disk_image: &mut dyn AsyncIo,
         serial: &[u8],
@@ -419,9 +451,9 @@ impl Request {
     }
 
     // Builds a read or write operation for IO to or from `mem`.
-    fn build_data_operation<B: Bitmap + Send + Sync + 'static>(
+    fn build_data_operation<M: GuestMemoryBackend + Send + Sync + 'static>(
         &self,
-        mem: Arc<vm_memory::GuestMemoryMmap<B>>,
+        mem: Arc<M>,
         offset: libc::off_t,
         alignment: Option<u64>,
         user_data: u64,
@@ -440,14 +472,14 @@ impl Request {
         }
 
         if let Some(alignment) = alignment
-            && !self.guest_memory_is_aligned(&mem, alignment)?
+            && !self.guest_memory_is_aligned(mem.as_ref(), alignment)?
         {
             // The guest-memory buffers are unaligned, so use an aligned bounce buffer.
             let mut buffer = OwnedIoBuffer::new(self.data_len(), alignment as usize)
                 .map_err(ExecuteError::TemporaryBufferAllocation)?;
 
             if self.request_type == RequestType::Out {
-                self.copy_guest_to_buffer(&mem, buffer.as_mut_slice())?;
+                self.copy_guest_to_buffer(mem.as_ref(), buffer.as_mut_slice())?;
             }
 
             return Ok(match self.request_type {
@@ -467,9 +499,9 @@ impl Request {
     }
 
     // Checks whether `self.data_descriptors` are aligned to `alignment`.
-    fn guest_memory_is_aligned<B: Bitmap + 'static>(
+    fn guest_memory_is_aligned<M: GuestMemoryBackend>(
         &self,
-        mem: &vm_memory::GuestMemoryMmap<B>,
+        mem: &M,
         alignment: u64,
     ) -> Result<bool, ExecuteError> {
         if alignment <= 1 {
@@ -509,11 +541,7 @@ impl Request {
     }
 
     // Marks the first `len` bytes of the read destinations dirty.
-    fn mark_read_dirty<B: Bitmap + 'static>(
-        &self,
-        mem: &vm_memory::GuestMemoryMmap<B>,
-        len: usize,
-    ) -> Result<(), Error> {
+    fn mark_read_dirty<M: GuestMemoryBackend>(&self, mem: &M, len: usize) -> Result<(), Error> {
         let mut remaining = len;
         for (data_addr, data_len) in &self.data_descriptors {
             if *data_len == 0 {
@@ -533,9 +561,9 @@ impl Request {
     }
 
     // Copies guest descriptor contents into a contiguous host buffer.
-    fn copy_guest_to_buffer<B: Bitmap + 'static>(
+    fn copy_guest_to_buffer<M: GuestMemoryBackend>(
         &self,
-        mem: &vm_memory::GuestMemoryMmap<B>,
+        mem: &M,
         buffer: &mut [u8],
     ) -> Result<(), ExecuteError> {
         let mut offset = 0usize;
@@ -549,9 +577,9 @@ impl Request {
     }
 
     // Copies a host completion buffer back into guest descriptors.
-    fn copy_buffer_to_guest<B: Bitmap + 'static>(
+    fn copy_buffer_to_guest<M: GuestMemoryBackend>(
         &self,
-        mem: &vm_memory::GuestMemoryMmap<B>,
+        mem: &M,
         buffer: &[u8],
     ) -> Result<(), Error> {
         let mut buffer_offset = 0usize;
@@ -567,9 +595,9 @@ impl Request {
         Ok(())
     }
 
-    pub fn complete_async<B: Bitmap + 'static>(
+    pub fn complete_async<M: GuestMemoryBackend>(
         &mut self,
-        mem: &vm_memory::GuestMemoryMmap<B>,
+        mem: &M,
         completion: &mut AsyncIoCompletion,
     ) -> Result<(), Error> {
         if self.request_type == RequestType::In && completion.result > 0 {
@@ -593,11 +621,6 @@ impl Request {
         &self,
     ) -> &SmallVec<[(GuestAddress, u32); DEFAULT_DESCRIPTOR_VEC_SIZE]> {
         &self.data_descriptors
-    }
-
-    #[inline]
-    pub fn status_addr(&self) -> GuestAddress {
-        self.status_addr
     }
 
     #[inline]
@@ -626,9 +649,6 @@ impl Request {
             total_bytes = total_bytes
                 .checked_add(u64::from(*data_len))
                 .ok_or(ExecuteError::BadRequest(Error::InvalidOffset))?;
-        }
-        if total_bytes == 0 {
-            return Ok(());
         }
         if !total_bytes.is_multiple_of(SECTOR_SIZE) {
             return Err(ExecuteError::BadRequest(Error::InvalidDataLength));
@@ -706,7 +726,6 @@ mod tests {
                     request_type,
                     sector: 0,
                     data_descriptors: SmallVec::from_slice(&[(GuestAddress(0), len)]),
-                    status_addr: GuestAddress(8191),
                     writeback: true,
                     start: Instant::now(),
                 };
@@ -738,7 +757,6 @@ mod tests {
                     (GuestAddress(1), 512),
                     (GuestAddress(513), 3584),
                 ]),
-                status_addr: GuestAddress(8191),
                 writeback: true,
                 start: Instant::now(),
             };
@@ -771,7 +789,6 @@ mod tests {
             request_type: RequestType::WriteZeroes,
             sector: 0,
             data_descriptors: SmallVec::from_slice(&[(GuestAddress(0), DISCARD_WZ_SEG_SIZE)]),
-            status_addr: GuestAddress(0),
             writeback: true,
             start: Instant::now(),
         };
@@ -791,21 +808,25 @@ mod tests {
     /// the submit does not survive that harvest.
     #[test]
     fn read_marks_survive_a_dirty_log_harvest_while_in_flight() {
+        use vm_allocator::page_size::get_page_size;
         use vm_memory::bitmap::AtomicBitmap;
         use vm_memory::{GuestMemoryBackend, GuestMemoryRegion};
 
+        let page_size = get_page_size();
         let mem = Arc::new(
-            GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap(),
+            GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(
+                GuestAddress(0),
+                16 * page_size as usize,
+            )])
+            .unwrap(),
         );
-        // One page at 0x1000, two pages at 0x4000
         let mut request = Request {
             request_type: RequestType::In,
             sector: 0,
             data_descriptors: SmallVec::from_slice(&[
-                (GuestAddress(0x1000), 0x1000),
-                (GuestAddress(0x4000), 0x2000),
+                (GuestAddress(page_size), page_size as u32),
+                (GuestAddress(4 * page_size), 2 * page_size as u32),
             ]),
-            status_addr: GuestAddress(0),
             writeback: true,
             start: Instant::now(),
         };
@@ -823,12 +844,81 @@ mod tests {
         (**region).bitmap().get_and_reset();
 
         // The backend filled the first buffer and one page of the second
-        let mut completion = AsyncIoCompletion::from_operation(op, 0x2000);
-        request.complete_async(&mem, &mut completion).unwrap();
+        let mut completion = AsyncIoCompletion::from_operation(op, 2 * page_size as i32);
+        request
+            .complete_async(mem.as_ref(), &mut completion)
+            .unwrap();
 
         let bitmap = region.bitmap();
-        assert!(bitmap.dirty_at(0x1000));
-        assert!(bitmap.dirty_at(0x4000));
-        assert!(!bitmap.dirty_at(0x5000));
+        assert!(bitmap.dirty_at(page_size as usize));
+        assert!(bitmap.dirty_at(4 * page_size as usize));
+        assert!(!bitmap.dirty_at(5 * page_size as usize));
+    }
+
+    // A request without data still has to start within the disk.
+    #[test]
+    fn zero_length_request_past_capacity_is_rejected() {
+        for request_type in [RequestType::In, RequestType::Out] {
+            for (sector, valid) in [(1024, true), (1025, false), (1 << 54, false)] {
+                let request = Request {
+                    request_type,
+                    sector,
+                    data_descriptors: SmallVec::from_slice(&[(GuestAddress(0), 0)]),
+                    writeback: true,
+                    start: Instant::now(),
+                };
+                let result = request.check_data_bounds(1024);
+                if valid {
+                    result.expect("an empty request at capacity should be accepted");
+                } else {
+                    assert!(
+                        matches!(result, Err(ExecuteError::BadRequest(Error::InvalidOffset))),
+                        "empty request at sector {sector} was accepted"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn short_header_descriptor_is_rejected() {
+        use virtio_bindings::virtio_blk::VIRTIO_BLK_T_IN;
+        use virtio_bindings::virtio_ring::{VRING_DESC_F_NEXT, VRING_DESC_F_WRITE};
+        use virtio_queue::QueueT;
+        use vm_memory::bitmap::AtomicBitmap;
+        use vm_memory::{GuestAddressSpace, GuestMemoryAtomic};
+        use vm_virtio::queue::testing::VirtQueue as GuestQ;
+
+        let mem =
+            GuestMemoryMmap::<AtomicBitmap>::from_ranges(&[(GuestAddress(0), 0x10000)]).unwrap();
+        mem.write_obj(VIRTIO_BLK_T_IN, GuestAddress(0x2000))
+            .unwrap();
+        let mem_atomic = GuestMemoryAtomic::new(mem.clone());
+
+        for (hdr_len, valid) in [(0, false), (8, false), (15, false), (16, true)] {
+            let vq = GuestQ::new(GuestAddress(0x1000), &mem, 4);
+            vq.dtable[0].set(0x2000, hdr_len, VRING_DESC_F_NEXT as u16, 1);
+            vq.dtable[1].set(
+                0x3000,
+                512,
+                (VRING_DESC_F_NEXT | VRING_DESC_F_WRITE) as u16,
+                2,
+            );
+            vq.dtable[2].set(0x4000, 1, VRING_DESC_F_WRITE as u16, 0);
+            vq.avail.ring[0].set(0);
+            vq.avail.idx.set(1);
+
+            let mut queue = vq.create_queue();
+            let mut chain = queue.pop_descriptor_chain(mem_atomic.memory()).unwrap();
+            let (result, _) = Request::parse(&mut chain, None);
+            if valid {
+                assert_eq!(result.unwrap().request_type(), RequestType::In);
+            } else {
+                assert!(
+                    matches!(result, Err(Error::DescriptorLengthTooSmall)),
+                    "header of {hdr_len} bytes was accepted"
+                );
+            }
+        }
     }
 }

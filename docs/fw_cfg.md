@@ -15,7 +15,8 @@ The `fw_cfg` device serves as a generic information channel between the VMM and 
 
 ## Enabling `fw_cfg`
 
-The `fw_cfg` device is enabled via the `fw_cfg` feature flag when building Cloud Hypervisor:
+The `fw_cfg` device requires the `fw_cfg` feature at build time. It is not
+enabled by default or in the release binaries:
 
 ```bash
 cargo build --features fw_cfg
@@ -57,7 +58,8 @@ This option allows the kernel to expose `fw_cfg` entries under `/sys/firmware/qe
 The `fw_cfg` device is configured using the `--fw-cfg-config` command-line option.
 
 **Parameters:**
-*   `e820=on|off`: (Default: `on`) Whether to add an E820 memory map entry to `fw_cfg`.
+*   `e820=on|off`: (Default: `on` on x86-64) Whether to add the E820 memory map
+    to `fw_cfg` as `etc/e820`. AArch64 has no E820 map and ignores this option.
 *   `kernel=on|off`: (Default: `on`) Whether to add the kernel image (specified by `--kernel`) to `fw_cfg`.
 *   `cmdline=on|off`: (Default: `on`) Whether to add the kernel command line (specified by `--cmdline`) to `fw_cfg`.
 *   `initramfs=on|off`: (Default: `on`) Whether to add the initramfs image (specified by `--initramfs`) to `fw_cfg`.
@@ -88,18 +90,15 @@ The `fw_cfg` device is configured using the `--fw-cfg-config` command-line optio
         --firmware /path/to/OVMF.fd \
         --disk path=/path/to/rootfs.img,image_type=raw \
         --device path=/sys/bus/pci/devices/0000:41:00.0 \
-        --fw-cfg-config items=[name=opt/ovmf/X-PciMmio64Mb,string=262144] \
+        --fw-cfg-config kernel=off,cmdline=off,initramfs=off,items=[name=opt/ovmf/X-PciMmio64Mb,string=262144] \
         ...
     ```
     The string `262144` is passed directly to the guest as the content of `opt/ovmf/X-PciMmio64Mb`.
 
-3.  **Disabling `fw_cfg` explicitly:**
+3.  **Disabling `fw_cfg`:**
 
-    ```bash
-    cloud-hypervisor \
-        --fw-cfg-config disable \
-        ...
-    ```
+    Omit `--fw-cfg-config`. The device is only created when this option is
+    passed.
 
 ## Accessing `fw_cfg` Items in the Guest
 
@@ -108,6 +107,9 @@ If `CONFIG_FW_CFG_SYSFS` is enabled in the guest kernel, items added to `fw_cfg`
 For example, an item added with `name=opt/org.example/my-data` will be available at:
 `/sys/firmware/qemu_fw_cfg/by_name/opt/org.example/my-data/raw`
 
-The `raw` file contains the binary content of the host file provided.
+The `raw` file contains the content of the host file or the inline string.
 
-Standard items like kernel, initramfs, cmdline, and ACPI tables also have predefined names (e.g., `etc/kernel`, `etc/cmdline`) if they are enabled to be passed via `fw_cfg`.
+The kernel, initramfs, and command line use fixed `fw_cfg` selectors without
+file names, so they do not appear under `by_name`. Other standard items have
+predefined names: `etc/e820` for the E820 memory map, and `acpi/tables`,
+`acpi/rsdp`, and `etc/table-loader` for the ACPI tables.

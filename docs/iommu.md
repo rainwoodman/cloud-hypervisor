@@ -49,12 +49,11 @@ layer of virtualization.
 
 ## Why virtio-iommu?
 
-The Cloud Hypervisor project decided to implement the brand new virtio-iommu
+The Cloud Hypervisor project decided to implement the virtio-iommu
 device in order to provide a virtual IOMMU to its users. The reason being the
 simplicity brought by the paravirtualization solution. By having one side
 handled from the guest itself, it removes the complexity of trapping memory
-page accesses and shadowing them. This is why the project will not try to
-implement a full emulation of a physical IOMMU.
+page accesses and shadowing them.
 
 ## Pre-requisites
 
@@ -65,7 +64,7 @@ As of Kernel 5.14, virtio-iommu is available for both X86-64 and Aarch64.
 ## Usage
 
 In order to expose a virtual IOMMU to the guest, it is required to create a
-virtio-iommu device and expose it through the ACPI IORT table. This can be
+virtio-iommu device and expose it through the ACPI VIOT table. This can be
 simply achieved by attaching at least one device to the virtual IOMMU.
 
 The way to expose to the guest a specific device as sitting behind this IOMMU
@@ -266,8 +265,6 @@ e.g.
 Devices that cannot be placed behind an IOMMU (e.g. lacking an `iommu=` option)
 cannot be placed on the IOMMU segments.
 
-
-
 ## Emulated ARM SMMUv3 (AArch64)
 
 > **Note**
@@ -321,7 +318,7 @@ Limitations:
     --api-socket=/tmp/api \
     --cpus boot=8 \
     --memory size=16G \
-    --disk path=focal-server-cloudimg-arm64.raw \
+    --disk path=focal-server-cloudimg-arm64.raw,image_type=raw \
     --kernel CLOUDHV_EFI.fd \
     --platform iommufd=on \
     --device path=/sys/bus/pci/devices/0009:01:00.0/,iommu=smmuv3

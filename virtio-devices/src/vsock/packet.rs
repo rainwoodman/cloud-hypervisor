@@ -19,7 +19,6 @@ use std::cmp;
 use std::io::{self, ErrorKind, Read, Write};
 use std::ops::Deref;
 
-use byteorder::{ByteOrder, LittleEndian};
 use virtio_queue::DescriptorChain;
 use vm_memory::{
     Address, Bytes, GuestAddress, GuestMemoryBackend, ReadVolatile, VolatileMemoryError,
@@ -29,7 +28,7 @@ use vm_virtio::AccessPlatform;
 use vm_virtio::checked_descriptor::DescriptorChainExt;
 
 use super::{Result, VsockError, defs};
-use crate::GuestMemoryMmap;
+use crate::GuestMemory;
 
 // The vsock packet header is defined by the C struct:
 //
@@ -96,6 +95,18 @@ const HDROFF_BUF_ALLOC: usize = 36;
 // we have successfully written to a backing Unix socket.
 const HDROFF_FWD_CNT: usize = 40;
 
+/// Returns the `N` bytes of the header field at `offset`.
+fn hdr_field<const N: usize>(hdr: &[u8], offset: usize) -> [u8; N] {
+    let mut field = [0; N];
+    field.copy_from_slice(&hdr[offset..offset + N]);
+    field
+}
+
+/// Overwrites the header field at `offset` with `field`.
+fn set_hdr_field<const N: usize>(hdr: &mut [u8], offset: usize, field: [u8; N]) {
+    hdr[offset..offset + N].copy_from_slice(&field);
+}
+
 /// The packet data buffer, which may be either:
 /// - a contiguous range of guest memory, if the packet data is stored in one contiguous buffer
 ///   described by a single virtq descriptor;
@@ -103,7 +114,7 @@ const HDROFF_FWD_CNT: usize = 40;
 ///   multiple virtq descriptors.
 enum PacketBuffer {
     Guest {
-        mem: GuestMemoryMmap,
+        mem: GuestMemory,
         addr: GuestAddress,
         len: usize,
     },
@@ -111,7 +122,7 @@ enum PacketBuffer {
 }
 
 impl PacketBuffer {
-    fn guest(mem: GuestMemoryMmap, addr: GuestAddress, len: usize) -> Result<Self> {
+    fn guest(mem: GuestMemory, addr: GuestAddress, len: usize) -> Result<Self> {
         // Validate the range before storing it.
         mem.get_slice(addr, len)
             .map_err(|_| VsockError::GuestMemory)?;
@@ -166,7 +177,6 @@ impl PacketBuffer {
         Ok(())
     }
 
-    #[cfg(test)]
     fn copy_from_slice(&mut self, offset: usize, src: &[u8]) -> Result<()> {
         self.check_range(offset, src.len())?;
         if src.is_empty() {
@@ -243,7 +253,6 @@ fn vsock_error_to_io(err: &VsockError) -> io::Error {
 /// The vsock packet, implemented as a wrapper over a virtq descriptor chain:
 /// - the chain head, holding the packet header; and
 /// - (optional) buffer, only present for data packets (VSOCK_OP_RW).
-///
 pub struct VsockPacket {
     // We still hold the header address in guest memory. We need to write back the modified
     // header in RX buffers.
@@ -258,13 +267,12 @@ impl VsockPacket {
     /// The chain head is expected to hold valid packet header data. A following packet buffer
     /// descriptor can optionally end the chain. Bounds and pointer checks are performed when
     /// creating the wrapper.
-    ///
     pub fn from_tx_virtq_head<M>(
         desc_chain: &mut DescriptorChain<M>,
         access_platform: Option<&dyn AccessPlatform>,
     ) -> Result<Self>
     where
-        M: Clone + Deref<Target = GuestMemoryMmap>,
+        M: Clone + Deref<Target = GuestMemory>,
     {
         let head = desc_chain
             .next_checked(access_platform)
@@ -403,13 +411,12 @@ impl VsockPacket {
     ///
     /// There must be two descriptors in the chain, both writable: a header descriptor and a data
     /// descriptor. Bounds and pointer checks are performed when creating the wrapper.
-    ///
     pub fn from_rx_virtq_head<M>(
         desc_chain: &mut DescriptorChain<M>,
         access_platform: Option<&dyn AccessPlatform>,
     ) -> Result<Self>
     where
-        M: Clone + Deref<Target = GuestMemoryMmap>,
+        M: Clone + Deref<Target = GuestMemory>,
     {
         let head = desc_chain
             .next_checked(access_platform)
@@ -490,19 +497,16 @@ impl VsockPacket {
     }
 
     /// Provides in-place, byte-slice, access to the vsock packet header.
-    ///
     pub fn hdr(&self) -> &[u8] {
         self.hdr.as_slice()
     }
 
     /// Provides in-place, byte-slice, mutable access to the vsock packet header.
-    ///
     pub fn hdr_mut(&mut self) -> &mut [u8] {
         self.hdr.as_mut_slice()
     }
 
     /// Writes the local copy of the packet header to the guest memory.
-    ///
     pub fn commit_hdr<M: GuestMemoryBackend>(&mut self, guest_mem: &M) -> Result<()> {
         self.validate_len()?;
 
@@ -543,7 +547,6 @@ impl VsockPacket {
             .copy_to_slice(offset, dst)
     }
 
-    #[cfg(test)]
     pub fn copy_buf_from_slice(&mut self, offset: usize, src: &[u8]) -> Result<()> {
         self.buf
             .as_mut()
@@ -579,43 +582,43 @@ impl VsockPacket {
     }
 
     pub fn src_cid(&self) -> u64 {
-        LittleEndian::read_u64(&self.hdr()[HDROFF_SRC_CID..])
+        u64::from_le_bytes(hdr_field(self.hdr(), HDROFF_SRC_CID))
     }
 
     pub fn set_src_cid(&mut self, cid: u64) -> &mut Self {
-        LittleEndian::write_u64(&mut self.hdr_mut()[HDROFF_SRC_CID..], cid);
+        set_hdr_field(self.hdr_mut(), HDROFF_SRC_CID, cid.to_le_bytes());
         self
     }
 
     pub fn dst_cid(&self) -> u64 {
-        LittleEndian::read_u64(&self.hdr()[HDROFF_DST_CID..])
+        u64::from_le_bytes(hdr_field(self.hdr(), HDROFF_DST_CID))
     }
 
     pub fn set_dst_cid(&mut self, cid: u64) -> &mut Self {
-        LittleEndian::write_u64(&mut self.hdr_mut()[HDROFF_DST_CID..], cid);
+        set_hdr_field(self.hdr_mut(), HDROFF_DST_CID, cid.to_le_bytes());
         self
     }
 
     pub fn src_port(&self) -> u32 {
-        LittleEndian::read_u32(&self.hdr()[HDROFF_SRC_PORT..])
+        u32::from_le_bytes(hdr_field(self.hdr(), HDROFF_SRC_PORT))
     }
 
     pub fn set_src_port(&mut self, port: u32) -> &mut Self {
-        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_SRC_PORT..], port);
+        set_hdr_field(self.hdr_mut(), HDROFF_SRC_PORT, port.to_le_bytes());
         self
     }
 
     pub fn dst_port(&self) -> u32 {
-        LittleEndian::read_u32(&self.hdr()[HDROFF_DST_PORT..])
+        u32::from_le_bytes(hdr_field(self.hdr(), HDROFF_DST_PORT))
     }
 
     pub fn set_dst_port(&mut self, port: u32) -> &mut Self {
-        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_DST_PORT..], port);
+        set_hdr_field(self.hdr_mut(), HDROFF_DST_PORT, port.to_le_bytes());
         self
     }
 
     pub fn len(&self) -> u32 {
-        LittleEndian::read_u32(&self.hdr()[HDROFF_LEN..])
+        u32::from_le_bytes(hdr_field(self.hdr(), HDROFF_LEN))
     }
 
     pub fn is_empty(&self) -> bool {
@@ -623,34 +626,34 @@ impl VsockPacket {
     }
 
     pub fn set_len(&mut self, len: u32) -> &mut Self {
-        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_LEN..], len);
+        set_hdr_field(self.hdr_mut(), HDROFF_LEN, len.to_le_bytes());
         self
     }
 
     pub fn type_(&self) -> u16 {
-        LittleEndian::read_u16(&self.hdr()[HDROFF_TYPE..])
+        u16::from_le_bytes(hdr_field(self.hdr(), HDROFF_TYPE))
     }
 
     pub fn set_type(&mut self, type_: u16) -> &mut Self {
-        LittleEndian::write_u16(&mut self.hdr_mut()[HDROFF_TYPE..], type_);
+        set_hdr_field(self.hdr_mut(), HDROFF_TYPE, type_.to_le_bytes());
         self
     }
 
     pub fn op(&self) -> u16 {
-        LittleEndian::read_u16(&self.hdr()[HDROFF_OP..])
+        u16::from_le_bytes(hdr_field(self.hdr(), HDROFF_OP))
     }
 
     pub fn set_op(&mut self, op: u16) -> &mut Self {
-        LittleEndian::write_u16(&mut self.hdr_mut()[HDROFF_OP..], op);
+        set_hdr_field(self.hdr_mut(), HDROFF_OP, op.to_le_bytes());
         self
     }
 
     pub fn flags(&self) -> u32 {
-        LittleEndian::read_u32(&self.hdr()[HDROFF_FLAGS..])
+        u32::from_le_bytes(hdr_field(self.hdr(), HDROFF_FLAGS))
     }
 
     pub fn set_flags(&mut self, flags: u32) -> &mut Self {
-        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_FLAGS..], flags);
+        set_hdr_field(self.hdr_mut(), HDROFF_FLAGS, flags.to_le_bytes());
         self
     }
 
@@ -660,20 +663,20 @@ impl VsockPacket {
     }
 
     pub fn buf_alloc(&self) -> u32 {
-        LittleEndian::read_u32(&self.hdr()[HDROFF_BUF_ALLOC..])
+        u32::from_le_bytes(hdr_field(self.hdr(), HDROFF_BUF_ALLOC))
     }
 
     pub fn set_buf_alloc(&mut self, buf_alloc: u32) -> &mut Self {
-        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_BUF_ALLOC..], buf_alloc);
+        set_hdr_field(self.hdr_mut(), HDROFF_BUF_ALLOC, buf_alloc.to_le_bytes());
         self
     }
 
     pub fn fwd_cnt(&self) -> u32 {
-        LittleEndian::read_u32(&self.hdr()[HDROFF_FWD_CNT..])
+        u32::from_le_bytes(hdr_field(self.hdr(), HDROFF_FWD_CNT))
     }
 
     pub fn set_fwd_cnt(&mut self, fwd_cnt: u32) -> &mut Self {
-        LittleEndian::write_u32(&mut self.hdr_mut()[HDROFF_FWD_CNT..], fwd_cnt);
+        set_hdr_field(self.hdr_mut(), HDROFF_FWD_CNT, fwd_cnt.to_le_bytes());
         self
     }
 }
@@ -687,7 +690,7 @@ mod tests {
 
     use super::super::tests::TestContext;
     use super::*;
-    use crate::GuestMemoryMmap;
+    use crate::GuestMemory;
     use crate::vsock::defs::MAX_PKT_BUF_SIZE;
 
     macro_rules! create_context {
@@ -722,7 +725,7 @@ mod tests {
         };
     }
 
-    fn set_pkt_len(len: u32, guest_desc: &GuestQDesc, mem: &GuestMemoryMmap) {
+    fn set_pkt_len(len: u32, guest_desc: &GuestQDesc<'_, GuestMemory>, mem: &GuestMemory) {
         let hdr_gpa = guest_desc.addr.get();
         mem.write_slice(
             &len.to_le_bytes(),
@@ -969,31 +972,34 @@ mod tests {
 
         assert_eq!(
             SRC_CID,
-            LittleEndian::read_u64(&pkt.hdr()[HDROFF_SRC_CID..])
+            u64::from_le_bytes(hdr_field(pkt.hdr(), HDROFF_SRC_CID))
         );
         assert_eq!(
             DST_CID,
-            LittleEndian::read_u64(&pkt.hdr()[HDROFF_DST_CID..])
+            u64::from_le_bytes(hdr_field(pkt.hdr(), HDROFF_DST_CID))
         );
         assert_eq!(
             SRC_PORT,
-            LittleEndian::read_u32(&pkt.hdr()[HDROFF_SRC_PORT..])
+            u32::from_le_bytes(hdr_field(pkt.hdr(), HDROFF_SRC_PORT))
         );
         assert_eq!(
             DST_PORT,
-            LittleEndian::read_u32(&pkt.hdr()[HDROFF_DST_PORT..])
+            u32::from_le_bytes(hdr_field(pkt.hdr(), HDROFF_DST_PORT))
         );
-        assert_eq!(LEN, LittleEndian::read_u32(&pkt.hdr()[HDROFF_LEN..]));
-        assert_eq!(TYPE, LittleEndian::read_u16(&pkt.hdr()[HDROFF_TYPE..]));
-        assert_eq!(OP, LittleEndian::read_u16(&pkt.hdr()[HDROFF_OP..]));
-        assert_eq!(FLAGS, LittleEndian::read_u32(&pkt.hdr()[HDROFF_FLAGS..]));
+        assert_eq!(LEN, u32::from_le_bytes(hdr_field(pkt.hdr(), HDROFF_LEN)));
+        assert_eq!(TYPE, u16::from_le_bytes(hdr_field(pkt.hdr(), HDROFF_TYPE)));
+        assert_eq!(OP, u16::from_le_bytes(hdr_field(pkt.hdr(), HDROFF_OP)));
+        assert_eq!(
+            FLAGS,
+            u32::from_le_bytes(hdr_field(pkt.hdr(), HDROFF_FLAGS))
+        );
         assert_eq!(
             BUF_ALLOC,
-            LittleEndian::read_u32(&pkt.hdr()[HDROFF_BUF_ALLOC..])
+            u32::from_le_bytes(hdr_field(pkt.hdr(), HDROFF_BUF_ALLOC))
         );
         assert_eq!(
             FWD_CNT,
-            LittleEndian::read_u32(&pkt.hdr()[HDROFF_FWD_CNT..])
+            u32::from_le_bytes(hdr_field(pkt.hdr(), HDROFF_FWD_CNT))
         );
 
         assert_eq!(pkt.hdr_mut().len(), VSOCK_PKT_HDR_SIZE);

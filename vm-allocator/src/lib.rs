@@ -11,6 +11,7 @@
 //! Manages system resources that can be allocated to VMs and their devices.
 
 mod address;
+mod aligned_mapping;
 mod gsi;
 /// page size related utility functions
 pub mod page_size;
@@ -23,3 +24,7 @@ pub use crate::gsi::{GsiAllocator, InterruptAllocError};
 pub use crate::system::SystemAllocator;
 mod memory_slot;
 pub use memory_slot::MemorySlotAllocator;
+mod guest_memory;
+pub use guest_memory::{Error as GuestRegionError, GuestMemory, GuestRegion};
+mod range_map;
+pub use range_map::{RangeMap, RangeMapError};

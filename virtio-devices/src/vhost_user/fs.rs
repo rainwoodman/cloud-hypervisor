@@ -2,17 +2,15 @@
 // SPDX-License-Identifier: Apache-2.0
 
 use std::result;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 
 use event_monitor::event;
 use log::{error, info};
 use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use serde_with::{Bytes, serde_as};
-use vhost::vhost_user::message::{VhostUserProtocolFeatures, VhostUserVirtioFeatures};
+use vhost::vhost_user::message::VhostUserProtocolFeatures;
 use vhost::vhost_user::{FrontendReqHandler, VhostUserFrontend, VhostUserFrontendReqHandler};
-use vm_device::UserspaceMapping;
 use vm_memory::ByteValued;
 use vm_migration::protocol::MemoryRangeTable;
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
@@ -22,10 +20,10 @@ use super::vu_common_ctrl::VhostUserHandle;
 use super::{DEFAULT_VIRTIO_FEATURES, Error, Result};
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
-use crate::vhost_user::{VhostUserCommon, VhostUserState};
+use crate::vhost_user::{PostcopyHandler, VhostUserCommon, VhostUserState};
 use crate::{
-    ActivateResult, GuestRegionMmap, MmapRegion, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon,
-    VirtioDevice, VirtioDeviceType, VirtioSharedMemoryList,
+    ActivateResult, GuestRegion, VIRTIO_F_ACCESS_PLATFORM, VirtioCommon, VirtioDevice,
+    VirtioDeviceType, VirtioSharedMemoryList,
 };
 
 const NUM_QUEUE_OFFSET: u16 = 1;
@@ -64,7 +62,7 @@ pub struct Fs {
     config: VirtioFsConfig,
     // Hold ownership of the memory that is allocated for the device
     // which will be automatically dropped when the device is dropped
-    cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
+    cache: Option<VirtioSharedMemoryList>,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
 }
@@ -78,11 +76,12 @@ impl Fs {
         tag: &str,
         req_num_queues: u16,
         queue_size: u16,
-        cache: Option<(VirtioSharedMemoryList, MmapRegion)>,
+        cache: Option<VirtioSharedMemoryList>,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
         access_platform_enabled: bool,
         state: Option<State>,
+        postcopy_handler: Option<Arc<dyn PostcopyHandler>>,
     ) -> Result<Fs> {
         // Calculate the actual number of queues needed.
         let num_queues = req_num_queues
@@ -107,8 +106,8 @@ impl Fs {
             info!("Restoring vhost-user-fs {id}");
 
             vu.set_protocol_features_vhost_user(
-                state.acked_features,
                 state.acked_protocol_features,
+                postcopy_handler.is_some(),
             )?;
 
             vu.restore_state(&state)?;
@@ -133,8 +132,11 @@ impl Fs {
                 | VhostUserProtocolFeatures::LOG_SHMFD
                 | VhostUserProtocolFeatures::DEVICE_STATE;
 
-            let (acked_features, acked_protocol_features) =
-                vu.negotiate_features_vhost_user(avail_features, avail_protocol_features)?;
+            let (acked_features, acked_protocol_features) = vu.negotiate_features_vhost_user(
+                avail_features,
+                avail_protocol_features,
+                postcopy_handler.is_some(),
+            )?;
 
             let backend_num_queues =
                 if acked_protocol_features & VhostUserProtocolFeatures::MQ.bits() != 0 {
@@ -170,11 +172,7 @@ impl Fs {
 
             (
                 avail_features,
-                // If part of the available features that have been acked, the
-                // PROTOCOL_FEATURES bit must be already set through the VIRTIO
-                // acked features as we know the guest would never ack it, thus
-                // the feature would be lost.
-                acked_features & VhostUserVirtioFeatures::PROTOCOL_FEATURES.bits(),
+                0,
                 acked_protocol_features,
                 num_queues,
                 config,
@@ -183,24 +181,27 @@ impl Fs {
             )
         };
 
+        if let Some(postcopy_handler) = postcopy_handler {
+            vu.start_postcopy(id.clone(), postcopy_handler)?;
+        }
+
+        let virtio_common = VirtioCommon {
+            device_type: VirtioDeviceType::Fs as u32,
+            avail_features,
+            acked_features,
+            queue_sizes: vec![queue_size; num_queues as usize],
+            min_queues: 1,
+            ..VirtioCommon::new(paused).map_err(Error::CreateEventFd)?
+        };
+
         Ok(Fs {
             vu_common: VhostUserCommon {
-                virtio_common: VirtioCommon {
-                    device_type: VirtioDeviceType::Fs as u32,
-                    avail_features,
-                    acked_features,
-                    queue_sizes: vec![queue_size; num_queues as usize],
-                    paused_sync: Some(Arc::new(Barrier::new(2))),
-                    min_queues: 1,
-                    paused: Arc::new(AtomicBool::new(paused)),
-                    ..Default::default()
-                },
                 vu: Some(Arc::new(Mutex::new(vu))),
                 acked_protocol_features,
                 socket_path: path.to_string(),
                 vu_num_queues,
                 vring_bases,
-                ..Default::default()
+                ..VhostUserCommon::new(virtio_common)
             },
             id,
             config,
@@ -268,9 +269,6 @@ impl VirtioDevice for Fs {
             pause_evt,
         )?;
 
-        let paused = Arc::clone(&self.vu_common.virtio_common.paused);
-        let paused_sync = self.vu_common.virtio_common.paused_sync.clone();
-
         self.vu_common.spawn_worker(
             &self.id,
             &self.seccomp_action,
@@ -278,7 +276,7 @@ impl VirtioDevice for Fs {
             &self.exit_evt,
             Arc::clone(&device_status),
             Arc::clone(&interrupt_cb),
-            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            move |pause_common| handler.run(pause_common),
         )?;
 
         event!("virtio-device", "activated", "id", &self.id);
@@ -294,7 +292,7 @@ impl VirtioDevice for Fs {
     }
 
     fn get_shm_regions(&self) -> Option<VirtioSharedMemoryList> {
-        self.cache.as_ref().map(|cache| cache.0.clone())
+        self.cache.clone()
     }
 
     fn set_shm_regions(
@@ -302,32 +300,15 @@ impl VirtioDevice for Fs {
         shm_regions: VirtioSharedMemoryList,
     ) -> result::Result<(), crate::Error> {
         if let Some(cache) = self.cache.as_mut() {
-            cache.0 = shm_regions;
+            *cache = shm_regions;
             Ok(())
         } else {
             Err(crate::Error::SetShmRegionsNotSupported)
         }
     }
 
-    fn add_memory_region(
-        &mut self,
-        region: &Arc<GuestRegionMmap>,
-    ) -> result::Result<(), crate::Error> {
+    fn add_memory_region(&mut self, region: &Arc<GuestRegion>) -> result::Result<(), crate::Error> {
         self.vu_common.add_memory_region(region)
-    }
-
-    fn userspace_mappings(&self) -> Vec<UserspaceMapping> {
-        let mut mappings = Vec::new();
-        if let Some(cache) = self.cache.as_ref() {
-            mappings.push(UserspaceMapping {
-                mem_slot: cache.0.mem_slot,
-                addr: cache.0.addr,
-                mapping: Arc::clone(&cache.0.mapping),
-                mergeable: false,
-            });
-        }
-
-        mappings
     }
 }
 

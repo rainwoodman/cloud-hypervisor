@@ -147,14 +147,6 @@ pub trait InterruptManager: Send + Sync {
             "setting notifiers not supported",
         ))
     }
-
-    /// Destroy an [InterruptSourceGroup](trait.InterruptSourceGroup.html) object created by
-    /// [create_group()](trait.InterruptManager.html#tymethod.create_group).
-    ///
-    /// Assume the caller takes the responsibility to disable all interrupt sources of the group
-    /// before calling destroy_group(). This assumption helps to simplify InterruptSourceGroup
-    /// implementations.
-    fn destroy_group(&self, group: Arc<dyn InterruptSourceGroup>) -> Result<()>;
 }
 
 pub trait InterruptSourceGroup: Send + Sync {
@@ -180,7 +172,9 @@ pub trait InterruptSourceGroup: Send + Sync {
     /// An interrupt notifier allows for external components and processes
     /// to inject interrupts into a guest, by writing to the [`EventFd`] returned
     /// by this method.
-    fn notifier(&self, index: InterruptIndex) -> Option<EventFd>;
+    /// Returns `Ok(None)` if no notifier is available, or an error if obtaining
+    /// the notifier fails.
+    fn notifier(&self, index: InterruptIndex) -> Result<Option<EventFd>>;
 
     /// Update the interrupt source group configuration.
     ///

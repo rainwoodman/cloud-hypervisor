@@ -30,8 +30,8 @@ use vhost::vhost_kern::vhost_binding::{
 use virtio_devices::vdpa::VHOST_VDPA_RESUME;
 
 use crate::userfaultfd::{
-    UFFDIO_API, UFFDIO_CONTINUE, UFFDIO_COPY, UFFDIO_POISON, UFFDIO_REGISTER, UFFDIO_WAKE,
-    UFFDIO_ZEROPAGE, USERFAULTFD_IOC_NEW,
+    UFFDIO_API, UFFDIO_CONTINUE, UFFDIO_COPY, UFFDIO_POISON, UFFDIO_REGISTER, UFFDIO_UNREGISTER,
+    UFFDIO_WAKE, UFFDIO_ZEROPAGE, USERFAULTFD_IOC_NEW,
 };
 
 #[derive(Copy, Clone)]
@@ -105,7 +105,6 @@ mod kvm {
     pub(super) const KVM_SET_DEVICE_ATTR: u64 = 0x4018_aee1;
     pub(super) const KVM_HAS_DEVICE_ATTR: u64 = 0x4018_aee3;
     pub(super) const KVM_SET_ONE_REG: u64 = 0x4010_aeac;
-    pub(super) const KVM_SET_USER_MEMORY_REGION: u64 = 0x4020_ae46;
     pub(super) const KVM_SET_USER_MEMORY_REGION2: u64 = 0x40a0_ae49;
     pub(super) const KVM_SET_MEMORY_ATTRIBUTES: u64 = 0x4020_aed2;
     pub(super) const KVM_CREATE_GUEST_MEMFD: u64 = 0xc040_aed4;
@@ -141,6 +140,7 @@ mod iommufd {
     pub(super) const IOMMU_HWPT_ALLOC: u64 = 0x3b89;
     pub(super) const IOMMU_GET_HW_INFO: u64 = 0x3b8a;
     pub(super) const IOMMU_HWPT_INVALIDATE: u64 = 0x3b8d;
+    pub(super) const IOMMU_IOAS_MAP_FILE: u64 = 0x3b8f;
     pub(super) const IOMMU_VIOMMU_ALLOC: u64 = 0x3b90;
     pub(super) const IOMMU_VDEVICE_ALLOC: u64 = 0x3b91;
     pub(super) const IOMMU_VEVENTQ_ALLOC: u64 = 0x3b93;
@@ -281,7 +281,6 @@ fn create_vmm_ioctl_seccomp_rule_common_kvm() -> Result<Vec<SeccompRule>, Backen
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_MP_STATE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_ONE_REG)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_REGS)?],
-        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION,)?],
         and![Cond::new(
             1,
             ArgLen::Dword,
@@ -310,6 +309,7 @@ fn create_vmm_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendEr
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_GET_HW_INFO)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_INVALIDATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP_FILE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_VIOMMU_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_VDEVICE_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_VEVENTQ_ALLOC)?],
@@ -456,6 +456,7 @@ fn create_vmm_ioctl_seccomp_rule_common(
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_API)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_COPY)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_REGISTER)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_UNREGISTER)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_WAKE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_ZEROPAGE)?],
         and![Cond::new(1, ArgLen::Dword, Eq, UFFDIO_CONTINUE)?],
@@ -883,7 +884,6 @@ fn create_vcpu_ioctl_seccomp_rule_kvm() -> Result<Vec<SeccompRule>, BackendError
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_IRQFD,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_DEVICE_ATTR,)?],
         and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_GSI_ROUTING,)?],
-        and![Cond::new(1, ArgLen::Dword, Eq, KVM_SET_USER_MEMORY_REGION,)?],
         and![Cond::new(
             1,
             ArgLen::Dword,
@@ -950,6 +950,8 @@ fn create_vcpu_ioctl_seccomp_rule_iommufd() -> Result<Vec<SeccompRule>, BackendE
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_UNMAP)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_ALLOC)?],
         and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_HWPT_INVALIDATE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, IOMMU_IOAS_MAP_FILE)?],
+        and![Cond::new(1, ArgLen::Dword, Eq, VFIO_DEVICE_FEATURE)?],
         and![Cond::new(
             1,
             ArgLen::Dword,
@@ -1002,6 +1004,7 @@ fn vcpu_thread_rules(
         (libc::SYS_clock_nanosleep, vec![]),
         (libc::SYS_close, vec![]),
         (libc::SYS_dup, vec![]),
+        (libc::SYS_eventfd2, vec![]),
         (libc::SYS_exit, vec![]),
         (libc::SYS_epoll_ctl, vec![]),
         (
@@ -1261,6 +1264,7 @@ fn serial_manager_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_epoll_pwait, vec![]),
         #[cfg(target_arch = "x86_64")]
         (libc::SYS_epoll_wait, vec![]),
+        (libc::SYS_eventfd2, vec![]),
         (libc::SYS_exit, vec![]),
         (libc::SYS_fcntl, vec![]),
         (libc::SYS_futex, vec![]),
@@ -1272,6 +1276,7 @@ fn serial_manager_thread_rules() -> Result<Vec<(i64, Vec<SeccompRule>)>, Backend
         (libc::SYS_recvfrom, vec![]),
         (libc::SYS_rt_sigreturn, vec![]),
         (libc::SYS_sendto, vec![]),
+        (libc::SYS_setsockopt, vec![]),
         (libc::SYS_shutdown, vec![]),
         (libc::SYS_sigaltstack, vec![]),
     ])
@@ -1379,5 +1384,21 @@ pub fn get_seccomp_filter(
         )
         .and_then(|filter| filter.try_into())
         .map_err(Error::Backend),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_serial_manager_has_no_outbound_socket_rules() {
+        let rules = get_seccomp_rules(Thread::SerialManager, None).unwrap();
+        for syscall in [libc::SYS_socket, libc::SYS_connect] {
+            assert!(!rules.iter().any(|(number, _)| *number == syscall));
+        }
+        for syscall in [libc::SYS_accept4, libc::SYS_setsockopt] {
+            assert!(rules.iter().any(|(number, _)| *number == syscall));
+        }
     }
 }

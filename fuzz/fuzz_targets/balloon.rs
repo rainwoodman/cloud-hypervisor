@@ -10,13 +10,11 @@ use libfuzzer_sys::{fuzz_target, Corpus};
 use seccompiler::SeccompAction;
 use virtio_devices::{VirtioDevice, VirtioInterrupt, VirtioInterruptType};
 use virtio_queue::{Queue, QueueT};
-use vm_memory::bitmap::AtomicBitmap;
+use vm_allocator::GuestMemory;
 use vm_memory::{ByteValued, Bytes, GuestAddress, GuestMemoryAtomic};
 use vm_migration::{Pausable, Snapshottable};
-use vm_virtio::AccessPlatform;
+use vm_virtio::{AccessPlatform, AccessType};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
-
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 
 const QUEUE_DATA_SIZE: usize = 4;
 const CONTROL_SIZE: usize = 30;
@@ -343,7 +341,12 @@ impl VirtioInterrupt for FailingVirtioInterrupt {
 struct IdentityAccessPlatform {}
 
 impl AccessPlatform for IdentityAccessPlatform {
-    fn translate_gva(&self, base: u64, _size: u64) -> std::io::Result<u64> {
+    fn translate_gva(
+        &self,
+        base: u64,
+        _size: u64,
+        _access_type: AccessType,
+    ) -> std::io::Result<u64> {
         Ok(base)
     }
 
@@ -494,25 +497,15 @@ fn bounded_pfn(v: u8) -> u32 {
     u32::from(v) & ((MEM_SIZE as u32 >> 12) - 1)
 }
 
-fn create_guest_memory(shared: bool) -> Option<GuestMemoryMmap> {
-    let mem_region = vmm::memory_manager::MemoryManager::create_ram_region(
-        &None,
-        0,
-        GuestAddress(0),
-        MEM_SIZE,
-        false,
-        false,
-        shared,
-        None,
-        None,
-        None,
-        false,
+fn create_guest_memory(shared: bool) -> Option<GuestMemory> {
+    let mem_region = vmm::memory_manager::MemoryManager::create_ram_region_raw(
+        &None, 0, MEM_SIZE, false, false, shared, None, None, None, false,
     )
     .ok()?;
-    let reporting_tail_region = vmm::memory_manager::MemoryManager::create_ram_region(
+    let mem_region = Arc::new(vm_memory::GuestRegionMmap::new(mem_region, GuestAddress(0))?.into());
+    let reporting_tail_region = vmm::memory_manager::MemoryManager::create_ram_region_raw(
         &None,
         0,
-        GuestAddress(MEM_SIZE as u64),
         REPORTING_TAIL_SIZE,
         false,
         false,
@@ -523,10 +516,13 @@ fn create_guest_memory(shared: bool) -> Option<GuestMemoryMmap> {
         false,
     )
     .ok()?;
-    let queue_region = vmm::memory_manager::MemoryManager::create_ram_region(
+    let reporting_tail_region = Arc::new(
+        vm_memory::GuestRegionMmap::new(reporting_tail_region, GuestAddress(MEM_SIZE as u64))?
+            .into(),
+    );
+    let queue_region = vmm::memory_manager::MemoryManager::create_ram_region_raw(
         &None,
         0,
-        GuestAddress(QUEUE_REGION_BASE),
         QUEUE_REGION_SIZE,
         false,
         false,
@@ -537,8 +533,11 @@ fn create_guest_memory(shared: bool) -> Option<GuestMemoryMmap> {
         false,
     )
     .ok()?;
+    let queue_region = Arc::new(
+        vm_memory::GuestRegionMmap::new(queue_region, GuestAddress(QUEUE_REGION_BASE))?.into(),
+    );
 
-    GuestMemoryMmap::from_arc_regions(vec![mem_region, reporting_tail_region, queue_region]).ok()
+    GuestMemory::from_arc_regions(vec![mem_region, reporting_tail_region, queue_region]).ok()
 }
 
 fn run_failing_interrupt_case(
@@ -775,11 +774,7 @@ fn activate_reporting_available_unacked(queue_data: &[u8]) {
     balloon.reset();
 }
 
-fn populate_queue_memory(
-    mem: &GuestMemoryMmap,
-    queue_layouts: &[QueueLayout],
-    bytes: &[u8],
-) -> bool {
+fn populate_queue_memory(mem: &GuestMemory, queue_layouts: &[QueueLayout], bytes: &[u8]) -> bool {
     if queue_layouts.len() != QUEUE_NUM as usize {
         return false;
     }
@@ -930,7 +925,7 @@ fn populate_queue_memory(
     ) && write_avail_ring(mem, reporting.avail_ring_addr, &[0, 1, 2, 3])
 }
 
-fn write_avail_ring(mem: &GuestMemoryMmap, avail_ring_addr: u64, heads: &[u16]) -> bool {
+fn write_avail_ring(mem: &GuestMemory, avail_ring_addr: u64, heads: &[u16]) -> bool {
     if !write_obj(mem, 0u16, avail_ring_addr)
         || !write_obj(mem, heads.len() as u16, avail_ring_addr + 2)
     {
@@ -947,7 +942,7 @@ fn write_avail_ring(mem: &GuestMemoryMmap, avail_ring_addr: u64, heads: &[u16]) 
 }
 
 fn write_descriptor(
-    mem: &GuestMemoryMmap,
+    mem: &GuestMemory,
     desc_table_addr: u64,
     index: u16,
     addr: u64,
@@ -962,6 +957,6 @@ fn write_descriptor(
         && write_obj(mem, next, offset + 14)
 }
 
-fn write_obj<T: ByteValued>(mem: &GuestMemoryMmap, value: T, addr: u64) -> bool {
+fn write_obj<T: ByteValued>(mem: &GuestMemory, value: T, addr: u64) -> bool {
     mem.write_obj(value, GuestAddress(addr)).is_ok()
 }

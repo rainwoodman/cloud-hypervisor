@@ -8,7 +8,6 @@ use std::os::fd::{AsRawFd, RawFd};
 use std::os::unix::fs::FileExt;
 use std::result;
 
-use remain::sorted;
 use thiserror::Error;
 
 use super::bat::{self, BatEntry, VhdxBatError};
@@ -16,7 +15,6 @@ use super::header::{self, RegionInfo, RegionTableEntry, VhdxHeader, VhdxHeaderEr
 use super::metadata::{self, DiskSpec, VhdxMetadataError};
 use crate::aligned_file::AlignedFile;
 
-#[sorted]
 #[derive(Error, Debug)]
 pub enum VhdxError {
     #[error("Failed to parse VHDx header")]
@@ -27,11 +25,12 @@ pub enum VhdxError {
     ParseVhdxRegionEntry(#[source] VhdxHeaderError),
     #[error("Failed reading metadata")]
     ReadBatEntry(#[source] VhdxBatError),
+    #[error("VHDX image has an active log that must be replayed before use")]
+    UnsupportedLogReplay,
 }
 
 pub(super) type Result<T> = result::Result<T, VhdxError>;
 
-#[sorted]
 #[derive(Error, Debug)]
 enum VhdxIoError {
     #[error("Invalid BAT entry state")]
@@ -76,7 +75,10 @@ impl Sector {
     ) -> result::Result<Sector, VhdxIoError> {
         let mut sector = Sector::default();
 
-        sector.bat_index = sector_index / disk_spec.sectors_per_block as u64;
+        // The BAT holds a sector bitmap entry after every chunk_ratio payload
+        // entries.
+        let block_index = sector_index / disk_spec.sectors_per_block as u64;
+        sector.bat_index = block_index + block_index / disk_spec.chunk_ratio;
         sector.block_offset = sector_index % disk_spec.sectors_per_block as u64;
         sector.free_sectors = disk_spec.sectors_per_block as u64 - sector.block_offset;
         if sector.free_sectors > sector_count {
@@ -107,6 +109,8 @@ pub(super) struct Vhdx {
     vhdx_header: VhdxHeader,
     bat_entry: RegionTableEntry,
     mdr_entry: RegionTableEntry,
+    log_offset: u64,
+    log_length: u32,
     disk_spec: DiskSpec,
     bat_entries: Vec<BatEntry>,
     first_write: bool,
@@ -119,6 +123,9 @@ impl Vhdx {
         let aligned = AlignedFile::new(file, direct_io);
 
         let vhdx_header = VhdxHeader::new(&aligned).map_err(VhdxError::ParseVhdxHeader)?;
+        if vhdx_header.has_active_log() {
+            return Err(VhdxError::UnsupportedLogReplay);
+        }
 
         let collected_entries = RegionInfo::new(
             &aligned,
@@ -129,6 +136,7 @@ impl Vhdx {
 
         let bat_entry = collected_entries.bat_entry;
         let mdr_entry = collected_entries.mdr_entry;
+        let (log_offset, log_length) = vhdx_header.log_region();
 
         let disk_spec =
             DiskSpec::new(&aligned, &mdr_entry).map_err(VhdxError::ParseVhdxMetadata)?;
@@ -140,6 +148,8 @@ impl Vhdx {
             vhdx_header,
             bat_entry,
             mdr_entry,
+            log_offset,
+            log_length,
             disk_spec,
             bat_entries,
             first_write: true,
@@ -151,14 +161,19 @@ impl Vhdx {
     }
 
     /// A fully-present BAT entry must describe a payload block that lies
-    /// outside the areas reserved for the header and the metadata region.
-    fn check_payload_file_offset(&self, offset: u64) -> result::Result<(), VhdxIoError> {
+    /// outside the areas reserved for the header, metadata, BAT and log regions.
+    fn check_payload_block_offset(&self, block_base: u64) -> result::Result<(), VhdxIoError> {
         let block_size = self.disk_spec.block_size as u64;
         let mdr_start = self.mdr_entry.file_offset;
         let mdr_end = mdr_start.saturating_add(self.mdr_entry.length as u64);
+        let bat_start = self.bat_entry.file_offset;
+        let bat_end = bat_start.saturating_add(self.bat_entry.length as u64);
+        let log_end = self.log_offset.saturating_add(self.log_length as u64);
 
-        if offset < metadata::BLOCK_SIZE_MIN as u64
-            || (offset < mdr_end && offset.saturating_add(block_size) > mdr_start)
+        if block_base < metadata::BLOCK_SIZE_MIN as u64
+            || (block_base < mdr_end && block_base.saturating_add(block_size) > mdr_start)
+            || (block_base < bat_end && block_base.saturating_add(block_size) > bat_start)
+            || (block_base < log_end && block_base.saturating_add(block_size) > self.log_offset)
         {
             return Err(VhdxIoError::InvalidBatFileOffset);
         }
@@ -261,7 +276,7 @@ impl Vhdx {
                 | bat::PAYLOAD_BLOCK_UNMAPPED
                 | bat::PAYLOAD_BLOCK_ZERO => {}
                 bat::PAYLOAD_BLOCK_FULLY_PRESENT => {
-                    self.check_payload_file_offset(sector.file_offset)?;
+                    self.check_payload_block_offset(bat_entry & bat::BAT_FILE_OFF_MASK)?;
 
                     self.aligned
                         .read_exact_at(
@@ -352,7 +367,7 @@ impl Vhdx {
                         .map_err(VhdxIoError::WriteSectorBlock)?;
                 }
                 bat::PAYLOAD_BLOCK_FULLY_PRESENT => {
-                    self.check_payload_file_offset(sector.file_offset)?;
+                    self.check_payload_block_offset(bat_entry & bat::BAT_FILE_OFF_MASK)?;
 
                     self.aligned
                         .write_all_at(
@@ -398,21 +413,61 @@ impl AsRawFd for Vhdx {
 mod tests {
     use std::fs;
     use std::os::unix::fs::FileExt;
-    use std::path::Path;
 
     use super::*;
     use crate::formats::vhdx::bat::PAYLOAD_BLOCK_FULLY_PRESENT;
-    use crate::formats::vhdx::test_util::create_dynamic_vhdx;
+    use crate::formats::vhdx::test_util::{create_dynamic_vhdx, edit_header, open_vhdx};
 
-    /// Opens an image read-write, which is what every test here needs: they
-    /// all write through the handle, or check that a write is refused.
-    fn open_vhdx(path: &Path) -> Vhdx {
+    const VHDX_HEADER_1_OFFSET: u64 = 0x10000;
+    const VHDX_HEADER_2_OFFSET: u64 = 0x20000;
+    const VHDX_HEADER_SIZE: usize = 4096;
+    const VHDX_LOG_GUID_OFFSET: usize = 48;
+
+    #[test]
+    fn bat_index_skips_sector_bitmap_entries() {
+        // 256 MiB blocks: 16 payload entries, then a sector bitmap entry.
+        let disk_spec = DiskSpec {
+            sectors_per_block: 1 << 19,
+            logical_sector_size: 512,
+            chunk_ratio: 16,
+            ..Default::default()
+        };
+        let bat = vec![BatEntry::default(); 40];
+        let bat_index = |block: u64| {
+            let sector_index = block * disk_spec.sectors_per_block as u64;
+            Sector::new(&disk_spec, &bat, sector_index, 1)
+                .unwrap()
+                .bat_index
+        };
+
+        assert_eq!(bat_index(0), 0);
+        assert_eq!(bat_index(15), 15);
+        assert_eq!(bat_index(16), 17);
+        assert_eq!(bat_index(31), 32);
+        assert_eq!(bat_index(32), 34);
+    }
+
+    /// A VHDX image with an active log must be rejected until replay is
+    /// supported; opening it would silently use a stale BAT.
+    #[test]
+    fn active_log_is_rejected() {
+        let tf = create_dynamic_vhdx(16, None);
+
         let file = fs::OpenOptions::new()
             .read(true)
             .write(true)
-            .open(path)
+            .open(tf.as_path())
             .unwrap();
-        Vhdx::new(file, false).unwrap()
+        // VHDX header 1 and 2 live at fixed 64 KiB offsets.
+        for base in [VHDX_HEADER_1_OFFSET, VHDX_HEADER_2_OFFSET] {
+            edit_header(&file, base, VHDX_HEADER_SIZE, |header| {
+                header[VHDX_LOG_GUID_OFFSET..VHDX_LOG_GUID_OFFSET + 16].fill(0x5a);
+            });
+        }
+        file.sync_all().unwrap();
+
+        let err = Vhdx::new(file, false).unwrap_err();
+        assert!(matches!(err, VhdxError::UnsupportedLogReplay), "{err}");
     }
 
     /// An unaligned sector write under a forced O_DIRECT alignment must go
@@ -420,12 +475,9 @@ mod tests {
     /// BAT update both land at unaligned host offsets) and read back intact.
     #[test]
     fn unaligned_write_is_rmw() {
-        let Some(tf) = create_dynamic_vhdx(16) else {
-            eprintln!("skipping unaligned_write_is_rmw: qemu-img unavailable");
-            return;
-        };
+        let tf = create_dynamic_vhdx(16, None);
 
-        let mut vhdx = open_vhdx(tf.as_path());
+        let mut vhdx = open_vhdx(tf.as_path()).unwrap();
 
         // Force a non-zero alignment so all of vhdx's positioned I/O exercises
         // the bounce/RMW path even though the tempfile is not really O_DIRECT.
@@ -447,19 +499,16 @@ mod tests {
 
     #[test]
     fn header_update_survives_reopen() {
-        let Some(tf) = create_dynamic_vhdx(16) else {
-            eprintln!("skipping header_update_survives_reopen: qemu-img unavailable");
-            return;
-        };
+        let tf = create_dynamic_vhdx(16, None);
 
         let data = [0xa5u8; 512];
         {
-            let mut vhdx = open_vhdx(tf.as_path());
+            let mut vhdx = open_vhdx(tf.as_path()).unwrap();
             vhdx.write_all_at(&data, 0).unwrap();
             vhdx.flush().unwrap();
         }
 
-        let vhdx = open_vhdx(tf.as_path());
+        let vhdx = open_vhdx(tf.as_path()).unwrap();
         let mut readback = [0u8; 512];
         assert_eq!(vhdx.read_at(&mut readback, 0).unwrap(), readback.len());
         assert_eq!(readback, data);
@@ -467,12 +516,9 @@ mod tests {
 
     #[test]
     fn read_misaligned_buffer_is_rejected() {
-        let Some(tf) = create_dynamic_vhdx(16) else {
-            eprintln!("skipping read_misaligned_buffer_is_rejected: qemu-img unavailable");
-            return;
-        };
+        let tf = create_dynamic_vhdx(16, None);
 
-        let vhdx = open_vhdx(tf.as_path());
+        let vhdx = open_vhdx(tf.as_path()).unwrap();
 
         let mut buf = vec![0u8; vhdx.disk_spec.logical_sector_size as usize - 1];
         let err = vhdx.read_at(&mut buf, 0).unwrap_err();
@@ -481,12 +527,9 @@ mod tests {
 
     #[test]
     fn write_misaligned_buffer_is_rejected() {
-        let Some(tf) = create_dynamic_vhdx(16) else {
-            eprintln!("skipping write_misaligned_buffer_is_rejected: qemu-img unavailable");
-            return;
-        };
+        let tf = create_dynamic_vhdx(16, None);
 
-        let mut vhdx = open_vhdx(tf.as_path());
+        let mut vhdx = open_vhdx(tf.as_path()).unwrap();
 
         let buf = vec![0u8; vhdx.disk_spec.logical_sector_size as usize - 1];
         let err = vhdx.write_all_at(&buf, 0).unwrap_err();
@@ -494,15 +537,96 @@ mod tests {
     }
 
     #[test]
-    fn write_with_bat_entry_in_header_area_is_rejected() {
-        let Some(tf) = create_dynamic_vhdx(16) else {
-            eprintln!(
-                "skipping write_with_bat_entry_in_header_area_is_rejected: qemu-img unavailable"
-            );
-            return;
-        };
+    fn payload_block_ending_at_region_boundary_is_accepted() {
+        let tf = create_dynamic_vhdx(16, Some(1));
 
-        let mut vhdx = open_vhdx(tf.as_path());
+        let mut vhdx = open_vhdx(tf.as_path()).unwrap();
+        assert_eq!(vhdx.disk_spec.block_size, 1 << 20);
+        let bat_start = vhdx.bat_entry.file_offset;
+        vhdx.log_length = 0;
+        vhdx.bat_entries[0] = BatEntry(
+            PAYLOAD_BLOCK_FULLY_PRESENT | ((bat_start - (1 << 20)) & bat::BAT_FILE_OFF_MASK),
+        );
+
+        let mut buf = [0u8; 512];
+        let read = vhdx.read_at(&mut buf, (1 << 20) - 512);
+        assert!(read.is_ok(), "unexpected read error: {read:?}");
+    }
+
+    #[test]
+    fn read_write_with_bat_entry_overlapping_log_region_is_rejected() {
+        let tf = create_dynamic_vhdx(16, Some(1));
+
+        let mut vhdx = open_vhdx(tf.as_path()).unwrap();
+        let (log_offset, _) = vhdx.vhdx_header.log_region();
+        vhdx.bat_entries[0] =
+            BatEntry(PAYLOAD_BLOCK_FULLY_PRESENT | (log_offset & bat::BAT_FILE_OFF_MASK));
+
+        let mut buf = [0u8; 512];
+        let read = vhdx.read_at(&mut buf, 0).unwrap_err();
+        assert!(
+            read.to_string().contains("BAT entry file offset"),
+            "unexpected read error: {read}"
+        );
+        let write = vhdx.write_all_at(&[0x44u8; 512], 0).unwrap_err();
+        assert!(
+            write.to_string().contains("BAT entry file offset"),
+            "unexpected write error: {write}"
+        );
+    }
+
+    #[test]
+    fn read_write_with_bat_entry_overlapping_bat_region_is_rejected() {
+        let tf = create_dynamic_vhdx(16, Some(1));
+
+        let mut vhdx = open_vhdx(tf.as_path()).unwrap();
+        let bat_start = vhdx.bat_entry.file_offset;
+        assert_eq!(vhdx.disk_spec.block_size, 1 << 20);
+
+        // The 1 MiB payload ends exactly where the metadata region starts, so
+        // only the BAT-region check can reject it.
+        vhdx.bat_entries[0] =
+            BatEntry(PAYLOAD_BLOCK_FULLY_PRESENT | (bat_start & bat::BAT_FILE_OFF_MASK));
+
+        let mut buf = [0u8; 512];
+        let read = vhdx.read_at(&mut buf, 0).unwrap_err();
+        assert!(
+            read.to_string().contains("BAT entry file offset"),
+            "unexpected read error: {read}"
+        );
+        let write = vhdx.write_all_at(&[0x44u8; 512], 0).unwrap_err();
+        assert!(
+            write.to_string().contains("BAT entry file offset"),
+            "unexpected write error: {write}"
+        );
+    }
+
+    #[test]
+    fn open_with_bat_entry_past_eof_is_rejected() {
+        let tf = create_dynamic_vhdx(16, None);
+
+        let vhdx = open_vhdx(tf.as_path()).unwrap();
+        let bat_offset = vhdx.bat_entry.file_offset;
+        let past_eof = ((vhdx.disk_spec.image_size / (1 << 20) + 1) << 20 & bat::BAT_FILE_OFF_MASK)
+            | PAYLOAD_BLOCK_FULLY_PRESENT;
+        vhdx.aligned
+            .file()
+            .write_all_at(&past_eof.to_le_bytes(), bat_offset)
+            .unwrap();
+        drop(vhdx);
+
+        let err = open_vhdx(tf.as_path()).unwrap_err();
+        assert!(
+            matches!(err, VhdxError::ReadBatEntry(VhdxBatError::PayloadPastEnd)),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn write_with_bat_entry_in_header_area_is_rejected() {
+        let tf = create_dynamic_vhdx(16, None);
+
+        let mut vhdx = open_vhdx(tf.as_path()).unwrap();
 
         // Simulate a corrupt image: BAT entry 0 says "fully present at file
         // offset 0", i.e. on top of the VHDX file header.
@@ -526,14 +650,9 @@ mod tests {
 
     #[test]
     fn read_with_bat_entry_in_header_area_is_rejected() {
-        let Some(tf) = create_dynamic_vhdx(16) else {
-            eprintln!(
-                "skipping read_with_bat_entry_in_header_area_is_rejected: qemu-img unavailable"
-            );
-            return;
-        };
+        let tf = create_dynamic_vhdx(16, None);
 
-        let mut vhdx = open_vhdx(tf.as_path());
+        let mut vhdx = open_vhdx(tf.as_path()).unwrap();
 
         // Simulate a corrupt image: BAT entry 0 says "fully present at file
         // offset 0", i.e. on top of the VHDX file header.
@@ -549,14 +668,9 @@ mod tests {
 
     #[test]
     fn write_with_bat_entry_overlapping_metadata_region_is_rejected() {
-        let Some(tf) = create_dynamic_vhdx(16) else {
-            eprintln!(
-                "skipping write_with_bat_entry_overlapping_metadata_region_is_rejected: qemu-img unavailable"
-            );
-            return;
-        };
+        let tf = create_dynamic_vhdx(16, None);
 
-        let mut vhdx = open_vhdx(tf.as_path());
+        let mut vhdx = open_vhdx(tf.as_path()).unwrap();
         let mdr_offset = vhdx.mdr_entry.file_offset;
         let mut before = [0u8; 8];
         vhdx.aligned
@@ -583,14 +697,9 @@ mod tests {
 
     #[test]
     fn read_with_bat_entry_overlapping_metadata_region_is_rejected() {
-        let Some(tf) = create_dynamic_vhdx(16) else {
-            eprintln!(
-                "skipping read_with_bat_entry_overlapping_metadata_region_is_rejected: qemu-img unavailable"
-            );
-            return;
-        };
+        let tf = create_dynamic_vhdx(16, None);
 
-        let mut vhdx = open_vhdx(tf.as_path());
+        let mut vhdx = open_vhdx(tf.as_path()).unwrap();
         let mdr_offset = vhdx.mdr_entry.file_offset;
         vhdx.bat_entries[0] = BatEntry(PAYLOAD_BLOCK_FULLY_PRESENT | mdr_offset);
 
@@ -604,12 +713,9 @@ mod tests {
 
     #[test]
     fn read_misaligned_offset_is_rejected() {
-        let Some(tf) = create_dynamic_vhdx(16) else {
-            eprintln!("skipping read_misaligned_offset_is_rejected: qemu-img unavailable");
-            return;
-        };
+        let tf = create_dynamic_vhdx(16, None);
 
-        let vhdx = open_vhdx(tf.as_path());
+        let vhdx = open_vhdx(tf.as_path()).unwrap();
         let sector = vhdx.disk_spec.logical_sector_size as usize;
 
         let mut buf = vec![0u8; sector];
@@ -619,12 +725,9 @@ mod tests {
 
     #[test]
     fn write_misaligned_offset_is_rejected() {
-        let Some(tf) = create_dynamic_vhdx(16) else {
-            eprintln!("skipping write_misaligned_offset_is_rejected: qemu-img unavailable");
-            return;
-        };
+        let tf = create_dynamic_vhdx(16, None);
 
-        let mut vhdx = open_vhdx(tf.as_path());
+        let mut vhdx = open_vhdx(tf.as_path()).unwrap();
         let sector = vhdx.disk_spec.logical_sector_size as usize;
 
         // Establish known content in sector 0 and sector 1.
@@ -645,14 +748,9 @@ mod tests {
 
     #[test]
     fn write_allocating_a_block_honours_the_sector_offset() {
-        let Some(tf) = create_dynamic_vhdx(16) else {
-            eprintln!(
-                "skipping write_allocating_a_block_honours_the_sector_offset: qemu-img unavailable"
-            );
-            return;
-        };
+        let tf = create_dynamic_vhdx(16, None);
 
-        let mut vhdx = open_vhdx(tf.as_path());
+        let mut vhdx = open_vhdx(tf.as_path()).unwrap();
         let sector = vhdx.disk_spec.logical_sector_size as usize;
 
         // Sector 1 of a fresh image: its block is still unallocated, so the

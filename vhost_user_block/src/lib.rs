@@ -65,18 +65,24 @@ enum Error {
     /// Failed to handle unknown event.
     #[error("Failed to handle unknown event")]
     HandleEventUnknownEvent,
+    /// Failed to open the disk image
+    #[error("Failed to open the disk image")]
+    OpenImage(#[source] io::Error),
     /// No path provided
     #[error("No path provided")]
     PathParameterMissing,
+    /// Failed to query the disk image size
+    #[error("Failed to query the disk image size")]
+    QueryImageSize(#[source] io::Error),
     /// No socket provided
     #[error("No socket provided")]
     SocketParameterMissing,
 }
 
 pub const SYNTAX: &str = "vhost-user-block backend parameters \
- \"path=<image_path>,socket=<socket_path>,num_queues=<number_of_queues>,\
- queue_size=<size_of_each_queue>,readonly=true|false,direct=true|false,\
- poll_queue=true|false\"";
+    \"path=<image_path>,socket=<socket_path>,num_queues=<number_of_queues>,\
+    queue_size=<size_of_each_queue>,readonly=true|false,direct=true|false,\
+    poll_queue=true|false\"";
 
 impl convert::From<Error> for io::Error {
     fn from(e: Error) -> Self {
@@ -125,7 +131,7 @@ impl VhostUserBlkThread {
         {
             debug!("got an element in the queue");
             let len = match Request::parse(&mut desc_chain, None) {
-                Ok(mut request) => {
+                (Ok(mut request), Some(status_addr)) => {
                     debug!("element is a valid request");
                     request.writeback = self.writeback.load(Ordering::Acquire);
                     let (status, len) = match request.execute(
@@ -141,18 +147,29 @@ impl VhostUserBlkThread {
                         Err(e) => (e.status(), 1),
                     };
 
-                    if let Err(e) = desc_chain.memory().write_obj(status, request.status_addr()) {
+                    if let Err(e) = desc_chain.memory().write_obj(status, status_addr) {
                         warn!(
                             "vhost-user-blk: failed to write status to 0x{:x}: {e:?}",
-                            request.status_addr().0
+                            status_addr.0
                         );
                         0
                     } else {
                         len
                     }
                 }
-                Err(err) => {
+                (Ok(_), None) => unreachable!("parse() returns the status address with a request"),
+                (Err(err), status_addr) => {
                     error!("failed to parse available descriptor chain: {err:?}");
+                    if let Some(status_addr) = status_addr
+                        && let Err(e) = desc_chain
+                            .memory()
+                            .write_obj(VIRTIO_BLK_S_IOERR as u8, status_addr)
+                    {
+                        info!(
+                            "vhost-user-blk: failed to write status to 0x{:x}: {e:?}",
+                            status_addr.0
+                        );
+                    }
                     0
                 }
             };
@@ -229,13 +246,16 @@ impl VhostUserBlkBackend {
         if direct {
             options.custom_flags(libc::O_DIRECT);
         }
-        let image: File = options.open(image_path).unwrap();
+        let image: File = options.open(image_path).map_err(Error::OpenImage)?;
         let raw_img = AlignedFile::new(image, direct);
 
         let serial = build_serial(None, &PathBuf::from(&image_path));
         let image = Arc::new(Mutex::new(raw_img));
 
-        let nsectors = query_device_size(image.lock().unwrap().file()).unwrap().0 / SECTOR_SIZE;
+        let nsectors = query_device_size(image.lock().unwrap().file())
+            .map_err(Error::QueryImageSize)?
+            .0
+            / SECTOR_SIZE;
         let config = VirtioBlockConfig {
             capacity: nsectors,
             blk_size: BLK_SIZE,
@@ -338,6 +358,7 @@ impl VhostUserBackendMut for VhostUserBlkBackend {
             | VhostUserProtocolFeatures::MQ
             | VhostUserProtocolFeatures::CONFIGURE_MEM_SLOTS
             | VhostUserProtocolFeatures::DEVICE_STATE
+            | VhostUserProtocolFeatures::PAGEFAULT
     }
 
     fn set_event_idx(&mut self, enabled: bool) {
@@ -383,10 +404,13 @@ impl VhostUserBackendMut for VhostUserBlkBackend {
                     // calling process_queue() until it stops finding new
                     // requests on the queue.
                     loop {
-                        vring
+                        if let Err(e) = vring
                             .get_queue_mut()
                             .enable_notification(self.mem.memory().deref())
-                            .unwrap();
+                        {
+                            error!("vhost-user-blk: enable_notification failed: {e:?}");
+                            break;
+                        }
                         if !thread.process_queue(&mut vring) {
                             break;
                         }
@@ -542,26 +566,41 @@ pub fn start_block_backend(backend_command: &str) {
 
     let mem = GuestMemoryAtomic::new(GuestMemoryMmap::new());
 
-    let blk_backend = Arc::new(RwLock::new(
-        VhostUserBlkBackend::new(
-            &backend_config.path,
-            backend_config.num_queues,
-            backend_config.readonly,
-            backend_config.direct,
-            backend_config.poll_queue,
-            backend_config.queue_size,
-            mem.clone(),
-        )
-        .unwrap(),
-    ));
+    let blk_backend = match VhostUserBlkBackend::new(
+        &backend_config.path,
+        backend_config.num_queues,
+        backend_config.readonly,
+        backend_config.direct,
+        backend_config.poll_queue,
+        backend_config.queue_size,
+        mem.clone(),
+    ) {
+        Ok(backend) => Arc::new(RwLock::new(backend)),
+        Err(e) => {
+            error!("Failed to create vhost-user-block backend: {e:?}");
+            process::exit(1);
+        }
+    };
 
     debug!("blk_backend is created!\n");
 
-    let mut listener = Listener::new(&backend_config.socket, true).unwrap();
+    let mut listener = match Listener::new(&backend_config.socket, true) {
+        Ok(listener) => listener,
+        Err(e) => {
+            error!("Failed to listen on vhost-user-block socket: {e:?}");
+            process::exit(1);
+        }
+    };
 
     let name = "vhost-user-blk-backend";
-    let mut blk_daemon =
-        VhostUserDaemon::new(name.to_string(), Arc::clone(&blk_backend), mem).unwrap();
+    let mut blk_daemon = match VhostUserDaemon::new(name.to_string(), Arc::clone(&blk_backend), mem)
+    {
+        Ok(daemon) => daemon,
+        Err(e) => {
+            error!("Failed to create vhost-user-block daemon: {e:?}");
+            process::exit(1);
+        }
+    };
 
     debug!("blk_daemon is created!\n");
 

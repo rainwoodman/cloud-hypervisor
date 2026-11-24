@@ -10,20 +10,18 @@ use std::os::unix::io::{AsRawFd, FromRawFd, RawFd};
 use std::sync::Arc;
 use std::{ffi, io};
 
+use cloud_hypervisor_fuzz::FuzzCursor;
 use libc::{MAP_NORESERVE, MAP_PRIVATE, PROT_READ, PROT_WRITE};
 use libfuzzer_sys::{fuzz_target, Corpus};
 use seccompiler::SeccompAction;
 use virtio_devices::{Pmem, VirtioDevice, VirtioInterrupt, VirtioInterruptType};
 use virtio_queue::{Queue, QueueT};
-use vm_device::UserspaceMapping;
-use vm_memory::bitmap::AtomicBitmap;
+use vm_allocator::{GuestMemory, GuestRegion};
 use vm_memory::guest_memory::FileOffset;
 use vm_memory::{Bytes, GuestAddress, GuestMemoryAtomic, MmapRegion};
 use vm_migration::{Pausable, Snapshottable};
-use vm_virtio::AccessPlatform;
+use vm_virtio::{AccessPlatform, AccessType};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
-
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
 
 const MEM_SIZE: usize = 2 * 1024 * 1024;
 const PMEM_FILE_SIZE: usize = 128 * 1024 * 1024;
@@ -39,49 +37,6 @@ const VRING_DESC_F_WRITE: u16 = 2;
 const REQ_BASE_ADDR: u64 = 0x10_000;
 const STATUS_BASE_ADDR: u64 = 0x20_000;
 const BAD_USED_RING_ADDR: u64 = MEM_SIZE as u64 + 0x1000;
-
-struct FuzzCursor<'a> {
-    bytes: &'a [u8],
-    cursor: usize,
-}
-
-impl<'a> FuzzCursor<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, cursor: 0 }
-    }
-
-    fn next_u8(&mut self) -> u8 {
-        let value = self.bytes[self.cursor % self.bytes.len()];
-        self.cursor = self.cursor.wrapping_add(1);
-        value
-    }
-
-    fn next_u32(&mut self) -> u32 {
-        u32::from_le_bytes([
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-        ])
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        u64::from_le_bytes([
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-        ])
-    }
-
-    fn next_bool(&mut self) -> bool {
-        self.next_u8() & 1 != 0
-    }
-}
 
 #[derive(Copy, Clone)]
 struct ChainCase {
@@ -134,7 +89,7 @@ fn run_pmem_case(
 
     exercise_device_api(&mut pmem, cursor, enable_access_platform);
 
-    let mem = match GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)]) {
+    let mem = match GuestMemory::from_ranges(&[(GuestAddress(0), MEM_SIZE)]) {
         Ok(mem) => mem,
         Err(_) => return false,
     };
@@ -233,7 +188,7 @@ fn run_bad_activate_case(cursor: &mut FuzzCursor<'_>) -> bool {
         Ok(pmem) => pmem,
         Err(_) => return false,
     };
-    let mem = match GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)]) {
+    let mem = match GuestMemory::from_ranges(&[(GuestAddress(0), MEM_SIZE)]) {
         Ok(mem) => mem,
         Err(_) => return false,
     };
@@ -264,7 +219,6 @@ fn exercise_device_api(pmem: &mut Pmem, cursor: &mut FuzzCursor<'_>, enable_acce
         (features & !access_platform_feature) & feature_noise
     };
     pmem.ack_features(acked_features);
-    let _ = pmem.userspace_mappings();
 
     let mut config = [0u8; size_of::<u64>() * 2];
     let config_len = 1 + (cursor.next_u8() as usize % config.len());
@@ -374,7 +328,7 @@ fn build_chain_cases(cursor: &mut FuzzCursor<'_>) -> Vec<ChainCase> {
     ]
 }
 
-fn populate_queue(mem: &GuestMemoryMmap, chain_cases: &[ChainCase]) -> bool {
+fn populate_queue(mem: &GuestMemory, chain_cases: &[ChainCase]) -> bool {
     if chain_cases.is_empty() || chain_cases.len() > (QUEUE_SIZE as usize / 2) {
         return false;
     }
@@ -441,7 +395,7 @@ fn populate_queue(mem: &GuestMemoryMmap, chain_cases: &[ChainCase]) -> bool {
     write_u16(mem, AVAIL_RING_ADDR + 2, chain_cases.len() as u16)
 }
 
-fn write_desc(mem: &GuestMemoryMmap, idx: u16, addr: u64, len: u32, flags: u16, next: u16) -> bool {
+fn write_desc(mem: &GuestMemory, idx: u16, addr: u64, len: u32, flags: u16, next: u16) -> bool {
     let desc_addr = DESC_TABLE_ADDR + u64::from(idx) * 16;
     write_u64(mem, desc_addr, addr)
         && write_u32(mem, desc_addr + 8, len)
@@ -449,17 +403,17 @@ fn write_desc(mem: &GuestMemoryMmap, idx: u16, addr: u64, len: u32, flags: u16, 
         && write_u16(mem, desc_addr + 14, next)
 }
 
-fn write_u16(mem: &GuestMemoryMmap, addr: u64, value: u16) -> bool {
+fn write_u16(mem: &GuestMemory, addr: u64, value: u16) -> bool {
     mem.write_slice(&value.to_le_bytes(), GuestAddress(addr))
         .is_ok()
 }
 
-fn write_u32(mem: &GuestMemoryMmap, addr: u64, value: u32) -> bool {
+fn write_u32(mem: &GuestMemory, addr: u64, value: u32) -> bool {
     mem.write_slice(&value.to_le_bytes(), GuestAddress(addr))
         .is_ok()
 }
 
-fn write_u64(mem: &GuestMemoryMmap, addr: u64, value: u64) -> bool {
+fn write_u64(mem: &GuestMemory, addr: u64, value: u64) -> bool {
     mem.write_slice(&value.to_le_bytes(), GuestAddress(addr))
         .is_ok()
 }
@@ -509,7 +463,7 @@ struct FuzzAccessPlatform {
 }
 
 impl AccessPlatform for FuzzAccessPlatform {
-    fn translate_gva(&self, base: u64, _size: u64) -> io::Result<u64> {
+    fn translate_gva(&self, base: u64, _size: u64, _access_type: AccessType) -> io::Result<u64> {
         if self.fail_on_odd && (base & 1) != 0 {
             Err(io::Error::other("fuzz gva translation failure"))
         } else {
@@ -526,7 +480,7 @@ impl AccessPlatform for FuzzAccessPlatform {
     }
 }
 
-fn create_backing_file_and_mapping() -> io::Result<(File, GuestAddress, UserspaceMapping)> {
+fn create_backing_file_and_mapping() -> io::Result<(File, GuestAddress, GuestRegion)> {
     let shm = memfd_create_with_size(&ffi::CString::new("fuzz").unwrap(), 0, PMEM_FILE_SIZE)?;
     let file: File = unsafe { File::from_raw_fd(shm) };
 
@@ -540,12 +494,9 @@ fn create_backing_file_and_mapping() -> io::Result<(File, GuestAddress, Userspac
     )
     .map_err(|e| io::Error::other(format!("failed building mmap region: {e}")))?;
     let guest_addr = GuestAddress(0);
-    let dummy_user_mapping = UserspaceMapping {
-        mem_slot: 0,
-        addr: guest_addr,
-        mapping: Arc::new(dummy_mmap_region),
-        mergeable: false,
-    };
+    let dummy_user_mapping = vm_memory::GuestRegionMmap::new(dummy_mmap_region, guest_addr)
+        .unwrap()
+        .into();
 
     Ok((file, guest_addr, dummy_user_mapping))
 }

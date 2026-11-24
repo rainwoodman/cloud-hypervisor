@@ -7,7 +7,9 @@ __Requirements__
 - Host with KVM enabled
 - [UEFI](uefi.md) capable Windows guest image with Virtio drivers integrated
 
-Any modern Windows Server version is compatible, as well as Windows 11. Cloud Hypervisor has been successfully tested with Windows Server 2019, Windows Server Core 2004 and Windows 11 IoT Enterprise LTSC 2024.
+Any modern Windows Server version is compatible, as well as Windows 11. Cloud
+Hypervisor has been successfully tested with Windows Server 2019, Windows Server
+Core 2004, Windows Server 2025, and Windows 11 IoT Enterprise LTSC 2024.
 
 At the current stage, only UEFI capable Windows images are supported. This implies the presence of the OVMF firmware during the Windows installation and in any subsequent usage. BIOS boot is not supported.
 
@@ -117,25 +119,26 @@ The basic command to boot a Windows image is shown in the next code snippet. The
 
 ```shell
 cloud-hypervisor \
-	--kernel ./$OVMF_DIR/CLOUDHV.fd \
+	--firmware ./$OVMF_DIR/CLOUDHV.fd \
 	--disk path=./$IMG_FILE,image_type=raw \
 	--cpus boot=1,kvm_hyperv=on \
 	--memory size=4G \
 	--serial tty \
 	--console off \
-	--net tap=
+	--net tap=,ip=192.168.249.1,mask=255.255.255.0
 ```
 
 It is necessary to always:
 
-- Carry the OVMF firmware in the `--kernel` option
+- Pass the `CLOUDHV.fd` firmware with the `--firmware` option
 - Add `kvm_hyperv=on` to the `--cpus` option
 
 In cases where the host processor supports address space > 39 bits, it might be necessary to limit the address space. It can be done by appending the option `max_phys_bits=X` to the `--cpus` parameter, where `X` is the number of bits to be supported. Windows was tested to support at least 39-bit address space.
 
 To daemonize the Cloud Hypervisor process, `nohup` can be used. Some STDIO redirections might need to be done. In a simple case it is sufficient to just redirect all the output to `/dev/null`.
 
-Be aware, currently, running the Windows 11 VM on Cloud Hypervisor with TPM 2.0 was not proven successful: `thread 'vcpu0' panicked`. Running the VM without TPM is a valid option though. Therefore the command as shown above is also valid for a Windows 11 VM.
+To give the guest a TPM 2.0 device, add the `--tpm` option as described in the
+[TPM documentation](tpm.md).
 
 ## Image Configuration
 
@@ -190,7 +193,10 @@ This section illustrates the Windows specific aspects of the VM network configur
 
 ### Basic Networking
 
-As the simplest option, using `--net tap=` in the Cloud Hypervisor command line will create a `vmtapX` device on the host with the default IPv4 address `192.168.249.1`. After SAC becomes available, the guest configuration can be set with
+As the simplest option, using `--net tap=,ip=192.168.249.1,mask=255.255.255.0`
+in the Cloud Hypervisor command line will create a `vmtapX` device on the host
+with the IPv4 address `192.168.249.1`. After SAC becomes available, the guest
+configuration can be set with
 
 <pre>
 SAC>i 10 192.168.249.2 255.255.255.0 192.168.249.1

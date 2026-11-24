@@ -17,9 +17,8 @@
 use std::io::{self, Write};
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::AtomicBool;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::{Arc, Barrier, Mutex};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{cmp, mem, result};
 
@@ -45,9 +44,10 @@ use zerocopy::{FromBytes, Immutable, IntoBytes, KnownLayout};
 
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
+use crate::thread_helper::PauseCommon;
 use crate::{
     ActivateResult, EPOLL_HELPER_EVENT_LAST, EpollHelper, EpollHelperError, EpollHelperHandler,
-    GuestMemoryMmap, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice,
+    GuestMemory, VIRTIO_F_ACCESS_PLATFORM, VIRTIO_F_VERSION_1, VirtioCommon, VirtioDevice,
     VirtioDeviceType, VirtioInterrupt, VirtioInterruptType,
 };
 
@@ -284,7 +284,7 @@ struct BalloonStatsHandler {
 }
 
 struct BalloonEpollHandler {
-    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    mem: GuestMemoryAtomic<GuestMemory>,
     queues: Vec<Queue>,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     inflate_queue_evt: EventFd,
@@ -307,7 +307,7 @@ impl BalloonEpollHandler {
     }
 
     fn advise_memory_range(
-        memory: &GuestMemoryMmap,
+        memory: &GuestMemory,
         range_base: GuestAddress,
         range_len: usize,
         advice: libc::c_int,
@@ -328,7 +328,7 @@ impl BalloonEpollHandler {
     }
 
     fn release_memory_range(
-        memory: &GuestMemoryMmap,
+        memory: &GuestMemory,
         range_base: GuestAddress,
         range_len: usize,
     ) -> result::Result<(), Error> {
@@ -379,7 +379,7 @@ impl BalloonEpollHandler {
 
     fn release_memory_range_partial_page(
         pbp: &mut Option<PartiallyBalloonedPage>,
-        memory: &GuestMemoryMmap,
+        memory: &GuestMemory,
         range_base: GuestAddress,
     ) -> result::Result<(), Error> {
         let page_size: u64 = get_page_size();
@@ -409,7 +409,7 @@ impl BalloonEpollHandler {
 
     fn process_inflate_addresses(
         &mut self,
-        memory: &GuestMemoryMmap,
+        memory: &GuestMemory,
         addresses: &mut SmallVec<[GuestAddress; VIRTIO_BALLOON_PFNS_PER_BATCH]>,
     ) {
         // The balloon always deals with 4 KiB pages. Use partial page handling
@@ -541,7 +541,7 @@ impl BalloonEpollHandler {
         access_platform: Option<&dyn AccessPlatform>,
     ) -> BalloonStatsResult
     where
-        M: Deref<Target = GuestMemoryMmap>,
+        M: Deref<Target = GuestMemory>,
     {
         let results: SmallVec<[_; 4]> = desc_chain.checked_iter(access_platform).collect();
         let mut data = Vec::new();
@@ -670,11 +670,7 @@ impl BalloonEpollHandler {
         }
     }
 
-    fn run(
-        &mut self,
-        paused: &AtomicBool,
-        paused_sync: &Barrier,
-    ) -> result::Result<(), EpollHelperError> {
+    fn run(&mut self, pause_common: &PauseCommon) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
         helper.add_event(self.inflate_queue_evt.as_raw_fd(), INFLATE_QUEUE_EVENT)?;
         helper.add_event(self.deflate_queue_evt.as_raw_fd(), DEFLATE_QUEUE_EVENT)?;
@@ -692,7 +688,7 @@ impl BalloonEpollHandler {
             self.process_stats_queue()
                 .map_err(|e| EpollHelperError::HandleEvent(anyhow!(e)))?;
         }
-        helper.run(paused, paused_sync, self)?;
+        helper.run(pause_common, self)?;
 
         Ok(())
     }
@@ -878,11 +874,9 @@ impl Balloon {
                 device_type: VirtioDeviceType::Balloon as u32,
                 avail_features,
                 acked_features,
-                paused_sync: Some(Arc::new(Barrier::new(2))),
                 queue_sizes,
                 min_queues: MIN_NUM_QUEUES,
-                paused: Arc::new(AtomicBool::new(paused)),
-                ..Default::default()
+                ..VirtioCommon::new(paused)?
             },
             id,
             config,
@@ -1075,9 +1069,6 @@ impl VirtioDevice for Balloon {
             access_platform: self.common.access_platform(),
         };
 
-        let paused = Arc::clone(&self.common.paused);
-        let paused_sync = self.common.paused_sync.clone();
-
         if let Err(e) = self.common.spawn_worker(
             &self.id,
             &self.seccomp_action,
@@ -1085,7 +1076,7 @@ impl VirtioDevice for Balloon {
             &self.exit_evt,
             Arc::clone(&device_status),
             Arc::clone(&interrupt_cb),
-            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            move |pause_common| handler.run(pause_common),
         ) {
             self.stats_request_sender = None;
             return Err(e);
@@ -1135,12 +1126,11 @@ impl Migratable for Balloon {}
 
 #[cfg(test)]
 mod tests {
-    use vm_memory::bitmap::AtomicBitmap;
     use vm_virtio::queue::testing::VirtQueue;
 
     use super::*;
 
-    type TestMemory = vm_memory::GuestMemoryMmap<AtomicBitmap>;
+    type TestMemory = GuestMemory;
 
     struct NoopInterrupt;
 
@@ -1205,8 +1195,6 @@ mod tests {
         use vm_memory::{FileOffset, GuestAddress, MmapRegion};
         use vmm_sys_util::tempfile::TempFile;
 
-        use crate::GuestRegionMmap;
-
         let backing_file = TempFile::new().unwrap();
         backing_file.as_file().write_all(&[0x5a; 4096]).unwrap();
         let original = fs::read(backing_file.as_path()).unwrap();
@@ -1223,8 +1211,10 @@ mod tests {
             libc::MAP_PRIVATE,
         )
         .unwrap();
-        let region = GuestRegionMmap::new(mmap, GuestAddress(0)).unwrap();
-        let memory = GuestMemoryMmap::from_regions(vec![region]).unwrap();
+        let region = vm_memory::GuestRegionMmap::new(mmap, GuestAddress(0))
+            .unwrap()
+            .into();
+        let memory = GuestMemory::from_regions(vec![region]).unwrap();
         memory.write_slice(&[0xa5], GuestAddress(0)).unwrap();
         assert_eq!(memory.read_obj::<u8>(GuestAddress(0)).unwrap(), 0xa5);
 

@@ -6,17 +6,17 @@
 use std::collections::{BTreeSet, HashMap, HashSet};
 #[cfg(feature = "ivshmem")]
 use std::fs;
+use std::mem::discriminant;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
-use std::result;
 use std::str::FromStr;
-use std::sync::LazyLock;
+use std::{io, result};
 
 use arch::CpuProfileConfig;
 #[cfg(target_arch = "x86_64")]
 use arch::CpuidOverride;
 use block::ImageType;
-use clap::ArgMatches;
-use log::{debug, warn};
+use log::warn;
 #[cfg(target_arch = "x86_64")]
 use option_parser::split_commas;
 use option_parser::{
@@ -31,11 +31,14 @@ use virtio_devices::block::MINIMUM_BLOCK_QUEUE_SIZE;
 use virtio_devices::vhost_user::VIRTIO_FS_TAG_LEN;
 use virtio_devices::{RateLimiterConfig, TokenBucketConfig, net, vhost_user};
 
+use crate::external_fds::{ExternalFds, Target, UpdateFdsError};
 use crate::landlock::LandlockAccess;
 use crate::vm_config::*;
 
 const MAX_NUM_PCI_SEGMENTS: u16 = 96;
 const MAX_IOMMU_ADDRESS_WIDTH_BITS: u8 = 64;
+const MIN_PHYS_BITS: u8 = 32;
+const MAX_PHYS_BITS: u8 = 64;
 
 // Maximum queue size is largest power of 2 that fits into a u16
 const VIRTIO_MAX_QUEUE_SIZE: u16 = 32768;
@@ -50,6 +53,13 @@ const MAX_SUPPORTED_CPUS: u32 = 255;
 /// Errors associated with VM configuration parameters.
 #[derive(Debug, Error)]
 pub enum Error {
+    // TODO(fd): Remove after the deprecation period for the legacy FD fields.
+    #[error("Cannot combine external_fds with legacy FD fields")]
+    MixedFdFormats,
+    #[error("Inherited file descriptor {0} is specified more than once")]
+    DuplicateInheritedFd(RawFd),
+    #[error("Invalid inherited file descriptor")]
+    InheritedFd(#[source] io::Error),
     /// Filesystem tag is missing
     #[error("Error parsing --fs: tag missing")]
     ParseFsTagMissing,
@@ -140,6 +150,12 @@ pub enum Error {
     /// Failed parsing serial parameters
     #[error("Error parsing --serial")]
     ParseSerial(#[source] OptionParserError),
+    #[error("Cannot resolve TCP console address {address:?}")]
+    ResolveConsoleTcpAddress {
+        address: String,
+        #[source]
+        source: io::Error,
+    },
     /// No mode given for console
     #[error("Error parsing --console: invalid console mode given")]
     ParseConsoleInvalidModeGiven,
@@ -215,15 +231,35 @@ pub enum ValidationError {
     /// Missing socket path for console
     #[error("Path missing when using socket console mode")]
     ConsoleSocketPathMissing,
-    /// Socket path given without socket console mode
-    #[error("Path only valid when using socket console mode")]
-    ConsoleSocketPathUnexpected,
+    /// Missing address for TCP console mode
+    #[error("Address missing when using TCP console mode")]
+    ConsoleTcpAddressMissing,
+    #[error("Server is only valid when using TCP console mode")]
+    ConsoleTcpServerUnexpected,
+    #[error("TCP console client mode is not supported")]
+    ConsoleTcpClientUnsupported,
+    #[error("TCP console port must not be zero")]
+    ConsoleTcpPortZero,
+    /// More than one new output was given for the same console
+    #[error("More than one new output given for console {0}")]
+    ConsoleOutputUpdateAmbiguous(String),
+    /// A new console output must keep the mode of the current one
+    #[error("Cannot change console output {0:?} to {1:?} with a different mode")]
+    ConsoleOutputUpdateModeMismatch(ConsoleOutput, ConsoleOutput),
+    /// Boot has no vCPUs
+    #[error("Number of boot vCPUs must be greater than 0")]
+    CpusBootZero,
     /// Max is less than boot
     #[error("Max CPUs ({0}) lower than boot CPUs ({1})")]
     CpusMaxLowerThanBoot(u32 /* max vCPUs */, u32 /* boot vCPUs */),
     /// Too many CPUs.
     #[error("Too many CPUs: specified {0} but {MAX_SUPPORTED_CPUS} is the limit")]
     TooManyCpus(u32 /* specified CPUs */),
+    /// Maximum physical address bits outside the supported range
+    #[error(
+        "Maximum physical address bits must be between {MIN_PHYS_BITS} and {MAX_PHYS_BITS}: {0}"
+    )]
+    InvalidMaxPhysBits(u8 /* specified bits */),
     #[cfg(target_arch = "aarch64")]
     /// The GICv3 layout does not fit this many CPUs.
     #[error("Too many CPUs for the GICv3 layout: specified {0} but {1} is the limit")]
@@ -234,6 +270,9 @@ pub enum ValidationError {
         usize, /* specified affinity */
         usize, /* maximum affinity */
     ),
+    /// kvm_hint_realtime conflicts with kvm_hyperv
+    #[error("`kvm_hint_realtime=on` cannot be combined with `kvm_hyperv=on`")]
+    KvmHintRealtimeWithKvmHyperv,
     /// Both socket and path specified
     #[error("Disk path and vhost socket both provided")]
     DiskSocketAndPath,
@@ -270,7 +309,7 @@ pub enum ValidationError {
     VnetQueueFdMismatch(u16 /* num of queues */, usize /* FD num */),
     /// Using reserved fd
     #[error("Reserved fd number (<= 2): {0}")]
-    VnetReservedFd(i32),
+    VnetReservedFd(RawFd),
     /// Hardware checksum offload is disabled.
     #[error("\"offload_tso\" and \"offload_ufo\" depend on \"offload_csum\"")]
     NoHardwareChecksumOffload,
@@ -280,6 +319,9 @@ pub enum ValidationError {
     /// Huge page size is not power of 2
     #[error("Huge page size is not power of 2: {0}")]
     InvalidHugePageSize(u64),
+    /// Invalid number of queues
+    #[error("Invalid number of queues: {0}")]
+    InvalidNumQueues(usize),
     /// Insufficient vCPUs for queues
     #[error("Queue count ({0}) must not exceed boot vCPUs ({1})")]
     TooManyQueues(u16 /* queues */, usize /* vCPUs */),
@@ -379,6 +421,37 @@ pub enum ValidationError {
     /// Invalid rate-limiter group
     #[error("Invalid rate-limiter group")]
     InvalidRateLimiterGroup,
+    /// A burst duration requires a burst rate
+    #[error("Rate limiter burst duration {0} seconds requires a burst rate")]
+    RateLimiterBurstSecondsWithoutRate(u64),
+    /// Burst rate and duration must be positive
+    #[error("Rate limiter burst rate {0} and duration {1} seconds must be positive")]
+    RateLimiterBurstZero(u64, u64),
+    /// A bounded burst cannot be combined with a one-time burst
+    #[error("Rate limiter burst rate {0} cannot be combined with one-time burst {1}")]
+    RateLimiterBurstWithOneTimeBurst(u64, u64),
+    /// A bounded burst requires an enabled sustained bucket
+    #[error("Rate limiter burst rate {0} requires nonzero size {1} and refill time {2} ms")]
+    RateLimiterBurstDisabledBucket(u64, u64, u64),
+    /// Burst rate cannot be below the sustained rate
+    #[error("Rate limiter burst rate {0} is below the sustained rate of {1} tokens per {2} ms")]
+    RateLimiterBurstBelowSustained(u64, u64, u64),
+    /// Burst capacity must fit in a u64
+    #[error("Rate limiter burst rate {0} times duration {1} seconds overflows token capacity")]
+    RateLimiterBurstCapacityOverflow(u64, u64),
+    /// A recharge duration requires a bounded burst
+    #[error("Rate limiter burst recharge time {0} seconds requires a burst rate")]
+    RateLimiterBurstRechargeWithoutRate(u64),
+    /// Recharge must take longer than refilling the base meter
+    #[error(
+        "Rate limiter burst recharge time {0} seconds must be at least {1} seconds to exceed the base refill time"
+    )]
+    RateLimiterBurstRechargeTooShort(u64, u128),
+    /// Recharge only applies to burst credit above the base capacity
+    #[error(
+        "Rate limiter burst recharge time {0} seconds has no effect: burst capacity {1} does not exceed the base capacity {2}"
+    )]
+    RateLimiterBurstRechargeWithoutCredit(u64, u64, u128),
     /// Rate limiting is not supported with vhost-user
     #[error("Rate limiting is not supported with vhost-user")]
     VhostUserRateLimiterNotSupported,
@@ -393,7 +466,7 @@ pub enum ValidationError {
     #[error("Invalid host data format")]
     InvalidHostData,
     #[cfg(feature = "sev_snp")]
-    #[error("SEV-SNP requires an IGVM payload (--payload igvm=<path>)")]
+    #[error("SEV-SNP requires an IGVM payload (--igvm <path>)")]
     SevSnpRequiresIgvm,
     #[cfg(all(feature = "kvm", feature = "sev_snp"))]
     #[error("SEV-SNP on KVM requires ACPI tables supplied through fw_cfg")]
@@ -422,18 +495,6 @@ pub enum ValidationError {
     #[cfg(feature = "sev_snp")]
     #[error("Passthrough devices require --platform iommufd=on with SEV-SNP")]
     SevSnpRequiresIommufd,
-    /// Restore expects all net ids that have fds
-    #[error("Net id {0} is associated with FDs and is required")]
-    RestoreMissingRequiredNetId(String),
-    /// Number of FDs passed during Restore are incorrect to the NetConfig
-    #[error("Number of Net FDs passed for '{0}' during Restore: {1}. Expected: {2}")]
-    RestoreNetFdCountMismatch(String, usize, usize),
-    /// vfio_fds entry does not match any DeviceConfig.id in the snapshot
-    #[error("VFIO device id '{0}' in 'vfio_fds' does not match any device in the snapshot")]
-    RestoreUnknownVfioId(String),
-    /// A device saved with an FD has no replacement FD for the restore
-    #[error("VFIO device '{0}' was FD backed and needs a new fd in 'vfio_fds'")]
-    RestoreMissingVfioFd(String),
     /// Prefault requires the eager-copy restore mode
     #[error("'prefault' requires 'memory_restore_mode=copy'")]
     InvalidRestorePrefaultWithOnDemand,
@@ -486,6 +547,11 @@ pub enum ValidationError {
     /// More than one update was specified that contains an empty memory zone ID
     #[error("At least one memory zone update with an empty ID was defined")]
     MemoryZoneUpdatesEmptyId,
+    /// A memory size of 0 requires memory zones
+    #[error("Memory zones are required when the memory size is 0")]
+    MemoryZonesMissing,
+    #[error("Invalid file descriptors")]
+    Fd(#[from] UpdateFdsError),
 }
 
 type ValidationResult<T> = result::Result<T, ValidationError>;
@@ -581,129 +647,6 @@ pub struct VmParams<'a> {
     pub fw_cfg_config: Option<&'a str>,
     #[cfg(feature = "ivshmem")]
     pub ivshmem: Option<&'a str>,
-}
-
-impl<'a> VmParams<'a> {
-    pub fn from_arg_matches(args: &'a ArgMatches) -> Self {
-        // These .unwrap()s cannot fail as there is a default value defined
-        let cpus = args.get_one::<String>("cpus").unwrap();
-        let memory = args.get_one::<String>("memory").unwrap();
-        let memory_zones: Option<Vec<&str>> = args
-            .get_many::<String>("memory-zone")
-            .map(|x| x.map(|y| y as &str).collect());
-        let rng = args.get_one::<String>("rng").unwrap();
-        let serial = args.get_one::<String>("serial").unwrap();
-        let firmware = args.get_one::<String>("firmware").map(|x| x as &str);
-        let kernel = args.get_one::<String>("kernel").map(|x| x as &str);
-        let initramfs = args.get_one::<String>("initramfs").map(|x| x as &str);
-        let cmdline = args.get_one::<String>("cmdline").map(|x| x as &str);
-        let rate_limit_groups: Option<Vec<&str>> = args
-            .get_many::<String>("rate-limit-group")
-            .map(|x| x.map(|y| y as &str).collect());
-        let disks: Option<Vec<&str>> = args
-            .get_many::<String>("disk")
-            .map(|x| x.map(|y| y as &str).collect());
-        let net: Option<Vec<&str>> = args
-            .get_many::<String>("net")
-            .map(|x| x.map(|y| y as &str).collect());
-        let console = args.get_one::<String>("console").unwrap();
-        #[cfg(target_arch = "x86_64")]
-        let debug_console = args.get_one::<String>("debug-console").unwrap().as_str();
-        let balloon = args.get_one::<String>("balloon").map(|x| x as &str);
-        let fs: Option<Vec<&str>> = args
-            .get_many::<String>("fs")
-            .map(|x| x.map(|y| y as &str).collect());
-        let generic_vhost_user: Option<Vec<&str>> = args
-            .get_many::<String>("generic-vhost-user")
-            .map(|x| x.map(|y| y as &str).collect());
-        let pmem: Option<Vec<&str>> = args
-            .get_many::<String>("pmem")
-            .map(|x| x.map(|y| y as &str).collect());
-        let devices: Option<Vec<&str>> = args
-            .get_many::<String>("device")
-            .map(|x| x.map(|y| y as &str).collect());
-        let user_devices: Option<Vec<&str>> = args
-            .get_many::<String>("user-device")
-            .map(|x| x.map(|y| y as &str).collect());
-        let vdpa: Option<Vec<&str>> = args
-            .get_many::<String>("vdpa")
-            .map(|x| x.map(|y| y as &str).collect());
-        let vsock: Option<&str> = args.get_one::<String>("vsock").map(|x| x as &str);
-        #[cfg(feature = "pvmemcontrol")]
-        let pvmemcontrol = args.get_flag("pvmemcontrol");
-        let pvpanic = args.get_flag("pvpanic");
-        let numa: Option<Vec<&str>> = args
-            .get_many::<String>("numa")
-            .map(|x| x.map(|y| y as &str).collect());
-        let watchdog = args.get_flag("watchdog");
-        let rtc: Option<&str> = args.get_one::<String>("rtc").map(|x| x as &str);
-        let pci_segments: Option<Vec<&str>> = args
-            .get_many::<String>("pci-segment")
-            .map(|x| x.map(|y| y as &str).collect());
-        let platform = args.get_one::<String>("platform").map(|x| x as &str);
-        #[cfg(feature = "guest_debug")]
-        let gdb = args.contains_id("gdb");
-        let tpm: Option<&str> = args.get_one::<String>("tpm").map(|x| x as &str);
-        #[cfg(feature = "igvm")]
-        let igvm = args.get_one::<String>("igvm").map(|x| x as &str);
-        #[cfg(feature = "sev_snp")]
-        let host_data = args.get_one::<String>("host-data").map(|x| x as &str);
-        let landlock_enable = args.get_flag("landlock");
-        let landlock_rules: Option<Vec<&str>> = args
-            .get_many::<String>("landlock-rules")
-            .map(|x| x.map(|y| y as &str).collect());
-        #[cfg(feature = "fw_cfg")]
-        let fw_cfg_config: Option<&str> =
-            args.get_one::<String>("fw-cfg-config").map(|x| x as &str);
-        #[cfg(feature = "ivshmem")]
-        let ivshmem: Option<&str> = args.get_one::<String>("ivshmem").map(|x| x as &str);
-        VmParams {
-            cpus,
-            memory,
-            memory_zones,
-            firmware,
-            kernel,
-            initramfs,
-            cmdline,
-            rate_limit_groups,
-            disks,
-            net,
-            rng,
-            balloon,
-            fs,
-            generic_vhost_user,
-            pmem,
-            serial,
-            console,
-            #[cfg(target_arch = "x86_64")]
-            debug_console,
-            devices,
-            user_devices,
-            vdpa,
-            vsock,
-            #[cfg(feature = "pvmemcontrol")]
-            pvmemcontrol,
-            pvpanic,
-            numa,
-            watchdog,
-            rtc,
-            #[cfg(feature = "guest_debug")]
-            gdb,
-            pci_segments,
-            platform,
-            tpm,
-            #[cfg(feature = "igvm")]
-            igvm,
-            #[cfg(feature = "sev_snp")]
-            host_data,
-            landlock_enable,
-            landlock_rules,
-            #[cfg(feature = "fw_cfg")]
-            fw_cfg_config,
-            #[cfg(feature = "ivshmem")]
-            ivshmem,
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -854,6 +797,17 @@ fn parse_cpuid_override_entry(
 }
 
 impl CpusConfig {
+    pub const SYNTAX: &'static str = "CPU parameters \
+        \"boot=<boot_vcpus>,max=<max_vcpus>,\
+        topology=<threads_per_core>:<cores_per_die>:<dies_per_package>:<packages>,\
+        kvm_hyperv=on|off,kvm_hint_realtime=on|off,\
+        max_phys_bits=<maximum_number_of_physical_bits>,\
+        affinity=<list_of_vcpus_with_their_associated_cpuset>,\
+        features=<list_of_features_to_enable>,\
+        nested=on|off,core_scheduling=vm|vcpu|off,\
+        profile=host|path:<file>,\
+        x-cpuid-overrides=[[<leaf>,<subleaf>,<eax>,<ebx>,<ecx>,<edx>],...]\"";
+
     pub fn parse(cpus: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -869,6 +823,8 @@ impl CpusConfig {
             .add("profile");
         #[cfg(target_arch = "x86_64")]
         parser.add("x-cpuid-overrides");
+        #[cfg(target_arch = "x86_64")]
+        parser.add("kvm_hint_realtime");
         parser.parse(cpus).map_err(Error::ParseCpus)?;
 
         let boot_vcpus: u32 = parser
@@ -882,6 +838,12 @@ impl CpusConfig {
         let topology = parser.convert("topology").map_err(Error::ParseCpus)?;
         let kvm_hyperv = parser
             .convert::<Toggle>("kvm_hyperv")
+            .map_err(Error::ParseCpus)?
+            .unwrap_or(Toggle(false))
+            .0;
+        #[cfg(target_arch = "x86_64")]
+        let kvm_hint_realtime = parser
+            .convert::<Toggle>("kvm_hint_realtime")
             .map_err(Error::ParseCpus)?
             .unwrap_or(Toggle(false))
             .0;
@@ -954,6 +916,8 @@ impl CpusConfig {
             max_vcpus,
             topology,
             kvm_hyperv,
+            #[cfg(target_arch = "x86_64")]
+            kvm_hint_realtime,
             max_phys_bits,
             affinity,
             features,
@@ -968,7 +932,8 @@ impl CpusConfig {
 
 impl PciSegmentConfig {
     pub const SYNTAX: &'static str = "PCI Segment parameters \
-         \"pci_segment=<segment_id>,mmio32_aperture_weight=<scale>,mmio64_aperture_weight=<scale>\"";
+        \"pci_segment=<segment_id>,mmio32_aperture_weight=<scale>,\
+        mmio64_aperture_weight=<scale>\"";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1024,32 +989,35 @@ impl PciSegmentConfig {
     }
 }
 
+// Shared by both variants of `PlatformConfig::SYNTAX`.
+macro_rules! platform_syntax {
+    ($($extra:literal)?) => {
+        concat!(
+            "Platform configuration parameters \
+                \"num_pci_segments=<num_pci_segments>,iommu_segments=<list_of_segments>,\
+                iommu_address_width=<bits>,iommufd=on|off,iommufd_fd=<fd>,vfio_p2p_dma=on|off,\
+                system_manufacturer=<dmi_system_manufacturer>,\
+                system_product_name=<dmi_system_product_name>,system_version=<dmi_system_version>,\
+                system_serial_number=<dmi_system_serial_number>,system_uuid=<dmi_system_uuid>,\
+                system_sku_number=<dmi_system_sku_number>,system_family=<dmi_system_family>,\
+                oem_strings=<list_of_strings>,chassis_asset_tag=<dmi_chassis_asset_tag>",
+            $($extra,)?
+            "\""
+        )
+    };
+}
+
 impl PlatformConfig {
-    pub fn syntax() -> &'static str {
-        static SYNTAX: LazyLock<String> = LazyLock::new(|| {
-            let mut syntax = "Platform configuration parameters \
-            \"num_pci_segments=<num_pci_segments>,iommu_segments=<list_of_segments>,\
-            iommu_address_width=<bits>,iommufd=on|off,iommufd_fd=<fd>,vfio_p2p_dma=on|off,\
-            system_manufacturer=<dmi_system_manufacturer>,\
-            system_product_name=<dmi_system_product_name>,system_version=<dmi_system_version>,\
-            system_serial_number=<dmi_system_serial_number>,system_uuid=<dmi_system_uuid>,\
-            system_sku_number=<dmi_system_sku_number>,system_family=<dmi_system_family>,\
-            oem_strings=<list_of_strings>,chassis_asset_tag=<dmi_chassis_asset_tag>"
-                .to_string();
+    #[cfg(feature = "sev_snp")]
+    pub const SYNTAX: &'static str = platform_syntax!(",sev_snp=on|off");
+    #[cfg(not(feature = "sev_snp"))]
+    pub const SYNTAX: &'static str = platform_syntax!();
 
-            if cfg!(feature = "sev_snp") {
-                syntax.push_str(",sev_snp=on|off");
-            }
-
-            syntax.push('"');
-
-            syntax
-        });
-
-        &SYNTAX
-    }
-
-    pub fn parse(platform: &str) -> Result<Self> {
+    /// # Safety
+    /// Live FDs named in the input must be exclusively owned by the caller.
+    /// Referenced descriptors may be consumed even if parsing fails.
+    pub unsafe fn parse(platform: &str) -> Result<Self> {
+        validate_inherited_fds([platform])?;
         struct StringField {
             key: &'static str,
             apply: fn(&mut PlatformConfig, String),
@@ -1123,8 +1091,12 @@ impl PlatformConfig {
             .map_err(Error::ParsePlatform)?
             .map(|v| v.0.into_boxed_slice());
         let iommufd_fd = parser
-            .convert::<i32>("iommufd_fd")
-            .map_err(Error::ParsePlatform)?;
+            .convert::<RawFd>("iommufd_fd")
+            .map_err(Error::ParsePlatform)?
+            // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
+            .map(|fd| unsafe { take_inherited_fd(fd) })
+            .transpose()?
+            .unwrap_or_default();
         // `iommufd_fd=<n>` implies `iommufd=on` unless the user explicitly set the value.
         let iommufd = parser
             .convert::<Toggle>("iommufd")
@@ -1203,13 +1175,32 @@ impl PlatformConfig {
     }
 }
 
+impl MemoryZoneConfig {
+    pub const SYNTAX: &'static str = "User defined memory zone parameters \
+        \"size=<guest_memory_region_size>,file=<backing_file>,\
+        shared=on|off,\
+        hugepages=on|off,hugepage_size=<hugepage_size>,\
+        host_numa_node=<node_id>,\
+        id=<zone_identifier>,hotplug_size=<hotpluggable_memory_size>,\
+        hotplugged_size=<hotplugged_memory_size>,\
+        prefault=on|off,reserve=on|off\"";
+}
+
 impl MemoryConfig {
+    pub const SYNTAX: &'static str = "Memory parameters \
+        \"size=<guest_memory_size>,mergeable=on|off,shared=on|off,\
+        hugepages=on|off,hugepage_size=<hugepage_size>,\
+        hotplug_method=acpi|virtio-mem,\
+        hotplug_size=<hotpluggable_memory_size>,\
+        hotplugged_size=<hotplugged_memory_size>,\
+        prefault=on|off,reserve=on|off,thp=on|off\" \
+        (ACPI memory hotplug is deprecated: use hotplug_method=virtio-mem)";
+
     #[expect(clippy::needless_pass_by_value)]
     pub fn parse(memory: &str, memory_zones: Option<Vec<&str>>) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
             .add("size")
-            .add("file")
             .add("mergeable")
             .add("hotplug_method")
             .add("hotplug_size")
@@ -1418,77 +1409,137 @@ impl MemoryConfig {
     }
 }
 
+const RATE_LIMITER_OPTIONS: &[&str] = &[
+    "bw_size",
+    "bw_one_time_burst",
+    "bw_refill_time",
+    "bw_burst_rate",
+    "bw_burst_seconds",
+    "bw_burst_recharge_seconds",
+    "ops_size",
+    "ops_one_time_burst",
+    "ops_refill_time",
+    "ops_burst_rate",
+    "ops_burst_seconds",
+    "ops_burst_recharge_seconds",
+];
+
+fn parse_rate_limiter_config(
+    parser: &OptionParser,
+) -> result::Result<RateLimiterConfig, OptionParserError> {
+    let bandwidth = TokenBucketConfig {
+        size: parser.convert("bw_size")?.unwrap_or_default(),
+        one_time_burst: Some(parser.convert("bw_one_time_burst")?.unwrap_or_default()),
+        refill_time: parser.convert("bw_refill_time")?.unwrap_or_default(),
+        burst_rate: parser.convert("bw_burst_rate")?,
+        burst_seconds: parser.convert("bw_burst_seconds")?,
+        burst_recharge_seconds: parser.convert("bw_burst_recharge_seconds")?,
+    };
+    let ops = TokenBucketConfig {
+        size: parser.convert("ops_size")?.unwrap_or_default(),
+        one_time_burst: Some(parser.convert("ops_one_time_burst")?.unwrap_or_default()),
+        refill_time: parser.convert("ops_refill_time")?.unwrap_or_default(),
+        burst_rate: parser.convert("ops_burst_rate")?,
+        burst_seconds: parser.convert("ops_burst_seconds")?,
+        burst_recharge_seconds: parser.convert("ops_burst_recharge_seconds")?,
+    };
+    let [bandwidth, ops] = [bandwidth, ops].map(|bucket| {
+        ((bucket.size != 0 && bucket.refill_time != 0)
+            || bucket.burst_rate.is_some()
+            || bucket.burst_seconds.is_some()
+            || bucket.burst_recharge_seconds.is_some())
+        .then_some(bucket)
+    });
+    Ok(RateLimiterConfig { bandwidth, ops })
+}
+
+fn validate_rate_limiter_config(cfg: &RateLimiterConfig) -> ValidationResult<()> {
+    for bucket in [cfg.bandwidth, cfg.ops].into_iter().flatten() {
+        let Some(rate) = bucket.burst_rate else {
+            if let Some(seconds) = bucket.burst_seconds {
+                return Err(ValidationError::RateLimiterBurstSecondsWithoutRate(seconds));
+            }
+            if let Some(recharge) = bucket.burst_recharge_seconds {
+                return Err(ValidationError::RateLimiterBurstRechargeWithoutRate(
+                    recharge,
+                ));
+            }
+            continue;
+        };
+        let seconds = bucket.burst_seconds.unwrap_or(1);
+        if rate == 0 || seconds == 0 {
+            return Err(ValidationError::RateLimiterBurstZero(rate, seconds));
+        }
+        if let Some(burst) = bucket.one_time_burst
+            && burst > 0
+        {
+            return Err(ValidationError::RateLimiterBurstWithOneTimeBurst(
+                rate, burst,
+            ));
+        }
+        if bucket.size == 0 || bucket.refill_time == 0 {
+            return Err(ValidationError::RateLimiterBurstDisabledBucket(
+                rate,
+                bucket.size,
+                bucket.refill_time,
+            ));
+        }
+        if u128::from(rate) * u128::from(bucket.refill_time) < u128::from(bucket.size) * 1000 {
+            return Err(ValidationError::RateLimiterBurstBelowSustained(
+                rate,
+                bucket.size,
+                bucket.refill_time,
+            ));
+        }
+        if rate.checked_mul(seconds).is_none() {
+            return Err(ValidationError::RateLimiterBurstCapacityOverflow(
+                rate, seconds,
+            ));
+        }
+        if let Some(recharge) = bucket.burst_recharge_seconds {
+            let sustained = u128::from(bucket.size) * 1000;
+            let refill_time = u128::from(bucket.refill_time);
+            let base_depth = sustained.div_ceil(refill_time);
+            let base_refill_seconds = base_depth * refill_time / sustained;
+            let capacity = rate * seconds;
+            if u128::from(capacity) <= base_depth {
+                return Err(ValidationError::RateLimiterBurstRechargeWithoutCredit(
+                    recharge, capacity, base_depth,
+                ));
+            }
+            if u128::from(recharge) <= base_refill_seconds {
+                return Err(ValidationError::RateLimiterBurstRechargeTooShort(
+                    recharge,
+                    base_refill_seconds + 1,
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 impl RateLimiterGroupConfig {
     pub const SYNTAX: &'static str = "Rate Limit Group parameters \
         \"bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
+        bw_burst_rate=<bytes_per_second>,bw_burst_seconds=<seconds>,\
+        bw_burst_recharge_seconds=<seconds>,\
         ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
+        ops_burst_rate=<io_ops_per_second>,ops_burst_seconds=<seconds>,\
+        ops_burst_recharge_seconds=<seconds>,\
         id=<device_id>\"";
 
     pub fn parse(rate_limit_group: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
-        parser
-            .add("bw_size")
-            .add("bw_one_time_burst")
-            .add("bw_refill_time")
-            .add("ops_size")
-            .add("ops_one_time_burst")
-            .add("ops_refill_time")
-            .add("id");
+        parser.add_all(RATE_LIMITER_OPTIONS).add("id");
         parser
             .parse(rate_limit_group)
             .map_err(Error::ParseRateLimiterGroup)?;
 
         let id = parser.get("id").unwrap_or_default();
-        let bw_size = parser
-            .convert("bw_size")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let bw_one_time_burst = parser
-            .convert("bw_one_time_burst")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let bw_refill_time = parser
-            .convert("bw_refill_time")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let ops_size = parser
-            .convert("ops_size")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let ops_one_time_burst = parser
-            .convert("ops_one_time_burst")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-        let ops_refill_time = parser
-            .convert("ops_refill_time")
-            .map_err(Error::ParseRateLimiterGroup)?
-            .unwrap_or_default();
-
-        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: bw_size,
-                one_time_burst: Some(bw_one_time_burst),
-                refill_time: bw_refill_time,
-            })
-        } else {
-            None
-        };
-        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: ops_size,
-                one_time_burst: Some(ops_one_time_burst),
-                refill_time: ops_refill_time,
-            })
-        } else {
-            None
-        };
-
         Ok(RateLimiterGroupConfig {
             id,
-            rate_limiter_config: RateLimiterConfig {
-                bandwidth: bw_tb_config,
-                ops: ops_tb_config,
-            },
+            rate_limiter_config: parse_rate_limiter_config(&parser)
+                .map_err(Error::ParseRateLimiterGroup)?,
         })
     }
 
@@ -1500,6 +1551,8 @@ impl RateLimiterGroupConfig {
         if self.id.is_empty() {
             return Err(ValidationError::InvalidRateLimiterGroup);
         }
+
+        validate_rate_limiter_config(&self.rate_limiter_config)?;
 
         Ok(())
     }
@@ -1573,17 +1626,21 @@ impl PciDeviceCommonConfig {
 
 impl DiskConfig {
     pub const SYNTAX: &'static str = "Disk parameters \
-         \"path=<disk_image_path>,readonly=on|off,direct=on|off,iommu=off|virtio,\
-         num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
-         vhost_user=on|off,socket=<vhost_user_socket_path>,\
-         bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
-         ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
-         id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
-         rate_limit_group=<group_id>,\
-         queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
-         serial=<serial_number>,backing_files=on|off,sparse=on|off,\
-         image_type=<raw,qcow2,vhd,vhdx,vmdk>,lock_granularity=byte-range|full,\
-         guest_block_size=<size_in_bytes>";
+        \"path=<disk_image_path>,readonly=on|off,direct=on|off,iommu=off|virtio,\
+        num_queues=<number_of_queues>,queue_size=<size_of_each_queue>,\
+        vhost_user=on|off,socket=<vhost_user_socket_path>,\
+        bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
+        bw_burst_rate=<bytes_per_second>,bw_burst_seconds=<seconds>,\
+        bw_burst_recharge_seconds=<seconds>,\
+        ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
+        ops_burst_rate=<io_ops_per_second>,ops_burst_seconds=<seconds>,\
+        ops_burst_recharge_seconds=<seconds>,\
+        id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
+        rate_limit_group=<group_id>,\
+        queue_affinity=<list_of_queue_indices_with_their_associated_cpuset>,\
+        serial=<serial_number>,backing_files=on|off,sparse=on|off,\
+        image_type=<raw,qcow2,vhd,vhdx,vmdk>,lock_granularity=byte-range|full,\
+        guest_block_size=<size_in_bytes>\"";
 
     pub fn parse(disk: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -1595,12 +1652,7 @@ impl DiskConfig {
             .add("num_queues")
             .add("vhost_user")
             .add("socket")
-            .add("bw_size")
-            .add("bw_one_time_burst")
-            .add("bw_refill_time")
-            .add("ops_size")
-            .add("ops_one_time_burst")
-            .add("ops_refill_time")
+            .add_all(RATE_LIMITER_OPTIONS)
             .add("_disable_io_uring")
             .add("_disable_aio")
             .add("serial")
@@ -1651,30 +1703,7 @@ impl DiskConfig {
             .unwrap_or(Toggle(false))
             .0;
         let rate_limit_group = parser.get("rate_limit_group");
-        let bw_size = parser
-            .convert("bw_size")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let bw_one_time_burst = parser
-            .convert("bw_one_time_burst")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let bw_refill_time = parser
-            .convert("bw_refill_time")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let ops_size = parser
-            .convert("ops_size")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let ops_one_time_burst = parser
-            .convert("ops_one_time_burst")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
-        let ops_refill_time = parser
-            .convert("ops_refill_time")
-            .map_err(Error::ParseDisk)?
-            .unwrap_or_default();
+        let rate_limiter_config = parse_rate_limiter_config(&parser).map_err(Error::ParseDisk)?;
         let serial = parser.get("serial");
         let queue_affinity = parser
             .convert::<TupleList<u16, Vec<usize>>>("queue_affinity")
@@ -1712,32 +1741,9 @@ impl DiskConfig {
             .convert::<u32>("guest_block_size")
             .map_err(Error::ParseDisk)?;
 
-        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: bw_size,
-                one_time_burst: Some(bw_one_time_burst),
-                refill_time: bw_refill_time,
-            })
-        } else {
-            None
-        };
-        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: ops_size,
-                one_time_burst: Some(ops_one_time_burst),
-                refill_time: ops_refill_time,
-            })
-        } else {
-            None
-        };
-        let rate_limiter_config = if bw_tb_config.is_some() || ops_tb_config.is_some() {
-            Some(RateLimiterConfig {
-                bandwidth: bw_tb_config,
-                ops: ops_tb_config,
-            })
-        } else {
-            None
-        };
+        let rate_limiter_config = (rate_limiter_config.bandwidth.is_some()
+            || rate_limiter_config.ops.is_some())
+        .then_some(rate_limiter_config);
         let sparse = parser
             .convert::<Toggle>("sparse")
             .map_err(Error::ParseDisk)?
@@ -1771,6 +1777,10 @@ impl DiskConfig {
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         self.pci_common.validate(vm_config, true)?;
+
+        if self.num_queues == 0 {
+            return Err(ValidationError::InvalidNumQueues(self.num_queues.into()));
+        }
 
         if self.num_queues as u32 > vm_config.cpus.boot_vcpus {
             return Err(ValidationError::TooManyQueues(
@@ -1812,6 +1822,10 @@ impl DiskConfig {
 
         if self.rate_limiter_config.is_some() && self.rate_limit_group.is_some() {
             return Err(ValidationError::InvalidRateLimiterGroup);
+        }
+
+        if let Some(cfg) = &self.rate_limiter_config {
+            validate_rate_limiter_config(cfg)?;
         }
 
         // Check Block device serial length
@@ -1868,9 +1882,7 @@ impl FromStr for IommuType {
         match s.to_lowercase().as_str() {
             "" | "off" | "false" => Ok(IommuType::Off),
             "on" | "true" => {
-                warn!(
-                    "iommu=on is deprecated, use iommu=virtio instead. It will be removed in a future release"
-                );
+                warn!("'iommu=on' is deprecated: use 'iommu=virtio' instead");
                 Ok(IommuType::Virtio)
             }
             "virtio" => Ok(IommuType::Virtio),
@@ -1882,16 +1894,24 @@ impl FromStr for IommuType {
 
 impl NetConfig {
     pub const SYNTAX: &'static str = "Network parameters \
-    \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,host_mac=<host_mac_addr>,\
-    fd=<[fd1,fd2,...]>,iommu=off|virtio,mtu=<mtu>,num_queues=<number_of_queues>,\
-    queue_size=<size_of_each_queue>,id=<device_id>,\
-    vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
-    bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
-    ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
-    pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
-    offload_tso=on|off,offload_ufo=on|off,offload_csum=on|off\"";
+        \"tap=<if_name>,ip=<ip_addr>,mask=<net_mask>,mac=<mac_addr>,host_mac=<host_mac_addr>,\
+        fd=<[fd1,fd2,...]>,iommu=off|virtio,mtu=<mtu>,num_queues=<number_of_queues>,\
+        queue_size=<size_of_each_queue>,id=<device_id>,\
+        vhost_user=<vhost_user_enable>,socket=<vhost_user_socket_path>,vhost_mode=client|server,\
+        bw_size=<bytes>,bw_one_time_burst=<bytes>,bw_refill_time=<ms>,\
+        bw_burst_rate=<bytes_per_second>,bw_burst_seconds=<seconds>,\
+        bw_burst_recharge_seconds=<seconds>,\
+        ops_size=<io_ops>,ops_one_time_burst=<io_ops>,ops_refill_time=<ms>,\
+        ops_burst_rate=<io_ops_per_second>,ops_burst_seconds=<seconds>,\
+        ops_burst_recharge_seconds=<seconds>,\
+        pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
+        offload_tso=on|off,offload_ufo=on|off,offload_csum=on|off\"";
 
-    pub fn parse(net: &str) -> Result<Self> {
+    /// # Safety
+    /// Live FDs named in the input must be exclusively owned by the caller.
+    /// Referenced descriptors may be consumed even if parsing fails.
+    pub unsafe fn parse(net: &str) -> Result<Self> {
+        validate_inherited_fds([net])?;
         let mut parser = OptionParser::new();
 
         parser
@@ -1910,12 +1930,7 @@ impl NetConfig {
             .add("socket")
             .add("vhost_mode")
             .add("fd")
-            .add("bw_size")
-            .add("bw_one_time_burst")
-            .add("bw_refill_time")
-            .add("ops_size")
-            .add("ops_one_time_burst")
-            .add("ops_refill_time")
+            .add_all(RATE_LIMITER_OPTIONS)
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
         parser.parse(net).map_err(Error::ParseNetwork)?;
 
@@ -1962,57 +1977,18 @@ impl NetConfig {
         let fds = parser
             .convert::<IntegerList>("fd")
             .map_err(Error::ParseNetwork)?
-            .map(|v| v.0.iter().map(|e| *e as i32).collect());
-        let bw_size = parser
-            .convert("bw_size")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let bw_one_time_burst = parser
-            .convert("bw_one_time_burst")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let bw_refill_time = parser
-            .convert("bw_refill_time")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let ops_size = parser
-            .convert("ops_size")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let ops_one_time_burst = parser
-            .convert("ops_one_time_burst")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let ops_refill_time = parser
-            .convert("ops_refill_time")
-            .map_err(Error::ParseNetwork)?
-            .unwrap_or_default();
-        let bw_tb_config = if bw_size != 0 && bw_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: bw_size,
-                one_time_burst: Some(bw_one_time_burst),
-                refill_time: bw_refill_time,
+            .map(|v| {
+                v.0.into_iter()
+                    // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
+                    .map(|fd| unsafe { take_inherited_fd(fd) })
+                    .collect::<Result<Vec<_>>>()
             })
-        } else {
-            None
-        };
-        let ops_tb_config = if ops_size != 0 && ops_refill_time != 0 {
-            Some(TokenBucketConfig {
-                size: ops_size,
-                one_time_burst: Some(ops_one_time_burst),
-                refill_time: ops_refill_time,
-            })
-        } else {
-            None
-        };
-        let rate_limiter_config = if bw_tb_config.is_some() || ops_tb_config.is_some() {
-            Some(RateLimiterConfig {
-                bandwidth: bw_tb_config,
-                ops: ops_tb_config,
-            })
-        } else {
-            None
-        };
+            .transpose()?;
+        let rate_limiter_config =
+            parse_rate_limiter_config(&parser).map_err(Error::ParseNetwork)?;
+        let rate_limiter_config = (rate_limiter_config.bandwidth.is_some()
+            || rate_limiter_config.ops.is_some())
+        .then_some(rate_limiter_config);
 
         let pci_common = PciDeviceCommonConfig::parse(net)?;
 
@@ -2058,7 +2034,8 @@ impl NetConfig {
                 ));
             }
 
-            for &fd in fds {
+            for fd in fds {
+                let fd = fd.as_ref().map_or(-1, |fd| fd.as_raw_fd());
                 if fd <= 2 {
                     return Err(ValidationError::VnetReservedFd(fd));
                 }
@@ -2080,6 +2057,10 @@ impl NetConfig {
 
         if self.vhost_user && self.rate_limiter_config.is_some() {
             return Err(ValidationError::VhostUserRateLimiterNotSupported);
+        }
+
+        if let Some(cfg) = &self.rate_limiter_config {
+            validate_rate_limiter_config(cfg)?;
         }
 
         if let Some(mtu) = self.mtu
@@ -2105,8 +2086,8 @@ impl NetConfig {
 }
 
 impl RngConfig {
-    pub const SYNTAX: &'static str = "Random number generator parameters \"\
-        src=<entropy_source_path>,iommu=off|virtio,pci_segment=<segment_id>,\
+    pub const SYNTAX: &'static str = "Random number generator parameters \
+        \"src=<entropy_source_path>,iommu=off|virtio,pci_segment=<segment_id>,\
         pci_device_id=<pci_slot>\"";
 
     pub fn parse(rng: &str) -> Result<Self> {
@@ -2133,8 +2114,8 @@ impl RngConfig {
 }
 
 impl RtcConfig {
-    pub const SYNTAX: &'static str = "Virtio RTC parameters \"\
-        iommu=off|virtio,id=<device_id>,\
+    pub const SYNTAX: &'static str = "Virtio RTC parameters \
+        \"iommu=off|virtio,id=<device_id>,\
         pci_segment=<segment_id>,pci_device_id=<pci_slot>\". \
         Passing --rtc with no arguments enables the device with default \
         settings.";
@@ -2155,7 +2136,8 @@ impl RtcConfig {
 }
 
 impl BalloonConfig {
-    pub const SYNTAX: &'static str = "Balloon parameters \"size=<balloon_size>,deflate_on_oom=on|off,\
+    pub const SYNTAX: &'static str = "Balloon parameters \
+        \"size=<balloon_size>,deflate_on_oom=on|off,\
         free_page_reporting=on|off,iommu=off|virtio,id=<device_id>,pci_segment=<segment_id>,\
         pci_device_id=<pci_slot>\"";
 
@@ -2201,10 +2183,10 @@ impl BalloonConfig {
 
 impl GenericVhostUserConfig {
     pub const SYNTAX: &'static str = "generic vhost-user parameters \
-    \"device_type=<ID number for virtio device type (FS, block, net, etc) or symbolic name>,\
-    socket=<socket_path>,\
-    queue_sizes=<list of queue sizes>,\
-    id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
+        \"device_type=<ID number for virtio device type (FS, block, net, etc) or symbolic name>,\
+        socket=<socket_path>,\
+        queue_sizes=<list of queue sizes>,\
+        id=<device_id>,pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(vhost_user: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2320,9 +2302,9 @@ impl GenericVhostUserConfig {
 
 impl FsConfig {
     pub const SYNTAX: &'static str = "virtio-fs parameters \
-    \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
-    queue_size=<size_of_each_queue>,id=<device_id>,\
-    pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
+        \"tag=<tag_name>,socket=<socket_path>,num_queues=<number_of_queues>,\
+        queue_size=<size_of_each_queue>,id=<device_id>,\
+        pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(fs: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2361,6 +2343,10 @@ impl FsConfig {
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
+        if self.num_queues == 0 {
+            return Err(ValidationError::InvalidNumQueues(self.num_queues.into()));
+        }
+
         if self.num_queues as u32 > vm_config.cpus.boot_vcpus {
             return Err(ValidationError::TooManyQueues(
                 self.num_queues,
@@ -2381,8 +2367,8 @@ impl FsConfig {
 #[cfg(feature = "fw_cfg")]
 impl FwCfgConfig {
     pub const SYNTAX: &'static str = "Boot params to pass to FW CFG device \
-    \"e820=on|off,kernel=on|off,cmdline=on|off,initramfs=on|off,acpi_table=on|off, \
-    items=[name=<item_name>,file=<file_path>:name=<item_name>,string=<string_value>]\"";
+        \"e820=on|off,kernel=on|off,cmdline=on|off,initramfs=on|off,acpi_table=on|off,\
+        items=[name=<item_name>,file=<file_path>:name=<item_name>,string=<string_value>]\"";
     pub fn parse(fw_cfg_config: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -2480,9 +2466,9 @@ impl FwCfgItem {
 
 impl PmemConfig {
     pub const SYNTAX: &'static str = "Persistent memory parameters \
-    \"file=<backing_file_path>,size=<persistent_memory_size>,iommu=off|virtio,\
-    discard_writes=on|off,id=<device_id>,\
-    pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
+        \"file=<backing_file_path>,size=<persistent_memory_size>,iommu=off|virtio,\
+        discard_writes=on|off,id=<device_id>,\
+        pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(pmem: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
@@ -2518,53 +2504,143 @@ impl PmemConfig {
     }
 }
 
-impl CommonConsoleConfig {
+impl ConsoleOutput {
     const VALUELESS_OPTIONS: &[&str] = &["off", "pty", "tty", "null"];
-    const VALUE_OPTIONS: &[&str] = &["file", "socket"];
+    const VALUE_OPTIONS: &[&str] = &["file", "socket", "tcp", "server"];
 
     fn parse(console: &str, map_err: impl Fn(OptionParserError) -> Error) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
             .add_all_valueless(Self::VALUELESS_OPTIONS)
             .add_all(Self::VALUE_OPTIONS);
-        parser.parse_subset(console).map_err(map_err)?;
+        parser.parse_subset(console).map_err(&map_err)?;
 
-        let mut file: Option<PathBuf> = None;
-        let mut socket: Option<PathBuf> = None;
-        let mut mode: ConsoleOutputMode = ConsoleOutputMode::Off;
-
-        if parser.is_set("off") {
+        let output = if parser.is_set("off") {
+            ConsoleOutput::Off
         } else if parser.is_set("pty") {
-            mode = ConsoleOutputMode::Pty;
+            ConsoleOutput::Pty { file: None }
         } else if parser.is_set("tty") {
-            mode = ConsoleOutputMode::Tty;
+            ConsoleOutput::Tty
         } else if parser.is_set("null") {
-            mode = ConsoleOutputMode::Null;
+            ConsoleOutput::Null
         } else if parser.is_set("file") {
-            mode = ConsoleOutputMode::File;
-            file =
-                Some(PathBuf::from(parser.get("file").ok_or(
-                    Error::Validation(ValidationError::ConsoleFileMissing),
-                )?));
+            let file = parser
+                .get("file")
+                .ok_or(Error::Validation(ValidationError::ConsoleFileMissing))?;
+            ConsoleOutput::File {
+                file: PathBuf::from(file),
+            }
         } else if parser.is_set("socket") {
-            mode = ConsoleOutputMode::Socket;
-            socket = Some(PathBuf::from(parser.get("socket").ok_or(
-                Error::Validation(ValidationError::ConsoleSocketPathMissing),
-            )?));
+            let socket = parser
+                .get("socket")
+                .ok_or(Error::Validation(ValidationError::ConsoleSocketPathMissing))?;
+            ConsoleOutput::Socket {
+                socket: PathBuf::from(socket),
+            }
+        } else if parser.is_set("tcp") {
+            let address = parser
+                .get("tcp")
+                .ok_or(Error::Validation(ValidationError::ConsoleTcpAddressMissing))?;
+            let server = parser
+                .convert::<Toggle>("server")
+                .map_err(&map_err)?
+                .unwrap_or(Toggle(true))
+                .0;
+            if !server {
+                return Err(Error::Validation(
+                    ValidationError::ConsoleTcpClientUnsupported,
+                ));
+            }
+            ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: parse_tcp_address(&address)
+                        .map_err(|source| Error::ResolveConsoleTcpAddress { address, source })?,
+                    server,
+                },
+            }
         } else {
             return Err(Error::ParseConsoleInvalidModeGiven);
+        };
+
+        if parser.is_set("server") && !matches!(output, ConsoleOutput::Tcp { .. }) {
+            return Err(Error::Validation(
+                ValidationError::ConsoleTcpServerUnexpected,
+            ));
         }
 
-        Ok(Self { mode, file, socket })
+        Ok(output)
     }
 
     pub fn validate(&self) -> ValidationResult<()> {
-        if self.mode == ConsoleOutputMode::Socket && self.socket.is_none() {
-            return Err(ValidationError::ConsoleSocketPathMissing);
+        if let ConsoleOutput::Tcp { tcp } = self {
+            if !tcp.server {
+                return Err(ValidationError::ConsoleTcpClientUnsupported);
+            }
+            if tcp.address.port() == 0 {
+                return Err(ValidationError::ConsoleTcpPortZero);
+            }
         }
-        if self.socket.is_some() && self.mode != ConsoleOutputMode::Socket {
-            return Err(ValidationError::ConsoleSocketPathUnexpected);
+        Ok(())
+    }
+
+    pub(crate) const UPDATE_OPTIONS: &[&str] = &[
+        "console_file",
+        "console_socket",
+        "console_tcp",
+        "serial_file",
+        "serial_socket",
+        "serial_tcp",
+    ];
+
+    pub(crate) fn parse_update(parser: &OptionParser, component: &str) -> Result<Option<Self>> {
+        let get_if_set = |mode: &str, missing: ValidationError| -> Result<Option<String>> {
+            let option = format!("{component}_{mode}");
+            if !parser.is_set(&option) {
+                return Ok(None);
+            }
+            parser
+                .get(&option)
+                .map(Some)
+                .ok_or(Error::Validation(missing))
+        };
+        let file = get_if_set("file", ValidationError::ConsoleFileMissing)?;
+        let socket = get_if_set("socket", ValidationError::ConsoleSocketPathMissing)?;
+        let tcp = get_if_set("tcp", ValidationError::ConsoleTcpAddressMissing)?;
+
+        let output = match (file, socket, tcp) {
+            (None, None, None) => return Ok(None),
+            (Some(file), None, None) => Self::File {
+                file: PathBuf::from(file),
+            },
+            (None, Some(socket), None) => Self::Socket {
+                socket: PathBuf::from(socket),
+            },
+            (None, None, Some(address)) => Self::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: parse_tcp_address(&address)
+                        .map_err(|source| Error::ResolveConsoleTcpAddress { address, source })?,
+                    server: true,
+                },
+            },
+            _ => {
+                return Err(Error::Validation(
+                    ValidationError::ConsoleOutputUpdateAmbiguous(component.to_owned()),
+                ));
+            }
+        };
+
+        Ok(Some(output))
+    }
+
+    fn update(&mut self, new: &Self) -> ValidationResult<()> {
+        if discriminant(self) != discriminant(new) {
+            return Err(ValidationError::ConsoleOutputUpdateModeMismatch(
+                self.clone(),
+                new.clone(),
+            ));
         }
+        new.validate()?;
+        self.clone_from(new);
         Ok(())
     }
 }
@@ -2573,19 +2649,19 @@ impl ConsoleConfig {
     pub fn parse(console: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
-            .add_all_valueless(CommonConsoleConfig::VALUELESS_OPTIONS)
-            .add_all(CommonConsoleConfig::VALUE_OPTIONS)
+            .add_all_valueless(ConsoleOutput::VALUELESS_OPTIONS)
+            .add_all(ConsoleOutput::VALUE_OPTIONS)
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
         parser.parse(console).map_err(Error::ParseConsole)?;
 
-        let common = CommonConsoleConfig::parse(console, Error::ParseConsole)?;
+        let output = ConsoleOutput::parse(console, Error::ParseConsole)?;
         let pci_common = PciDeviceCommonConfig::parse(console)?;
 
-        Ok(Self { common, pci_common })
+        Ok(Self { output, pci_common })
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
-        self.common.validate()?;
+        self.output.validate()?;
         self.pci_common.validate(vm_config, true)
     }
 }
@@ -2594,21 +2670,24 @@ impl SerialConfig {
     pub fn parse(serial: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
-            .add_all_valueless(CommonConsoleConfig::VALUELESS_OPTIONS)
-            .add_all(CommonConsoleConfig::VALUE_OPTIONS);
+            .add_all_valueless(ConsoleOutput::VALUELESS_OPTIONS)
+            .add_all(ConsoleOutput::VALUE_OPTIONS);
         parser.parse(serial).map_err(Error::ParseSerial)?;
 
-        let common = CommonConsoleConfig::parse(serial, Error::ParseSerial)?;
-        Ok(Self { common })
+        let output = ConsoleOutput::parse(serial, Error::ParseSerial)?;
+        Ok(Self { output })
     }
 
     pub fn validate(&self) -> ValidationResult<()> {
-        self.common.validate()
+        self.output.validate()
     }
 }
 
 #[cfg(target_arch = "x86_64")]
 impl DebugConsoleConfig {
+    pub const SYNTAX: &'static str = "Debug console: \
+        \"off|null|pty|tty|file=<path>,iobase=<port in hex>\"";
+
     pub fn parse(debug_console_ops: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser
@@ -2622,26 +2701,8 @@ impl DebugConsoleConfig {
             .parse(debug_console_ops)
             .map_err(Error::ParseConsole)?;
 
-        let mut file: Option<PathBuf> = None;
+        let output = ConsoleOutput::parse(debug_console_ops, Error::ParseConsole)?;
         let mut iobase: Option<u16> = None;
-        let mut mode: ConsoleOutputMode = ConsoleOutputMode::Off;
-
-        if parser.is_set("off") {
-        } else if parser.is_set("pty") {
-            mode = ConsoleOutputMode::Pty;
-        } else if parser.is_set("tty") {
-            mode = ConsoleOutputMode::Tty;
-        } else if parser.is_set("null") {
-            mode = ConsoleOutputMode::Null;
-        } else if parser.is_set("file") {
-            mode = ConsoleOutputMode::File;
-            file =
-                Some(PathBuf::from(parser.get("file").ok_or(
-                    Error::Validation(ValidationError::ConsoleFileMissing),
-                )?));
-        } else {
-            return Err(Error::ParseConsoleInvalidModeGiven);
-        }
 
         if parser.is_set("iobase")
             && let Some(iobase_opt) = parser.get("iobase")
@@ -2657,19 +2718,23 @@ impl DebugConsoleConfig {
                 })?);
         }
 
-        Ok(Self { file, mode, iobase })
+        Ok(Self { output, iobase })
     }
 }
 
 impl DeviceConfig {
     pub const SYNTAX: &'static str = "Direct device assignment parameters \
-    \"path=<device_path>,fd=<vfio_cdev_fd>,iommu=off|virtio|smmuv3,\
-    id=<device_id>,\
-    pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
-    x_nv_gpudirect_clique=<clique_id>,\
-    x_exclude_mmap_bars=[<bar>...]\"";
+        \"path=<device_path>,fd=<vfio_cdev_fd>,iommu=off|virtio|smmuv3,\
+        id=<device_id>,\
+        pci_segment=<segment_id>,pci_device_id=<pci_slot>,\
+        x_nv_gpudirect_clique=<clique_id>,\
+        x_exclude_mmap_bars=[<bar>...]\"";
 
-    pub fn parse(device: &str) -> Result<Self> {
+    /// # Safety
+    /// Live FDs named in the input must be exclusively owned by the caller.
+    /// Referenced descriptors may be consumed even if parsing fails.
+    pub unsafe fn parse(device: &str) -> Result<Self> {
+        validate_inherited_fds([device])?;
         let mut parser = OptionParser::new();
         parser
             .add("path")
@@ -2681,7 +2746,13 @@ impl DeviceConfig {
 
         let pci_common = PciDeviceCommonConfig::parse(device)?;
         let path = parser.get("path").map(PathBuf::from);
-        let fd = parser.convert::<i32>("fd").map_err(Error::ParseDevice)?;
+        let fd = parser
+            .convert::<RawFd>("fd")
+            .map_err(Error::ParseDevice)?
+            // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
+            .map(|fd| unsafe { take_inherited_fd(fd) })
+            .transpose()?
+            .unwrap_or_default();
         let x_nv_gpudirect_clique = parser
             .convert::<u8>("x_nv_gpudirect_clique")
             .map_err(Error::ParseDevice)?;
@@ -2714,7 +2785,7 @@ impl DeviceConfig {
             return Err(ValidationError::IommuSmmuv3RequiresIommufd);
         }
 
-        match (&self.path, self.fd) {
+        match (&self.path, self.fd.as_ref()) {
             (None, None) => return Err(ValidationError::VfioDeviceNeitherPathNorFd),
             (Some(_), Some(_)) => return Err(ValidationError::VfioDeviceBothPathAndFd),
             (None, Some(_)) => {
@@ -2748,7 +2819,8 @@ impl DeviceConfig {
 }
 
 impl UserDeviceConfig {
-    pub const SYNTAX: &'static str = "Userspace device socket=<socket_path>,id=<device_id>,\
+    pub const SYNTAX: &'static str = "Userspace device \
+        \"socket=<socket_path>,id=<device_id>,\
         pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(user_device: &str) -> Result<Self> {
@@ -2805,13 +2877,19 @@ impl VdpaConfig {
     }
 
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
-        self.pci_common.validate(vm_config, true)
+        self.pci_common.validate(vm_config, true)?;
+
+        if self.num_queues == 0 {
+            return Err(ValidationError::InvalidNumQueues(self.num_queues.into()));
+        }
+
+        Ok(())
     }
 }
 
 impl VsockConfig {
     pub const SYNTAX: &'static str = "Virtio VSOCK parameters \
-        \"cid=<context_id>,socket=<socket_path>,iommu=off|virtio,id=<device_id>,\
+        \"cid=<context_id>,socket=<socket_path>,socket_type=stream|seqpacket,iommu=off|virtio,id=<device_id>,\
         pci_segment=<segment_id>,pci_device_id=<pci_slot>\"";
 
     pub fn parse(vsock: &str) -> Result<Self> {
@@ -2819,6 +2897,7 @@ impl VsockConfig {
         parser
             .add("socket")
             .add("cid")
+            .add("socket_type")
             .add_all(PciDeviceCommonConfig::OPTIONS_IOMMU);
         parser.parse(vsock).map_err(Error::ParseVsock)?;
 
@@ -2836,6 +2915,10 @@ impl VsockConfig {
             pci_common,
             cid,
             socket,
+            socket_type: parser
+                .convert("socket_type")
+                .map_err(Error::ParseVsock)?
+                .unwrap_or_default(),
         })
     }
 
@@ -2846,8 +2929,8 @@ impl VsockConfig {
 
 impl NumaConfig {
     pub const SYNTAX: &'static str = "Settings related to a given NUMA node \
-        \"guest_numa_id=<node_id>,cpus=<cpus_id>,distances=<list_of_distances_to_destination_nodes>,\
-        device_id=<device_id>,\
+        \"guest_numa_id=<node_id>,cpus=<cpus_id>,\
+        distances=<list_of_distances_to_destination_nodes>,device_id=<device_id>,\
         memory_zones=<list_of_memory_zones>,\
         pci_segments=<list_of_pci_segments>\"";
 
@@ -2969,33 +3052,9 @@ pub struct RestoredNetConfig {
     pub id: String,
     #[serde(default)]
     pub num_fds: usize,
-    // Special deserialize handling:
-    // A serialize-deserialize cycle typically happens across processes.
-    // Therefore, we don't serialize FDs, and whatever value is here after
-    // deserialization is invalid.
-    //
-    // Valid FDs are transmitted via a different channel (SCM_RIGHTS message)
-    // and will be populated into this struct on the destination VMM eventually.
-    #[serde(default, deserialize_with = "deserialize_restorednetconfig_fds")]
-    pub fds: Option<Vec<i32>>,
-}
-
-fn deserialize_restorednetconfig_fds<'de, D>(d: D) -> result::Result<Option<Vec<i32>>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fds: Option<Vec<i32>> = Option::deserialize(d)?;
-    if let Some(invalid_fds) = invalid_fds {
-        // If the live-migration path is used properly, new FDs are passed as
-        // SCM_RIGHTS message. So, we don't get them from the serialized JSON
-        // anyway.
-        debug!(
-            "FDs in 'RestoredNetConfig' won't be deserialized as they are most likely invalid now. Deserializing them as -1."
-        );
-        Ok(Some(vec![-1; invalid_fds.len()]))
-    } else {
-        Ok(None)
-    }
+    // Deserialization keeps the FD count for restore.
+    #[serde(default)]
+    pub fds: Option<Vec<ExternalFd>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
@@ -3005,6 +3064,7 @@ pub enum MemoryRestoreMode {
     Copy,
     /// Restore lazily by faulting snapshot pages into guest RAM on demand.
     OnDemand,
+    OnDemandNoBackgroundFetchPages,
     /// Restore by mapping the snapshot memory file copy-on-write, sharing the
     /// page cache across VMs restored from the same snapshot.
     CopyOnWrite,
@@ -3023,6 +3083,7 @@ impl FromStr for MemoryRestoreMode {
         match s.to_lowercase().as_str() {
             "copy" => Ok(Self::Copy),
             "ondemand" => Ok(Self::OnDemand),
+            "ondemand_no_background_fetch_pages" => Ok(Self::OnDemandNoBackgroundFetchPages),
             "copyonwrite" => Ok(Self::CopyOnWrite),
             _ => Err(MemoryRestoreModeParseError::InvalidValue(s.to_owned())),
         }
@@ -3042,21 +3103,9 @@ pub struct VmMemoryZoneUpdateData {
 #[derive(Clone, Debug, PartialEq, Eq, Deserialize, Serialize, Default)]
 pub struct RestoredVfioConfig {
     pub id: String,
-    // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
-    #[serde(default, deserialize_with = "deserialize_restored_fd")]
-    pub fd: Option<i32>,
-}
-
-pub(crate) fn deserialize_restored_fd<'de, D>(d: D) -> result::Result<Option<i32>, D::Error>
-where
-    D: serde::Deserializer<'de>,
-{
-    let invalid_fd: Option<i32> = Option::deserialize(d)?;
-    if invalid_fd.is_some() {
-        Ok(Some(-1))
-    } else {
-        Ok(None)
-    }
+    // Deserialized FDs are discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fd: ExternalFd,
 }
 
 #[serde_with::skip_serializing_none]
@@ -3067,39 +3116,60 @@ pub struct RestoreConfig {
     pub prefault: bool,
     #[serde(default)]
     pub memory_restore_mode: MemoryRestoreMode,
+    /// Deprecated: use `external_fds` with network targets instead.
     #[serde(default)]
     pub net_fds: Option<Vec<RestoredNetConfig>>,
+    /// Deprecated: use `external_fds` with VFIO targets instead.
     #[serde(default)]
     pub vfio_fds: Option<Vec<RestoredVfioConfig>>,
-    // FDs are not serialized and any deserialized value is invalid; see NetConfig::fds.
-    #[serde(default, deserialize_with = "deserialize_restored_fd")]
-    pub iommufd_fd: Option<i32>,
+    /// Deprecated: use `external_fds` with an IOMMU target instead.
+    // Deserialized FDs are discarded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub iommufd_fd: ExternalFd,
     #[serde(default)]
     pub resume: bool,
     #[serde(default)]
     pub zone_updates: Vec<VmMemoryZoneUpdateData>,
+    #[serde(default)]
+    pub serial: Option<ConsoleOutput>,
+    #[serde(default)]
+    pub console: Option<ConsoleOutput>,
+    #[serde(default, flatten)]
+    pub(crate) external_fds: ExternalFds,
 }
 
 impl RestoreConfig {
-    pub const SYNTAX: &'static str = "Restore from a VM snapshot. \
-        \nRestore parameters \"source_url=<source_url>,prefault=on|off,memory_restore_mode=copy|ondemand|copyonwrite,\
-        net_fds=<list_of_net_ids_with_their_associated_fds>,\
-        vfio_fds=<list_of_vfio_ids_with_their_associated_fd>,iommufd_fd=<fd>,resume=true|false,\
-        zone_updates=<list_of_updates>\"
-        \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo) \
-        \n`prefault` controls eager prefaulting for the copy-based restore path (disabled by default) \
-        \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd support is unavailable, and `memory_restore_mode=copyonwrite` maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise) \
-        \n`net_fds` is a list of net ids with new file descriptors. \
-        Only net devices backed by FDs directly are needed as input.\
-        \n`vfio_fds` is a list of VFIO device ids each paired with a new cdev file descriptor, \
-        e.g. vfio_fds=[vfio0@5,vfio1@6]. Use this to restore a VFIO device onto a different \
-        sysfs path or host. Requires `iommufd_fd`.\
-        \n`iommufd_fd` is a new iommufd file descriptor for the restored VM. \
-        The one saved in the snapshot does not survive serialization.\
-        \n `resume` controls whether the VM will be directly resumed after restore \
-        \n `zone_updates` can be used to update NUMA memory zones. Expects a list of elements in the form `id@host_numa_node`";
+    pub const SYNTAX: &'static str = "Restore from a VM snapshot.\
+        \nRestore parameters \"source_url=<source_url>,prefault=on|off,\
+        memory_restore_mode=copy|ondemand|ondemand_no_background_fetch_pages|copyonwrite,\
+        external_fds=[net(<id>)@[<fd>,...],vfio(<id>)@[<fd>],iommu@[<fd>]],resume=true|false,\
+        zone_updates=<list_of_updates>,\
+        serial_file=<path>|serial_socket=<path>|serial_tcp=<ip>:<port>,\
+        console_file=<path>|console_socket=<path>|console_tcp=<ip>:<port>\"\n\
+        \n`source_url` should be a valid URL (e.g file:///foo/bar or tcp://192.168.1.10/foo)\
+        \n`prefault` controls eager prefaulting for the copy-based restore path \
+        (disabled by default)\
+        \n`memory_restore_mode=copy` preserves the existing eager read-copy restore behavior, \
+        `memory_restore_mode=ondemand` enables lazy demand paging and fails restore if userfaultfd \
+        support is unavailable, `memory_restore_mode=ondemand_no_background_fetch_pages` does the \
+        same without prefaulting pages in the background, and `memory_restore_mode=copyonwrite` \
+        maps the snapshot file copy-on-write (plain private RAM only; falls back to copy otherwise)\
+        \n`external_fds` provides replacement file descriptors. `net(<id>)` entries replace \
+        the FDs of network devices, `vfio(<id>)` entries replace VFIO cdev FDs, and `iommu` \
+        provides the iommufd FD. \
+        Do not combine `external_fds` with legacy FD fields.\
+        \n`net_fds=<list_of_net_ids_with_their_associated_fds>`, \
+        `vfio_fds=<list_of_vfio_ids_with_their_associated_fd>` and \
+        `iommufd_fd=<fd>` are deprecated; use `external_fds` instead.\
+        \n`resume` controls whether the VM will be directly resumed after restore\
+        \n`zone_updates` can be used to update NUMA memory zones. \
+        Expects a list of elements in the form `id@host_numa_node`";
 
-    pub fn parse(restore: &str) -> Result<Self> {
+    /// # Safety
+    /// Live FDs named in the input must be exclusively owned by the caller.
+    /// Referenced descriptors may be consumed even if parsing fails.
+    pub unsafe fn parse(restore: &str) -> Result<Self> {
+        validate_inherited_fds([restore])?;
         let mut parser = OptionParser::new();
         parser
             .add("source_url")
@@ -3109,8 +3179,16 @@ impl RestoreConfig {
             .add("vfio_fds")
             .add("iommufd_fd")
             .add("resume")
-            .add("zone_updates");
+            .add("zone_updates")
+            .add_all(ConsoleOutput::UPDATE_OPTIONS)
+            .add("external_fds");
         parser.parse(restore).map_err(Error::ParseRestore)?;
+
+        for field in ["net_fds", "vfio_fds", "iommufd_fd"] {
+            if parser.get(field).is_some() {
+                warn!("The '{field}' option is deprecated; use 'external_fds' instead");
+            }
+        }
 
         let source_url = parser
             .get("source_url")
@@ -3125,32 +3203,50 @@ impl RestoreConfig {
             .convert::<MemoryRestoreMode>("memory_restore_mode")
             .map_err(Error::ParseRestore)?
             .unwrap_or_default();
-        let net_fds = parser
+        let mut net_fds = parser
             .convert::<TupleList<String, Vec<u64>>>("net_fds")
             .map_err(Error::ParseRestore)?
             .map(|v| {
-                v.0.iter()
-                    .map(|Tuple(id, fds)| RestoredNetConfig {
-                        id: id.clone(),
-                        num_fds: fds.len(),
-                        fds: Some(fds.iter().map(|e| *e as i32).collect()),
+                v.0.into_iter()
+                    .map(|Tuple(id, fds)| {
+                        Ok(RestoredNetConfig {
+                            id,
+                            num_fds: fds.len(),
+                            fds: Some(
+                                fds.into_iter()
+                                    .map(|fd| {
+                                        // SAFETY: The caller transfers the inherited descriptors.
+                                        unsafe { take_inherited_fd(fd) }
+                                    })
+                                    .collect::<Result<Vec<_>>>()?,
+                            ),
+                        })
                     })
-                    .collect()
-            });
-        let vfio_fds = parser
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        let mut vfio_fds = parser
             .convert::<TupleList<String, u64>>("vfio_fds")
             .map_err(Error::ParseRestore)?
             .map(|v| {
-                v.0.iter()
-                    .map(|Tuple(id, fd)| RestoredVfioConfig {
-                        id: id.clone(),
-                        fd: Some(*fd as i32),
+                v.0.into_iter()
+                    .map(|Tuple(id, fd)| {
+                        Ok(RestoredVfioConfig {
+                            id,
+                            // SAFETY: The caller transfers the inherited descriptor.
+                            fd: unsafe { take_inherited_fd(fd) }?,
+                        })
                     })
-                    .collect()
-            });
-        let iommufd_fd = parser
-            .convert::<i32>("iommufd_fd")
-            .map_err(Error::ParseRestore)?;
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        let mut iommufd_fd = parser
+            .convert::<RawFd>("iommufd_fd")
+            .map_err(Error::ParseRestore)?
+            // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
+            .map(|fd| unsafe { take_inherited_fd(fd) })
+            .transpose()?
+            .unwrap_or_default();
         let resume = parser
             .convert::<Toggle>("resume")
             .map_err(Error::ParseRestore)?
@@ -3161,13 +3257,31 @@ impl RestoreConfig {
             .convert::<TupleList<String, u32>>("zone_updates")
             .map_err(Error::ParseRestore)?
             .map_or(Vec::new(), |v| {
-                v.0.iter()
-                    .map(|Tuple(id, host_numa_node)| VmMemoryZoneUpdateData {
-                        id: id.clone(),
-                        host_numa_node: *host_numa_node,
-                    })
+                v.0.into_iter()
+                    .map(|Tuple(id, host_numa_node)| VmMemoryZoneUpdateData { id, host_numa_node })
                     .collect()
             });
+        let mut external_fds: ExternalFds = parser
+            .convert::<TupleList<Target, Vec<u64>>>("external_fds")
+            .map_err(Error::ParseRestore)?
+            .map(|v| {
+                // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
+                unsafe { ExternalFds::from_cli(v) }
+            })
+            .transpose()?
+            .unwrap_or_default();
+        // TODO(fd): Remove after the deprecation period for the legacy FD fields.
+        if !external_fds.is_empty()
+            && (net_fds.is_some() || vfio_fds.is_some() || iommufd_fd.is_some())
+        {
+            return Err(Error::MixedFdFormats);
+        }
+        external_fds.import_restored_iommufd_fd(&mut iommufd_fd, false);
+        external_fds.import_restored_vfio_configs(&mut vfio_fds);
+        external_fds.import_restored_net_configs(&mut net_fds);
+
+        let serial = ConsoleOutput::parse_update(&parser, "serial")?;
+        let console = ConsoleOutput::parse_update(&parser, "console")?;
 
         Ok(RestoreConfig {
             source_url,
@@ -3178,55 +3292,25 @@ impl RestoreConfig {
             iommufd_fd,
             resume,
             zone_updates,
+            serial,
+            console,
+            external_fds,
         })
     }
 
-    // Ensure all net devices from 'VmConfig' backed by FDs have a
-    // corresponding 'RestoreNetConfig' with a matched 'id' and expected
-    // number of FDs.
     pub fn validate(&self, vm_config: &VmConfig) -> ValidationResult<()> {
         if self.memory_restore_mode != MemoryRestoreMode::Copy && self.prefault {
             return Err(ValidationError::InvalidRestorePrefaultWithOnDemand);
         }
 
-        if self.memory_restore_mode == MemoryRestoreMode::OnDemand {
+        if matches!(
+            self.memory_restore_mode,
+            MemoryRestoreMode::OnDemand | MemoryRestoreMode::OnDemandNoBackgroundFetchPages
+        ) {
             vm_config.check_postcopy_incompatible_device()?;
         }
 
-        let mut restored_net_with_fds = HashMap::new();
-        for n in self.net_fds.iter().flatten() {
-            assert_eq!(
-                n.num_fds,
-                n.fds.as_ref().map_or(0, |f| f.len()),
-                "Invalid 'RestoredNetConfig' with conflicted fields."
-            );
-            if restored_net_with_fds.insert(n.id.clone(), n).is_some() {
-                return Err(ValidationError::IdentifierNotUnique(n.id.clone()));
-            }
-        }
-
-        for net_fds in vm_config.net.iter().flatten() {
-            if let Some(expected_fds) = &net_fds.fds {
-                let expected_id = net_fds
-                    .pci_common
-                    .id
-                    .as_ref()
-                    .expect("Invalid 'NetConfig' with empty 'id' for VM restore.");
-                if let Some(r) = restored_net_with_fds.remove(expected_id) {
-                    if r.num_fds != expected_fds.len() {
-                        return Err(ValidationError::RestoreNetFdCountMismatch(
-                            expected_id.clone(),
-                            r.num_fds,
-                            expected_fds.len(),
-                        ));
-                    }
-                } else {
-                    return Err(ValidationError::RestoreMissingRequiredNetId(
-                        expected_id.clone(),
-                    ));
-                }
-            }
-        }
+        vm_config.validate_fds(&self.external_fds)?;
 
         let unique_zones = self
             .zone_updates
@@ -3238,58 +3322,6 @@ impl RestoreConfig {
         }
         if unique_zones.contains("") {
             return Err(ValidationError::MemoryZoneUpdatesEmptyId);
-        }
-
-        if !restored_net_with_fds.is_empty() {
-            warn!("Ignoring unused 'net_fds' for VM restore.");
-        }
-
-        let vfio_fds = self.vfio_fds.as_deref().unwrap_or_default();
-        if !vfio_fds.is_empty() {
-            // Substituted devices become FD backed, which requires an
-            // externally supplied iommufd FD and the iommufd backend.
-            if self.iommufd_fd.is_none() {
-                return Err(ValidationError::VfioFdRequiresIommufdFd);
-            }
-            if !vm_config.platform.as_ref().is_some_and(|p| p.iommufd) {
-                return Err(ValidationError::IommufdFdRequiresIommufd);
-            }
-
-            let mut seen = HashSet::new();
-            for v in vfio_fds {
-                if !seen.insert(v.id.as_str()) {
-                    return Err(ValidationError::IdentifierNotUnique(v.id.clone()));
-                }
-            }
-
-            let known_ids: HashSet<&str> = vm_config
-                .devices
-                .iter()
-                .flatten()
-                .filter_map(|d| d.pci_common.id.as_deref())
-                .collect();
-            for v in vfio_fds {
-                if !known_ids.contains(v.id.as_str()) {
-                    return Err(ValidationError::RestoreUnknownVfioId(v.id.clone()));
-                }
-            }
-        }
-
-        // A device saved with an FD cannot reuse it, the snapshot carries no
-        // live descriptor. Each one needs a replacement in vfio_fds.
-        let substituted: HashSet<&str> = vfio_fds.iter().map(|v| v.id.as_str()).collect();
-        for d in vm_config.devices.iter().flatten() {
-            if d.fd.is_some()
-                && !d
-                    .pci_common
-                    .id
-                    .as_deref()
-                    .is_some_and(|id| substituted.contains(id))
-            {
-                return Err(ValidationError::RestoreMissingVfioFd(
-                    d.pci_common.id.clone().unwrap_or_default(),
-                ));
-            }
         }
 
         Ok(())
@@ -3355,10 +3387,10 @@ impl LandlockConfig {
 #[cfg(feature = "ivshmem")]
 impl IvshmemConfig {
     pub const SYNTAX: &'static str = "Ivshmem device. Specify the backend file path and size \
-    for the shared memory: \"path=</path/to/a/file>,size=<file_size>,id=<device_id>,\
-    pci_segment=<segment_id>,pci_device_id=<pci_slot>\" \
-    \nThe <file_size> must be a power of 2 (e.g., 2M, 4M, etc.), as it represents the size \
-    of the memory region mapped to the guest. Default size is 128M.";
+        for the shared memory: \"path=</path/to/a/file>,size=<file_size>,id=<device_id>,\
+        pci_segment=<segment_id>,pci_device_id=<pci_slot>\"\
+        \nThe <file_size> must be a power of 2 (e.g., 2M, 4M, etc.), as it represents the size \
+        of the memory region mapped to the guest. Default size is 128M.";
     pub fn parse(ivshmem: &str) -> Result<Self> {
         let mut parser = OptionParser::new();
         parser.add("path").add("size");
@@ -3403,6 +3435,20 @@ impl IvshmemConfig {
 }
 
 impl VmConfig {
+    pub(crate) fn update_console_outputs(
+        &mut self,
+        serial: Option<&ConsoleOutput>,
+        console: Option<&ConsoleOutput>,
+    ) -> ValidationResult<()> {
+        if let Some(serial) = serial {
+            self.serial.output.update(serial)?;
+        }
+        if let Some(console) = console {
+            self.console.output.update(console)?;
+        }
+        Ok(())
+    }
+
     fn validate_identifier(
         id_list: &mut BTreeSet<String>,
         id: &Option<String>,
@@ -3451,18 +3497,6 @@ impl VmConfig {
         if self.user_devices.as_ref().is_some_and(|d| !d.is_empty()) {
             return Err(ValidationError::PostcopyIncompatibleDevice(
                 "vfio-user".to_owned(),
-            ));
-        }
-        if self.disks.iter().flatten().any(|disk| disk.vhost_user)
-            || self.net.iter().flatten().any(|net| net.vhost_user)
-            || self.fs.as_ref().is_some_and(|fs| !fs.is_empty())
-            || self
-                .generic_vhost_user
-                .as_ref()
-                .is_some_and(|d| !d.is_empty())
-        {
-            return Err(ValidationError::PostcopyIncompatibleDevice(
-                "vhost-user".to_owned(),
             ));
         }
         Ok(())
@@ -3596,27 +3630,22 @@ impl VmConfig {
         // "console=hvc0 earlyprintk=ttyS0"
 
         let mut tty_consoles = Vec::new();
-        if self.console.common.mode == ConsoleOutputMode::Tty {
+        if self.console.output == ConsoleOutput::Tty {
             tty_consoles.push("virtio-console");
         }
-        if self.serial.common.mode == ConsoleOutputMode::Tty {
+        if self.serial.output == ConsoleOutput::Tty {
             tty_consoles.push("serial-console");
         }
         #[cfg(target_arch = "x86_64")]
-        if self.debug_console.mode == ConsoleOutputMode::Tty {
+        if self.debug_console.output == ConsoleOutput::Tty {
             tty_consoles.push("debug-console");
         }
         if tty_consoles.len() > 1 {
             warn!("Using TTY output for multiple consoles: {tty_consoles:?}");
         }
 
-        if self.console.common.mode == ConsoleOutputMode::File && self.console.common.file.is_none()
-        {
-            return Err(ValidationError::ConsoleFileMissing);
-        }
-
-        if self.serial.common.mode == ConsoleOutputMode::File && self.serial.common.file.is_none() {
-            return Err(ValidationError::ConsoleFileMissing);
+        if self.cpus.boot_vcpus == 0 {
+            return Err(ValidationError::CpusBootZero);
         }
 
         if self.cpus.max_vcpus < self.cpus.boot_vcpus {
@@ -3624,6 +3653,15 @@ impl VmConfig {
                 self.cpus.max_vcpus,
                 self.cpus.boot_vcpus,
             ));
+        }
+
+        #[cfg(target_arch = "x86_64")]
+        if self.cpus.kvm_hint_realtime && self.cpus.kvm_hyperv {
+            return Err(ValidationError::KvmHintRealtimeWithKvmHyperv);
+        }
+
+        if !(MIN_PHYS_BITS..=MAX_PHYS_BITS).contains(&self.cpus.max_phys_bits) {
+            return Err(ValidationError::InvalidMaxPhysBits(self.cpus.max_phys_bits));
         }
 
         if self.cpus.max_vcpus > MAX_SUPPORTED_CPUS {
@@ -3650,6 +3688,10 @@ impl VmConfig {
                     ));
                 }
             }
+        }
+
+        if self.memory.size == 0 && self.memory.zones.is_none() {
+            return Err(ValidationError::MemoryZonesMissing);
         }
 
         if let Some(rate_limit_groups) = &self.rate_limit_groups {
@@ -3777,11 +3819,22 @@ impl VmConfig {
                 return Err(ValidationError::CpuTopologyDiesPerPackage);
             }
 
-            let total: u32 = (t.threads_per_core as u32)
-                * (t.cores_per_die as u32)
-                * (t.dies_per_package as u32)
-                * (t.packages as u32);
-            if total != self.cpus.max_vcpus {
+            for count in [
+                t.threads_per_core,
+                t.cores_per_die,
+                t.dies_per_package,
+                t.packages,
+            ] {
+                if u32::from(count) > MAX_SUPPORTED_CPUS {
+                    return Err(ValidationError::TooManyCpus(u32::from(count)));
+                }
+            }
+
+            let total = u64::from(t.threads_per_core)
+                * u64::from(t.cores_per_die)
+                * u64::from(t.dies_per_package)
+                * u64::from(t.packages);
+            if total != u64::from(self.cpus.max_vcpus) {
                 return Err(ValidationError::CpuTopologyCount);
             }
         }
@@ -3887,12 +3940,12 @@ impl VmConfig {
             let mut used_pci_segments = HashMap::new();
             for numa_node in numa.iter() {
                 numa_node.validate()?;
-                if let Some(memory_zones) = numa_node.memory_zones.clone() {
+                if let Some(memory_zones) = &numa_node.memory_zones {
                     for memory_zone in memory_zones.iter() {
-                        if used_numa_node_memory_zones.contains_key(memory_zone) {
+                        if let Some(previous_node) = used_numa_node_memory_zones.get(memory_zone) {
                             return Err(ValidationError::MemoryZoneReused(
                                 memory_zone.to_string(),
-                                *used_numa_node_memory_zones.get(memory_zone).unwrap(),
+                                *previous_node,
                                 numa_node.guest_numa_id,
                             ));
                         }
@@ -3901,7 +3954,7 @@ impl VmConfig {
                     }
                 }
 
-                if let Some(pci_segments) = numa_node.pci_segments.clone() {
+                if let Some(pci_segments) = &numa_node.pci_segments {
                     for pci_segment in pci_segments.iter() {
                         if *pci_segment >= num_pci_segments {
                             return Err(ValidationError::InvalidPciSegment(*pci_segment));
@@ -3911,10 +3964,10 @@ impl VmConfig {
                                 numa_node.guest_numa_id,
                             ));
                         }
-                        if used_pci_segments.contains_key(pci_segment) {
+                        if let Some(previous_node) = used_pci_segments.get(pci_segment) {
                             return Err(ValidationError::PciSegmentReused(
                                 *pci_segment,
-                                *used_pci_segments.get(pci_segment).unwrap(),
+                                *previous_node,
                                 numa_node.guest_numa_id,
                             ));
                         }
@@ -3959,7 +4012,20 @@ impl VmConfig {
         Ok(id_list)
     }
 
-    pub fn parse(vm_params: VmParams) -> Result<Self> {
+    /// # Safety
+    /// Live FDs named in the input must be exclusively owned by the caller.
+    /// Referenced descriptors may be consumed even if parsing fails.
+    pub unsafe fn parse(vm_params: VmParams) -> Result<Self> {
+        validate_inherited_fds(
+            vm_params
+                .net
+                .iter()
+                .flatten()
+                .copied()
+                .chain(vm_params.devices.iter().flatten().copied())
+                .chain(vm_params.platform),
+        )?;
+
         let mut rate_limit_groups: Option<Box<[RateLimiterGroupConfig]>> = None;
         if let Some(rate_limit_group_list) = &vm_params.rate_limit_groups {
             let mut rate_limit_group_config_list = Vec::new();
@@ -3992,7 +4058,8 @@ impl VmConfig {
         if let Some(net_list) = &vm_params.net {
             let mut net_config_list = Vec::new();
             for item in net_list.iter() {
-                let net_config = NetConfig::parse(item)?;
+                // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
+                let net_config = unsafe { NetConfig::parse(item) }?;
                 net_config_list.push(net_config);
             }
             net = Some(net_config_list);
@@ -4052,7 +4119,8 @@ impl VmConfig {
         if let Some(device_list) = &vm_params.devices {
             let mut device_config_list = Vec::new();
             for item in device_list.iter() {
-                let device_config = DeviceConfig::parse(item)?;
+                // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
+                let device_config = unsafe { DeviceConfig::parse(item) }?;
                 device_config_list.push(device_config);
             }
             devices = Some(device_config_list);
@@ -4094,7 +4162,11 @@ impl VmConfig {
             pci_segments = Some(pci_segment_config_list.into_boxed_slice());
         }
 
-        let platform = vm_params.platform.map(PlatformConfig::parse).transpose()?;
+        let platform = vm_params
+            .platform
+            // SAFETY: The caller transfers ownership of the inherited CLI descriptors.
+            .map(|platform| unsafe { PlatformConfig::parse(platform) })
+            .transpose()?;
 
         let mut numa: Option<Box<[NumaConfig]>> = None;
         if let Some(numa_list) = &vm_params.numa {
@@ -4192,7 +4264,6 @@ impl VmConfig {
             pci_segments,
             platform,
             tpm,
-            preserved_fds: None,
             landlock_enable: vm_params.landlock_enable,
             landlock_rules,
             #[cfg(feature = "ivshmem")]
@@ -4208,82 +4279,66 @@ impl VmConfig {
         // Remove if VFIO device
         if let Some(devices) = self.devices.as_mut() {
             let len = devices.len();
-            devices.retain(|dev| dev.pci_common.id.as_ref().map(|id| id.as_ref()) != Some(id));
+            devices.retain(|dev| dev.pci_common.id.as_deref() != Some(id));
             removed |= devices.len() != len;
         }
 
         // Remove if VFIO user device
         if let Some(user_devices) = self.user_devices.as_mut() {
             let len = user_devices.len();
-            user_devices.retain(|dev| dev.pci_common.id.as_ref().map(|id| id.as_ref()) != Some(id));
+            user_devices.retain(|dev| dev.pci_common.id.as_deref() != Some(id));
             removed |= user_devices.len() != len;
         }
 
         // Remove if disk device
         if let Some(disks) = self.disks.as_mut() {
             let len = disks.len();
-            disks.retain(|dev| dev.pci_common.id.as_ref().map(|id| id.as_ref()) != Some(id));
+            disks.retain(|dev| dev.pci_common.id.as_deref() != Some(id));
             removed |= disks.len() != len;
         }
 
         // Remove if fs device
         if let Some(fs) = self.fs.as_mut() {
             let len = fs.len();
-            fs.retain(|dev| dev.pci_common.id.as_ref().map(|id| id.as_ref()) != Some(id));
+            fs.retain(|dev| dev.pci_common.id.as_deref() != Some(id));
             removed |= fs.len() != len;
         }
 
         // Remove if generic vhost-user device
         if let Some(generic_vhost_user) = self.generic_vhost_user.as_mut() {
             let len = generic_vhost_user.len();
-            generic_vhost_user
-                .retain(|dev| dev.pci_common.id.as_ref().map(|id| id.as_ref()) != Some(id));
+            generic_vhost_user.retain(|dev| dev.pci_common.id.as_deref() != Some(id));
             removed |= generic_vhost_user.len() != len;
         }
 
         // Remove if net device
         if let Some(net) = self.net.as_mut() {
             let len = net.len();
-            net.retain(|dev| dev.pci_common.id.as_ref().map(|id| id.as_ref()) != Some(id));
+            net.retain(|dev| dev.pci_common.id.as_deref() != Some(id));
             removed |= net.len() != len;
         }
 
         // Remove if pmem device
         if let Some(pmem) = self.pmem.as_mut() {
             let len = pmem.len();
-            pmem.retain(|dev| dev.pci_common.id.as_ref().map(|id| id.as_ref()) != Some(id));
+            pmem.retain(|dev| dev.pci_common.id.as_deref() != Some(id));
             removed |= pmem.len() != len;
         }
 
         // Remove if vDPA device
         if let Some(vdpa) = self.vdpa.as_mut() {
             let len = vdpa.len();
-            vdpa.retain(|dev| dev.pci_common.id.as_ref().map(|id| id.as_ref()) != Some(id));
+            vdpa.retain(|dev| dev.pci_common.id.as_deref() != Some(id));
             removed |= vdpa.len() != len;
         }
 
         // Remove if vsock device
-        if let Some(vsock) = self.vsock.as_ref()
-            && vsock.pci_common.id.as_ref().map(|id| id.as_ref()) == Some(id)
-        {
-            self.vsock = None;
-            removed = true;
-        }
+        removed |= self
+            .vsock
+            .take_if(|vsock| vsock.pci_common.id.as_deref() == Some(id))
+            .is_some();
 
         removed
-    }
-
-    /// # Safety
-    /// To use this safely, the caller must guarantee that the input
-    /// fds are all valid.
-    pub unsafe fn add_preserved_fds(&mut self, fds: Vec<i32>) {
-        if fds.is_empty() {
-            return;
-        }
-
-        self.preserved_fds
-            .get_or_insert_with(HashSet::new)
-            .extend(fds);
     }
 
     #[cfg(feature = "sev_snp")]
@@ -4292,61 +4347,88 @@ impl VmConfig {
     }
 }
 
-impl Clone for VmConfig {
-    fn clone(&self) -> Self {
-        VmConfig {
-            cpus: self.cpus.clone(),
-            memory: self.memory.clone(),
-            payload: self.payload.clone(),
-            rate_limit_groups: self.rate_limit_groups.clone(),
-            disks: self.disks.clone(),
-            net: self.net.clone(),
-            rng: self.rng.clone(),
-            rtc: self.rtc.clone(),
-            balloon: self.balloon.clone(),
-            #[cfg(feature = "pvmemcontrol")]
-            pvmemcontrol: self.pvmemcontrol.clone(),
-            fs: self.fs.clone(),
-            generic_vhost_user: self.generic_vhost_user.clone(),
-            pmem: self.pmem.clone(),
-            serial: self.serial.clone(),
-            console: self.console.clone(),
-            #[cfg(target_arch = "x86_64")]
-            debug_console: self.debug_console.clone(),
-            devices: self.devices.clone(),
-            user_devices: self.user_devices.clone(),
-            vdpa: self.vdpa.clone(),
-            vsock: self.vsock.clone(),
-            numa: self.numa.clone(),
-            pci_segments: self.pci_segments.clone(),
-            platform: self.platform.clone(),
-            tpm: self.tpm.clone(),
-            preserved_fds: self
-                .preserved_fds
-                .as_ref()
-                // SAFETY: FFI call with valid FDs
-                .map(|fds| fds.iter().map(|fd| unsafe { libc::dup(*fd) }).collect()),
-            landlock_rules: self.landlock_rules.clone(),
-            #[cfg(feature = "ivshmem")]
-            ivshmem: self.ivshmem.clone(),
-            ..*self
-        }
+/// # Safety
+/// A live fd must be exclusively owned by the caller, which transfers it here.
+pub(crate) unsafe fn take_inherited_fd(fd: impl TryInto<RawFd>) -> Result<ExternalFd> {
+    let fd = fd
+        .try_into()
+        .map_err(|_| Error::InheritedFd(io::Error::from_raw_os_error(libc::EBADF)))?;
+    // SAFETY: F_GETFD takes no pointer arguments and rejects invalid FDs.
+    if fd < 3 || unsafe { libc::fcntl(fd, libc::F_GETFD) } < 0 {
+        return Err(Error::InheritedFd(io::Error::from_raw_os_error(
+            libc::EBADF,
+        )));
     }
+    // SAFETY: The caller transfers exclusive ownership of the validated FD.
+    Ok(unsafe { OwnedFd::from_raw_fd(fd) }.into())
 }
 
-impl Drop for VmConfig {
-    fn drop(&mut self) {
-        if let Some(mut fds) = self.preserved_fds.take() {
-            for fd in fds.drain() {
-                // SAFETY: FFI call with valid FDs
-                unsafe { libc::close(fd) };
+// Check all references before taking ownership so repeated CLI FDs cannot
+// create two owners for the same FD.
+pub(crate) fn validate_inherited_fds<'a>(configs: impl IntoIterator<Item = &'a str>) -> Result<()> {
+    let mut seen = HashSet::new();
+    for config in configs {
+        let mut parser = OptionParser::new();
+        parser
+            .add("fd")
+            .add("iommufd_fd")
+            .add("net_fds")
+            .add("vfio_fds")
+            .add("external_fds");
+        // The regular config parser reports malformed values.
+        if parser.parse_subset(config).is_err() {
+            continue;
+        }
+        let mut fds = parser
+            .convert::<IntegerList>("fd")
+            .ok()
+            .flatten()
+            .map_or_else(
+                || {
+                    parser
+                        .convert::<u64>("fd")
+                        .ok()
+                        .flatten()
+                        .into_iter()
+                        .collect()
+                },
+                |fds| fds.0,
+            );
+        fds.extend(parser.convert::<u64>("iommufd_fd").ok().flatten());
+        if let Some(pairs) = parser
+            .convert::<TupleList<String, Vec<u64>>>("net_fds")
+            .ok()
+            .flatten()
+        {
+            fds.extend(pairs.0.into_iter().flat_map(|Tuple(_, fds)| fds));
+        }
+        if let Some(pairs) = parser
+            .convert::<TupleList<String, u64>>("vfio_fds")
+            .ok()
+            .flatten()
+        {
+            fds.extend(pairs.0.into_iter().map(|Tuple(_, fd)| fd));
+        }
+        if let Some(pairs) = parser
+            .convert::<TupleList<Target, Vec<u64>>>("external_fds")
+            .ok()
+            .flatten()
+        {
+            fds.extend(pairs.0.into_iter().flat_map(|Tuple(_, fds)| fds));
+        }
+        for fd in fds {
+            if let Ok(fd) = RawFd::try_from(fd)
+                && !seen.insert(fd)
+            {
+                return Err(Error::DuplicateInheritedFd(fd));
             }
         }
     }
+    Ok(())
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::fs::File;
     use std::os::unix::io::AsRawFd;
     #[cfg(target_arch = "x86_64")]
@@ -4355,6 +4437,93 @@ mod tests {
     use net_util::MacAddr;
 
     use super::*;
+    use crate::external_fds::tests::{net_target, vfio_target};
+    use crate::tests::test_fd;
+
+    #[test]
+    fn test_vfio_binding_state_is_runtime_only() {
+        let fd: ExternalFd = test_fd().into();
+
+        let mut config: VmConfig = serde_json::from_str("{}").unwrap();
+        let mut device = device_fixture();
+        device.fd = fd.clone();
+        assert!(device.iommufd_dev_id.is_none());
+        device.iommufd_dev_id = Some(7);
+        config.devices = Some(vec![device]);
+        assert_eq!(
+            config.clone().devices.as_ref().unwrap()[0].iommufd_dev_id,
+            Some(7)
+        );
+
+        let json = serde_json::to_string(&config).unwrap();
+        assert!(!json.contains("iommufd_dev_id"));
+        let restored: VmConfig = serde_json::from_str(&json).unwrap();
+        assert!(
+            restored.devices.as_ref().unwrap()[0]
+                .iommufd_dev_id
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn test_take_inherited_fd() {
+        use std::os::fd::IntoRawFd;
+
+        // SAFETY: These values cannot name live descriptors.
+        unsafe {
+            take_inherited_fd(-1).unwrap_err();
+            take_inherited_fd(u64::MAX).unwrap_err();
+        }
+        let fd = test_fd().into_raw_fd();
+        assert_eq!(
+            // SAFETY: into_raw_fd transferred exclusive ownership of the descriptor.
+            unsafe { take_inherited_fd(fd) }
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .as_raw_fd(),
+            fd
+        );
+        for input in [
+            vec!["fd=[3,3]"],
+            vec!["fd=3", "iommufd_fd=3"],
+            vec!["net_fds=[net0@[3,4]],vfio_fds=[vfio0@4]"],
+            vec!["fd= [3,3]"],
+        ] {
+            assert!(matches!(
+                validate_inherited_fds(input),
+                Err(Error::DuplicateInheritedFd(_))
+            ));
+        }
+        validate_inherited_fds(["fd=[3,4]", "fd=5", "iommufd_fd=6"]).unwrap();
+    }
+
+    #[test]
+    fn test_validate_inherited_external_fds() {
+        for input in [
+            vec!["external_fds=[net(net0)@[3,3]]"],
+            vec!["external_fds=[net(net0)@[3,4],vfio(vfio0)@[3]]"],
+            vec!["external_fds=[vfio(vfio0)@[3],iommu@[3]]"],
+            vec!["net_fds=[net0@[3,4]],external_fds=[net(net1)@[3]]"],
+            vec!["vfio_fds=[vfio0@3],external_fds=[vfio(vfio1)@[3]]"],
+            vec!["iommufd_fd=3,external_fds=[iommu@[3]]"],
+            vec!["fd=3", "external_fds=[net(net0)@[3]]"],
+            vec![
+                "external_fds=[net(net0)@[3]]",
+                "external_fds=[net(net1)@[3]]",
+            ],
+        ] {
+            assert!(matches!(
+                validate_inherited_fds(input),
+                Err(Error::DuplicateInheritedFd(3))
+            ));
+        }
+        validate_inherited_fds([
+            "fd=3",
+            "net_fds=[net0@[4,5]],vfio_fds=[vfio0@6],iommufd_fd=7,external_fds=[net(net1)@[8,9],vfio(vfio1)@[10],iommu@[11]]",
+        ])
+        .unwrap();
+    }
 
     #[cfg(target_arch = "aarch64")]
     #[test]
@@ -4516,6 +4685,20 @@ mod tests {
                 ..Default::default()
             }
         );
+        #[cfg(target_arch = "x86_64")]
+        {
+            assert_eq!(
+                CpusConfig::parse("boot=1,kvm_hint_realtime=on")?,
+                CpusConfig {
+                    boot_vcpus: 1,
+                    max_vcpus: 1,
+                    kvm_hint_realtime: true,
+                    ..Default::default()
+                }
+            );
+            assert!(!CpusConfig::parse("boot=1")?.kvm_hint_realtime);
+            CpusConfig::parse("boot=1,kvm_hint_realtime=maybe").unwrap_err();
+        }
         assert_eq!(
             CpusConfig::parse("boot=2,affinity=[0@[0,2],1@[1,3]]")?,
             CpusConfig {
@@ -4700,6 +4883,7 @@ mod tests {
     #[test]
     fn test_mem_parsing() -> Result<()> {
         assert_eq!(MemoryConfig::parse("", None)?, MemoryConfig::default());
+        MemoryConfig::parse("size=512M,file=/some/file", None).unwrap_err();
         // Default string
         assert_eq!(
             MemoryConfig::parse("size=512M", None)?,
@@ -4782,6 +4966,9 @@ mod tests {
                         size: 1000,
                         one_time_burst: Some(0),
                         refill_time: 100,
+                        burst_rate: None,
+                        burst_seconds: None,
+                        burst_recharge_seconds: None,
                     }),
                     ops: None,
                 }
@@ -4797,11 +4984,578 @@ mod tests {
                         size: 1000,
                         one_time_burst: Some(0),
                         refill_time: 100,
+                        burst_rate: None,
+                        burst_seconds: None,
+                        burst_recharge_seconds: None,
                     }),
                 }
             }
         );
         Ok(())
+    }
+
+    fn parse_rate_limiter_configs(options: &str) -> [RateLimiterConfig; 3] {
+        [
+            DiskConfig::parse(options)
+                .unwrap()
+                .rate_limiter_config
+                .unwrap(),
+            // SAFETY: These test inputs contain no inherited descriptors.
+            unsafe { NetConfig::parse(options) }
+                .unwrap()
+                .rate_limiter_config
+                .unwrap(),
+            RateLimiterGroupConfig::parse(options)
+                .unwrap()
+                .rate_limiter_config,
+        ]
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_parsing() {
+        let options = "bw_size=1000,bw_refill_time=1000,bw_burst_rate=2000,bw_burst_seconds=3,\
+            ops_size=100,ops_refill_time=1000,ops_burst_rate=400,ops_burst_seconds=2";
+        let expected = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 1000,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(2000),
+                burst_seconds: Some(3),
+                burst_recharge_seconds: None,
+            }),
+            ops: Some(TokenBucketConfig {
+                size: 100,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(400),
+                burst_seconds: Some(2),
+                burst_recharge_seconds: None,
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+        }
+
+        let options = "bw_size=1000,bw_refill_time=1000,bw_burst_rate=2000,\
+            ops_size=100,ops_refill_time=1000,ops_burst_rate=400";
+        let expected = RateLimiterConfig {
+            bandwidth: expected.bandwidth.map(|b| TokenBucketConfig {
+                burst_seconds: None,
+                ..b
+            }),
+            ops: expected.ops.map(|b| TokenBucketConfig {
+                burst_seconds: None,
+                ..b
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_recharge_parsing() {
+        let options = "bw_size=1000,bw_refill_time=1000,bw_burst_rate=2000,bw_burst_seconds=3,\
+            bw_burst_recharge_seconds=4,ops_size=100,ops_refill_time=1000,ops_burst_rate=400,\
+            ops_burst_seconds=2,ops_burst_recharge_seconds=5";
+        let expected = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 1000,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(2000),
+                burst_seconds: Some(3),
+                burst_recharge_seconds: Some(4),
+            }),
+            ops: Some(TokenBucketConfig {
+                size: 100,
+                one_time_burst: Some(0),
+                refill_time: 1000,
+                burst_rate: Some(400),
+                burst_seconds: Some(2),
+                burst_recharge_seconds: Some(5),
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+            for result in rate_limiter_validation_results(config) {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_plain_parsing() {
+        let options = "bw_size=1000,bw_refill_time=100,bw_one_time_burst=2000,\
+            ops_size=100,ops_refill_time=100,ops_one_time_burst=200";
+        let expected = RateLimiterConfig {
+            bandwidth: Some(TokenBucketConfig {
+                size: 1000,
+                one_time_burst: Some(2000),
+                refill_time: 100,
+                burst_rate: None,
+                burst_seconds: None,
+                burst_recharge_seconds: None,
+            }),
+            ops: Some(TokenBucketConfig {
+                size: 100,
+                one_time_burst: Some(200),
+                refill_time: 100,
+                burst_rate: None,
+                burst_seconds: None,
+                burst_recharge_seconds: None,
+            }),
+        };
+        for config in parse_rate_limiter_configs(options) {
+            assert_eq!(config, expected);
+        }
+
+        for config in parse_rate_limiter_configs(
+            "bw_size=1000,bw_refill_time=100,ops_size=100,ops_refill_time=100",
+        ) {
+            assert_eq!(
+                config,
+                RateLimiterConfig {
+                    bandwidth: expected.bandwidth.map(|b| TokenBucketConfig {
+                        one_time_burst: Some(0),
+                        ..b
+                    }),
+                    ops: expected.ops.map(|b| TokenBucketConfig {
+                        one_time_burst: Some(0),
+                        ..b
+                    }),
+                }
+            );
+        }
+
+        for options in ["", "bw_size=1000", "ops_refill_time=100"] {
+            assert_eq!(
+                DiskConfig::parse(options).unwrap().rate_limiter_config,
+                None
+            );
+            assert_eq!(
+                // SAFETY: These test inputs contain no inherited descriptors.
+                unsafe { NetConfig::parse(options) }
+                    .unwrap()
+                    .rate_limiter_config,
+                None
+            );
+            assert_eq!(
+                RateLimiterGroupConfig::parse(options)
+                    .unwrap()
+                    .rate_limiter_config,
+                RateLimiterConfig::default()
+            );
+        }
+    }
+
+    fn rate_limiter_validation_results(cfg: RateLimiterConfig) -> [ValidationResult<()>; 3] {
+        let vm_config: VmConfig = serde_json::from_str("{}").unwrap();
+        let mut disk = raw_disk_fixture();
+        disk.rate_limiter_config = Some(cfg);
+        let mut net = net_fixture();
+        net.rate_limiter_config = Some(cfg);
+        let group = RateLimiterGroupConfig {
+            id: "group0".to_string(),
+            rate_limiter_config: cfg,
+        };
+        [
+            disk.validate(&vm_config),
+            net.validate(&vm_config),
+            group.validate(&vm_config),
+        ]
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_disabled_parsing() {
+        for (options, expected) in [
+            (
+                "bw_burst_rate=2000",
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 0, 0),
+            ),
+            (
+                "ops_burst_rate=2000",
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 0, 0),
+            ),
+            (
+                "bw_burst_seconds=2",
+                ValidationError::RateLimiterBurstSecondsWithoutRate(2),
+            ),
+            (
+                "ops_burst_seconds=2",
+                ValidationError::RateLimiterBurstSecondsWithoutRate(2),
+            ),
+            (
+                "bw_burst_recharge_seconds=4",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(4),
+            ),
+            (
+                "ops_burst_recharge_seconds=4",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(4),
+            ),
+            (
+                "bw_burst_recharge_seconds=0",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(0),
+            ),
+            (
+                "ops_burst_recharge_seconds=0",
+                ValidationError::RateLimiterBurstRechargeWithoutRate(0),
+            ),
+        ] {
+            for cfg in parse_rate_limiter_configs(options) {
+                for result in rate_limiter_validation_results(cfg) {
+                    assert_eq!(result.unwrap_err(), expected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_validation() {
+        let bucket = TokenBucketConfig {
+            size: 1000,
+            one_time_burst: Some(0),
+            refill_time: 1000,
+            burst_rate: Some(2000),
+            burst_seconds: Some(2),
+            burst_recharge_seconds: None,
+        };
+        let invalid = [
+            (
+                TokenBucketConfig {
+                    burst_rate: None,
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstSecondsWithoutRate(2),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_rate: Some(0),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstZero(0, 2),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_seconds: Some(0),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstZero(2000, 0),
+            ),
+            (
+                TokenBucketConfig {
+                    one_time_burst: Some(1),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstWithOneTimeBurst(2000, 1),
+            ),
+            (
+                TokenBucketConfig { size: 0, ..bucket },
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 0, 1000),
+            ),
+            (
+                TokenBucketConfig {
+                    refill_time: 0,
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstDisabledBucket(2000, 1000, 0),
+            ),
+            (
+                TokenBucketConfig {
+                    size: 1001,
+                    burst_rate: Some(1000),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstBelowSustained(1000, 1001, 1000),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_rate: Some(u64::MAX),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstCapacityOverflow(u64::MAX, 2),
+            ),
+        ];
+        for (bucket, expected) in invalid {
+            for cfg in [
+                RateLimiterConfig {
+                    bandwidth: Some(bucket),
+                    ops: None,
+                },
+                RateLimiterConfig {
+                    bandwidth: None,
+                    ops: Some(bucket),
+                },
+            ] {
+                for result in rate_limiter_validation_results(cfg) {
+                    assert_eq!(result.unwrap_err(), expected);
+                }
+            }
+        }
+
+        for bucket in [
+            bucket,
+            TokenBucketConfig {
+                one_time_burst: None,
+                burst_seconds: None,
+                ..bucket
+            },
+            // Depth can be smaller than size: size/refill_time defines only the rate.
+            TokenBucketConfig {
+                size: 10_000,
+                refill_time: 10_000,
+                burst_rate: Some(1000),
+                burst_seconds: Some(1),
+                ..bucket
+            },
+            TokenBucketConfig {
+                size: u64::MAX,
+                refill_time: u64::MAX,
+                burst_rate: Some(u64::MAX),
+                burst_seconds: Some(1),
+                ..bucket
+            },
+            // No new validation is applied to plain buckets.
+            TokenBucketConfig {
+                one_time_burst: Some(2000),
+                burst_rate: None,
+                burst_seconds: None,
+                ..bucket
+            },
+        ] {
+            for result in rate_limiter_validation_results(RateLimiterConfig {
+                bandwidth: Some(bucket),
+                ops: Some(bucket),
+            }) {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_recharge_validation() {
+        let bucket = TokenBucketConfig {
+            size: 1,
+            one_time_burst: Some(0),
+            refill_time: 2000,
+            burst_rate: Some(2),
+            burst_seconds: Some(2),
+            burst_recharge_seconds: Some(3),
+        };
+        let invalid = [
+            (
+                TokenBucketConfig {
+                    burst_rate: None,
+                    burst_seconds: None,
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeWithoutRate(3),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_recharge_seconds: Some(0),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(0, 3),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_recharge_seconds: Some(1),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(1, 3),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_recharge_seconds: Some(2),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(2, 3),
+            ),
+            (
+                TokenBucketConfig {
+                    size: 3,
+                    burst_recharge_seconds: Some(1),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(1, 2),
+            ),
+            (
+                TokenBucketConfig {
+                    refill_time: u64::MAX,
+                    burst_recharge_seconds: Some(u64::MAX / 1000),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeTooShort(
+                    u64::MAX / 1000,
+                    u128::from(u64::MAX / 1000) + 1,
+                ),
+            ),
+            (
+                TokenBucketConfig {
+                    burst_rate: Some(1),
+                    burst_seconds: Some(1),
+                    burst_recharge_seconds: Some(10),
+                    ..bucket
+                },
+                ValidationError::RateLimiterBurstRechargeWithoutCredit(10, 1, 1),
+            ),
+        ];
+        for (bucket, expected) in invalid {
+            for cfg in [
+                RateLimiterConfig {
+                    bandwidth: Some(bucket),
+                    ops: None,
+                },
+                RateLimiterConfig {
+                    bandwidth: None,
+                    ops: Some(bucket),
+                },
+            ] {
+                for result in rate_limiter_validation_results(cfg) {
+                    assert_eq!(result.unwrap_err(), expected);
+                }
+            }
+        }
+
+        for bucket in [
+            bucket,
+            TokenBucketConfig {
+                size: 3,
+                burst_recharge_seconds: Some(2),
+                ..bucket
+            },
+            TokenBucketConfig {
+                size: u64::MAX,
+                refill_time: u64::MAX,
+                burst_rate: Some(u64::MAX),
+                burst_seconds: Some(1),
+                burst_recharge_seconds: Some(u64::MAX),
+                ..bucket
+            },
+            TokenBucketConfig {
+                size: 2_000_000_001,
+                refill_time: 4_000_000_000_000,
+                burst_rate: Some(1),
+                burst_seconds: Some(10),
+                burst_recharge_seconds: Some(2),
+                ..bucket
+            },
+            TokenBucketConfig {
+                refill_time: u64::MAX,
+                burst_recharge_seconds: Some(u64::MAX / 1000 + 1),
+                ..bucket
+            },
+        ] {
+            for result in rate_limiter_validation_results(RateLimiterConfig {
+                bandwidth: Some(bucket),
+                ops: Some(bucket),
+            }) {
+                result.unwrap();
+            }
+        }
+    }
+
+    #[test]
+    fn test_rate_limiter_burst_serde() {
+        let old_json = r#"{"size":1000,"one_time_burst":0,"refill_time":1000}"#;
+        let plain: TokenBucketConfig = serde_json::from_str(old_json).unwrap();
+        assert_eq!(plain.burst_rate, None);
+        assert_eq!(plain.burst_seconds, None);
+        assert_eq!(plain.burst_recharge_seconds, None);
+        assert_eq!(serde_json::to_string(&plain).unwrap(), old_json);
+        let old_config_json = format!(r#"{{"bandwidth":{old_json},"ops":null}}"#);
+        let plain_config: RateLimiterConfig = serde_json::from_str(&old_config_json).unwrap();
+        assert_eq!(plain_config.bandwidth, Some(plain));
+        assert_eq!(
+            serde_json::to_string(&plain_config).unwrap(),
+            old_config_json
+        );
+
+        let burst = TokenBucketConfig {
+            burst_rate: Some(2000),
+            burst_seconds: Some(3),
+            ..plain
+        };
+        let json = serde_json::to_string(&burst).unwrap();
+        assert_eq!(
+            serde_json::from_str::<TokenBucketConfig>(&json).unwrap(),
+            burst
+        );
+        let config = RateLimiterConfig {
+            bandwidth: Some(burst),
+            ops: Some(burst),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RateLimiterConfig>(&json).unwrap(),
+            config
+        );
+
+        let recharge = TokenBucketConfig {
+            burst_recharge_seconds: Some(4),
+            ..burst
+        };
+        let json = serde_json::to_string(&recharge).unwrap();
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(value["burst_recharge_seconds"], 4);
+        assert_eq!(
+            serde_json::from_str::<TokenBucketConfig>(&json).unwrap(),
+            recharge
+        );
+        let config = RateLimiterConfig {
+            bandwidth: Some(recharge),
+            ops: Some(recharge),
+        };
+        let json = serde_json::to_string(&config).unwrap();
+        assert_eq!(
+            serde_json::from_str::<RateLimiterConfig>(&json).unwrap(),
+            config
+        );
+    }
+
+    #[test]
+    fn test_rate_limiter_token_bucket_config() {
+        let plain = TokenBucketConfig {
+            size: 1000,
+            one_time_burst: Some(2000),
+            refill_time: 100,
+            burst_rate: None,
+            burst_seconds: None,
+            burst_recharge_seconds: None,
+        };
+        let bucket = plain.token_bucket().unwrap();
+        assert_eq!(bucket.capacity(), 1000);
+        assert_eq!(bucket.one_time_burst(), 2000);
+        assert_eq!(bucket.refill_time_ms(), 100);
+        assert_eq!(bucket.budget(), 1000);
+
+        let burst = TokenBucketConfig {
+            one_time_burst: Some(0),
+            burst_rate: Some(20_000),
+            ..plain
+        };
+        let bucket = burst.token_bucket().unwrap();
+        assert_eq!(bucket.capacity(), 20_000);
+        assert_eq!(bucket.one_time_burst(), 0);
+        assert_eq!(bucket.refill_time_ms(), 100);
+        let bucket = TokenBucketConfig {
+            burst_seconds: Some(3),
+            ..burst
+        }
+        .token_bucket()
+        .unwrap();
+        assert_eq!(bucket.capacity(), 60_000);
+        let bucket = TokenBucketConfig {
+            burst_seconds: Some(3),
+            burst_recharge_seconds: Some(4),
+            ..burst
+        }
+        .token_bucket()
+        .unwrap();
+        assert_eq!(bucket.capacity(), 60_000);
+        assert_eq!(bucket.budget(), 60_000);
     }
 
     #[test]
@@ -5004,7 +5758,7 @@ mod tests {
         Ok(())
     }
 
-    fn net_fixture() -> NetConfig {
+    pub(crate) fn net_fixture() -> NetConfig {
         NetConfig {
             pci_common: PciDeviceCommonConfig::default(),
             tap: None,
@@ -5028,13 +5782,19 @@ mod tests {
 
     #[test]
     fn test_net_parsing() -> Result<()> {
+        use std::os::fd::IntoRawFd;
+
         assert_eq!(
-            NetConfig::parse("mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { NetConfig::parse("mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef") }?,
             net_fixture(),
         );
 
         assert_eq!(
-            NetConfig::parse("mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,id=mynet0")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                NetConfig::parse("mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,id=mynet0")
+            }?,
             NetConfig {
                 pci_common: PciDeviceCommonConfig {
                     id: Some("mynet0".to_owned()),
@@ -5045,9 +5805,12 @@ mod tests {
         );
 
         assert_eq!(
-            NetConfig::parse(
-                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,tap=tap0,ip=192.168.100.1,mask=255.255.255.128"
-            )?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                NetConfig::parse(
+                    "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,tap=tap0,ip=192.168.100.1,mask=255.255.255.128",
+                )
+            }?,
             NetConfig {
                 tap: Some("tap0".to_owned()),
                 ip: Some("192.168.100.1".parse().unwrap()),
@@ -5057,9 +5820,12 @@ mod tests {
         );
 
         assert_eq!(
-            NetConfig::parse(
-                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,vhost_user=true,socket=/tmp/sock"
-            )?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                NetConfig::parse(
+                    "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,vhost_user=true,socket=/tmp/sock",
+                )
+            }?,
             NetConfig {
                 vhost_user: true,
                 vhost_socket: Some("/tmp/sock".to_owned()),
@@ -5068,9 +5834,12 @@ mod tests {
         );
 
         assert_eq!(
-            NetConfig::parse(
-                "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,num_queues=4,queue_size=1024,iommu=on"
-            )?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                NetConfig::parse(
+                    "mac=de:ad:be:ef:12:34,host_mac=12:34:de:ad:be:ef,num_queues=4,queue_size=1024,iommu=on",
+                )
+            }?,
             NetConfig {
                 pci_common: PciDeviceCommonConfig {
                     iommu: IommuType::Virtio,
@@ -5082,18 +5851,30 @@ mod tests {
             }
         );
 
+        let files = [test_fd(), test_fd()];
+        let [fd0, fd1] = files.map(IntoRawFd::into_raw_fd);
+        // SAFETY: The files transferred exclusive ownership to us.
+        let config = unsafe {
+            NetConfig::parse(&format!(
+                "mac=de:ad:be:ef:12:34,fd=[{fd0},{fd1}],num_queues=4"
+            ))
+        }?;
+        let fds = config.fds.as_ref().unwrap();
+        assert_eq!(fds[0].as_ref().unwrap().as_raw_fd(), fd0);
+        assert_eq!(fds[1].as_ref().unwrap().as_raw_fd(), fd1);
         assert_eq!(
-            NetConfig::parse("mac=de:ad:be:ef:12:34,fd=[3,7],num_queues=4")?,
+            config,
             NetConfig {
                 host_mac: None,
-                fds: Some(vec![3, 7]),
+                fds: config.fds.clone(),
                 num_queues: 4,
                 ..net_fixture()
             }
         );
 
         assert_eq!(
-            NetConfig::parse("mac=de:ad:be:ef:12:34,mask=255.255.255.0")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { NetConfig::parse("mac=de:ad:be:ef:12:34,mask=255.255.255.0") }?,
             NetConfig {
                 mask: Some("255.255.255.0".parse().unwrap()),
                 host_mac: None,
@@ -5368,8 +6149,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_console_parsing() -> Result<()> {
-        let console_config = |mode, file, socket, iommu| ConsoleConfig {
-            common: CommonConsoleConfig { file, mode, socket },
+        let console_config = |output, iommu| ConsoleConfig {
+            output,
             pci_common: PciDeviceCommonConfig {
                 iommu,
                 ..Default::default()
@@ -5380,59 +6161,422 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         ConsoleConfig::parse("badmode").unwrap_err();
         assert_eq!(
             ConsoleConfig::parse("off")?,
-            console_config(ConsoleOutputMode::Off, None, None, IommuType::Off)
+            console_config(ConsoleOutput::Off, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("pty")?,
-            console_config(ConsoleOutputMode::Pty, None, None, IommuType::Off)
+            console_config(ConsoleOutput::Pty { file: None }, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("tty")?,
-            console_config(ConsoleOutputMode::Tty, None, None, IommuType::Off)
+            console_config(ConsoleOutput::Tty, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("null")?,
-            console_config(ConsoleOutputMode::Null, None, None, IommuType::Off)
+            console_config(ConsoleOutput::Null, IommuType::Off)
         );
         assert_eq!(
             ConsoleConfig::parse("file=/tmp/console")?,
             console_config(
-                ConsoleOutputMode::File,
-                Some(PathBuf::from("/tmp/console")),
-                None,
+                ConsoleOutput::File {
+                    file: PathBuf::from("/tmp/console"),
+                },
                 IommuType::Off
             )
         );
         assert_eq!(
             ConsoleConfig::parse("null,iommu=on")?,
-            console_config(ConsoleOutputMode::Null, None, None, IommuType::Virtio)
+            console_config(ConsoleOutput::Null, IommuType::Virtio)
         );
         assert_eq!(
             ConsoleConfig::parse("file=/tmp/console,iommu=on")?,
             console_config(
-                ConsoleOutputMode::File,
-                Some(PathBuf::from("/tmp/console")),
-                None,
+                ConsoleOutput::File {
+                    file: PathBuf::from("/tmp/console"),
+                },
                 IommuType::Virtio
             )
         );
         assert_eq!(
             ConsoleConfig::parse("socket=/tmp/serial.sock,iommu=on")?,
             console_config(
-                ConsoleOutputMode::Socket,
-                None,
-                Some(PathBuf::from("/tmp/serial.sock")),
+                ConsoleOutput::Socket {
+                    socket: PathBuf::from("/tmp/serial.sock"),
+                },
                 IommuType::Virtio
             )
         );
+        assert_eq!(
+            ConsoleConfig::parse("tcp=127.0.0.1:4444")?.output,
+            ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: "127.0.0.1:4444".parse().unwrap(),
+                    server: true,
+                },
+            }
+        );
+        assert_eq!(
+            ConsoleConfig::parse("tcp=[::1]:4444")?.output,
+            ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: "[::1]:4444".parse().unwrap(),
+                    server: true,
+                },
+            }
+        );
+        SerialConfig::parse("tcp=localhost:4444").unwrap_err();
+        for options in ["tcp=127.0.0.1:4444", "tcp=127.0.0.1:4444,server=on"] {
+            let serial = SerialConfig::parse(options)?;
+            let console = ConsoleConfig::parse(options)?;
+            assert_eq!(serial.output, console.output);
+            assert!(matches!(
+                serial.output,
+                ConsoleOutput::Tcp {
+                    tcp: TcpConsoleConfig { server: true, .. }
+                }
+            ));
+            serial.validate().unwrap();
+            console.output.validate().unwrap();
+        }
+        for options in ["tcp=127.0.0.1:4444,server=invalid", "null,server=on"] {
+            ConsoleConfig::parse(options).unwrap_err();
+            SerialConfig::parse(options).unwrap_err();
+        }
+        assert!(matches!(
+            SerialConfig::parse("tcp=127.0.0.1:4444,server=off"),
+            Err(Error::Validation(
+                ValidationError::ConsoleTcpClientUnsupported
+            ))
+        ));
+        assert!(matches!(
+            ConsoleConfig::parse("tcp=127.0.0.1:4444,server=off"),
+            Err(Error::Validation(
+                ValidationError::ConsoleTcpClientUnsupported
+            ))
+        ));
         Ok(())
+    }
+
+    #[test]
+    fn test_console_output_parse_update() {
+        let parse = |input: &str, device: &str| {
+            let mut parser = OptionParser::new();
+            parser.add_all(ConsoleOutput::UPDATE_OPTIONS);
+            parser.parse(input).unwrap();
+            ConsoleOutput::parse_update(&parser, device)
+        };
+
+        assert_eq!(parse("", "serial").unwrap(), None);
+        assert_eq!(
+            parse("serial_file=/tmp/serial.log", "serial").unwrap(),
+            Some(ConsoleOutput::File {
+                file: PathBuf::from("/tmp/serial.log"),
+            })
+        );
+        assert_eq!(
+            parse("console_socket=/tmp/console.sock", "console").unwrap(),
+            Some(ConsoleOutput::Socket {
+                socket: PathBuf::from("/tmp/console.sock"),
+            })
+        );
+        assert_eq!(
+            parse("serial_tcp=127.0.0.1:4444", "serial").unwrap(),
+            Some(ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: "127.0.0.1:4444".parse().unwrap(),
+                    server: true,
+                },
+            })
+        );
+
+        // Options of the other console must not leak into this one.
+        assert_eq!(parse("console_tcp=127.0.0.1:4444", "serial").unwrap(), None);
+        // Two outputs for different consoles are fine, two for one are not.
+        parse("serial_file=/tmp/a,console_file=/tmp/b", "serial").unwrap();
+        assert!(matches!(
+            parse("serial_file=/tmp/a,serial_tcp=127.0.0.1:4444", "serial"),
+            Err(Error::Validation(
+                ValidationError::ConsoleOutputUpdateAmbiguous(_)
+            ))
+        ));
+        assert!(matches!(
+            parse("serial_tcp=localhost:4444", "serial"),
+            Err(Error::ResolveConsoleTcpAddress { .. })
+        ));
+
+        // An option without a value must be rejected.
+        assert!(matches!(
+            parse("serial_file=", "serial"),
+            Err(Error::Validation(ValidationError::ConsoleFileMissing))
+        ));
+        assert!(matches!(
+            parse("console_socket=", "console"),
+            Err(Error::Validation(ValidationError::ConsoleSocketPathMissing))
+        ));
+        assert!(matches!(
+            parse("serial_tcp=", "serial"),
+            Err(Error::Validation(ValidationError::ConsoleTcpAddressMissing))
+        ));
+    }
+
+    #[test]
+    fn test_console_output_update() {
+        let tcp = |address: &str| ConsoleOutput::Tcp {
+            tcp: TcpConsoleConfig {
+                address: address.parse().unwrap(),
+                server: true,
+            },
+        };
+        let file = ConsoleOutput::File {
+            file: PathBuf::from("/tmp/console.log"),
+        };
+
+        let mut output = tcp("127.0.0.1:4444");
+        output
+            .update(&tcp("127.0.0.1:5555"))
+            .expect("should accept a new address in the same mode");
+        assert_eq!(output, tcp("127.0.0.1:5555"));
+
+        // Rejected updates must leave the output unchanged.
+        assert_eq!(
+            output.update(&file),
+            Err(ValidationError::ConsoleOutputUpdateModeMismatch(
+                tcp("127.0.0.1:5555"),
+                file.clone()
+            ))
+        );
+        assert_eq!(
+            output.update(&tcp("127.0.0.1:0")),
+            Err(ValidationError::ConsoleTcpPortZero)
+        );
+        assert_eq!(output, tcp("127.0.0.1:5555"));
+    }
+
+    #[test]
+    fn test_console_output_update_requires_same_mode() {
+        let outputs = [
+            ConsoleOutput::Off,
+            ConsoleOutput::Pty { file: None },
+            ConsoleOutput::Tty,
+            ConsoleOutput::File {
+                file: PathBuf::from("/tmp/console.log"),
+            },
+            ConsoleOutput::Socket {
+                socket: PathBuf::from("/tmp/console.sock"),
+            },
+            ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: "127.0.0.1:4444".parse().unwrap(),
+                    server: true,
+                },
+            },
+            ConsoleOutput::Null,
+        ];
+
+        for (current_index, current) in outputs.iter().enumerate() {
+            for (new_index, new) in outputs.iter().enumerate() {
+                let mut output = current.clone();
+                if current_index == new_index {
+                    assert_eq!(output.update(new), Ok(()));
+                } else {
+                    assert_eq!(
+                        output.update(new),
+                        Err(ValidationError::ConsoleOutputUpdateModeMismatch(
+                            current.clone(),
+                            new.clone()
+                        ))
+                    );
+                    assert_eq!(output, *current);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_tcp_console_port_zero_validation() {
+        for address in ["127.0.0.1:0", "[::1]:0"] {
+            let options = format!("tcp={address}");
+            let serial = SerialConfig::parse(&options).unwrap();
+            let console = ConsoleConfig::parse(&options).unwrap();
+            assert_eq!(
+                serial.validate().unwrap_err(),
+                ValidationError::ConsoleTcpPortZero
+            );
+            assert_eq!(
+                console.output.validate().unwrap_err(),
+                ValidationError::ConsoleTcpPortZero
+            );
+
+            let config = serde_json::json!({
+                "mode": "Tcp",
+                "tcp": { "address": address }
+            });
+            let serial: SerialConfig = serde_json::from_value(config.clone()).unwrap();
+            let console: ConsoleConfig = serde_json::from_value(config).unwrap();
+            assert_eq!(
+                serial.validate().unwrap_err(),
+                ValidationError::ConsoleTcpPortZero
+            );
+            assert_eq!(
+                console.output.validate().unwrap_err(),
+                ValidationError::ConsoleTcpPortZero
+            );
+        }
+    }
+
+    #[test]
+    fn test_tcp_console_deserialization() {
+        let config = serde_json::json!({
+            "mode": "Tcp",
+            "tcp": { "address": "127.0.0.1:4444" }
+        });
+        let serial: SerialConfig = serde_json::from_value(config.clone()).unwrap();
+        let console: ConsoleConfig = serde_json::from_value(config.clone()).unwrap();
+        let expected = ConsoleOutput::Tcp {
+            tcp: TcpConsoleConfig {
+                address: "127.0.0.1:4444".parse().unwrap(),
+                server: true,
+            },
+        };
+        assert_eq!(serial.output, expected);
+        assert_eq!(console.output, expected);
+        serial.validate().unwrap();
+        console.output.validate().unwrap();
+
+        let mut hostname = config.clone();
+        hostname["tcp"]["address"] = serde_json::json!("localhost:4444");
+        serde_json::from_value::<SerialConfig>(hostname.clone()).unwrap_err();
+        serde_json::from_value::<ConsoleConfig>(hostname).unwrap_err();
+
+        let mut explicit = config.clone();
+        explicit["tcp"]["server"] = serde_json::json!(true);
+        assert_eq!(
+            serde_json::from_value::<SerialConfig>(explicit.clone()).unwrap(),
+            serial
+        );
+        assert_eq!(
+            serde_json::from_value::<ConsoleConfig>(explicit.clone()).unwrap(),
+            console
+        );
+        explicit["tcp"]["server"] = serde_json::json!(false);
+        let serial: SerialConfig = serde_json::from_value(explicit.clone()).unwrap();
+        let console: ConsoleConfig = serde_json::from_value(explicit).unwrap();
+        assert_eq!(
+            serial.validate().unwrap_err(),
+            ValidationError::ConsoleTcpClientUnsupported
+        );
+        assert_eq!(
+            console.output.validate().unwrap_err(),
+            ValidationError::ConsoleTcpClientUnsupported
+        );
+    }
+
+    // The HTTP API, snapshots, and migration rely on this JSON format.
+    #[test]
+    fn test_console_output_json_format() {
+        let tcp = TcpConsoleConfig {
+            address: "127.0.0.1:4444".parse().unwrap(),
+            server: true,
+        };
+        let cases = [
+            (serde_json::json!({ "mode": "Off" }), ConsoleOutput::Off),
+            (
+                serde_json::json!({ "mode": "Pty" }),
+                ConsoleOutput::Pty { file: None },
+            ),
+            (
+                serde_json::json!({ "mode": "Pty", "file": "/dev/pts/3" }),
+                ConsoleOutput::Pty {
+                    file: Some(PathBuf::from("/dev/pts/3")),
+                },
+            ),
+            (serde_json::json!({ "mode": "Tty" }), ConsoleOutput::Tty),
+            (
+                serde_json::json!({ "mode": "File", "file": "/tmp/console" }),
+                ConsoleOutput::File {
+                    file: PathBuf::from("/tmp/console"),
+                },
+            ),
+            (
+                serde_json::json!({ "mode": "Socket", "socket": "/tmp/console.sock" }),
+                ConsoleOutput::Socket {
+                    socket: PathBuf::from("/tmp/console.sock"),
+                },
+            ),
+            (
+                serde_json::json!({
+                    "mode": "Tcp",
+                    "tcp": { "address": "127.0.0.1:4444", "server": true }
+                }),
+                ConsoleOutput::Tcp { tcp },
+            ),
+            (serde_json::json!({ "mode": "Null" }), ConsoleOutput::Null),
+        ];
+        for (json, output) in cases {
+            let config = SerialConfig { output };
+            assert_eq!(
+                serde_json::from_value::<SerialConfig>(json.clone()).unwrap(),
+                config
+            );
+            assert_eq!(serde_json::to_value(&config).unwrap(), json);
+        }
+
+        // Versions before v53 serialized unset paths as null.
+        let config: SerialConfig = serde_json::from_value(serde_json::json!({
+            "mode": "Socket",
+            "file": null,
+            "socket": "/tmp/console.sock"
+        }))
+        .unwrap();
+        assert_eq!(
+            config.output,
+            ConsoleOutput::Socket {
+                socket: PathBuf::from("/tmp/console.sock"),
+            }
+        );
+
+        for mode in ["File", "Socket", "Tcp"] {
+            serde_json::from_value::<SerialConfig>(serde_json::json!({ "mode": mode }))
+                .unwrap_err();
+        }
+    }
+
+    #[cfg(target_arch = "x86_64")]
+    #[test]
+    fn test_debug_console_config() {
+        let config = DebugConsoleConfig {
+            output: ConsoleOutput::File {
+                file: PathBuf::from("/tmp/console"),
+            },
+            iobase: Some(0xe9),
+        };
+        assert_eq!(
+            DebugConsoleConfig::parse("file=/tmp/console,iobase=0xe9").unwrap(),
+            config
+        );
+
+        let json = serde_json::json!({
+            "mode": "File",
+            "file": "/tmp/console",
+            "iobase": 0xe9
+        });
+        assert_eq!(
+            serde_json::from_value::<DebugConsoleConfig>(json.clone()).unwrap(),
+            config
+        );
+        assert_eq!(serde_json::to_value(&config).unwrap(), json);
+
+        // The debug console has no socket or TCP backend.
+        for options in ["socket=/tmp/console.sock", "tcp=127.0.0.1:4444"] {
+            DebugConsoleConfig::parse(options).unwrap_err();
+        }
     }
 
     fn device_fixture() -> DeviceConfig {
         DeviceConfig {
             pci_common: PciDeviceCommonConfig::default(),
             path: Some(PathBuf::from("/path/to/device")),
-            fd: None,
+            fd: Default::default(),
             x_nv_gpudirect_clique: None,
             x_exclude_mmap_bars: Vec::new(),
             iommufd_dev_id: None,
@@ -5441,22 +6585,27 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_device_parsing() -> Result<()> {
-        // The parser itself is purely syntactic; the "path or fd is
-        // required" rule is enforced by VmConfig::validate instead.
+        use std::os::fd::IntoRawFd;
+
+        // The "path or fd is
+        // required" rule is enforced by VmConfig::validate.
         assert_eq!(
-            DeviceConfig::parse("")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { DeviceConfig::parse("") }?,
             DeviceConfig {
                 path: None,
                 ..device_fixture()
             }
         );
         assert_eq!(
-            DeviceConfig::parse("path=/path/to/device")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { DeviceConfig::parse("path=/path/to/device") }?,
             device_fixture()
         );
 
         assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,iommu=on")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { DeviceConfig::parse("path=/path/to/device,iommu=on") }?,
             DeviceConfig {
                 pci_common: PciDeviceCommonConfig {
                     iommu: IommuType::Virtio,
@@ -5467,7 +6616,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,iommu=on,id=mydevice0")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { DeviceConfig::parse("path=/path/to/device,iommu=on,id=mydevice0") }?,
             DeviceConfig {
                 pci_common: PciDeviceCommonConfig {
                     id: Some("mydevice0".to_owned()),
@@ -5479,7 +6629,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[2]")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[2]") }?,
             DeviceConfig {
                 x_exclude_mmap_bars: vec![2],
                 ..device_fixture()
@@ -5487,7 +6638,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[0,2,5]")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[0,2,5]") }?,
             DeviceConfig {
                 x_exclude_mmap_bars: vec![0, 2, 5],
                 ..device_fixture()
@@ -5495,7 +6647,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[6]")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { DeviceConfig::parse("path=/path/to/device,x_exclude_mmap_bars=[6]") }?,
             DeviceConfig {
                 x_exclude_mmap_bars: vec![6],
                 ..device_fixture()
@@ -5504,23 +6657,32 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         // `fd=` is accepted alongside or in place of `path=`; exclusivity
         // is enforced by DeviceConfig::validate, not by the parser.
+        let fd = test_fd().into_raw_fd();
+        // SAFETY: The file transferred exclusive ownership to us.
+        let config = unsafe { DeviceConfig::parse(&format!("fd={fd}")) }?;
+        assert_eq!(config.fd.as_ref().unwrap().as_raw_fd(), fd);
         assert_eq!(
-            DeviceConfig::parse("fd=7")?,
+            config,
             DeviceConfig {
                 path: None,
-                fd: Some(7),
+                fd: config.fd.clone(),
                 ..device_fixture()
             }
         );
+        let fd = test_fd().into_raw_fd();
+        // SAFETY: The file transferred exclusive ownership to us.
+        let config = unsafe { DeviceConfig::parse(&format!("path=/path/to/device,fd={fd}")) }?;
+        assert_eq!(config.fd.as_ref().unwrap().as_raw_fd(), fd);
         assert_eq!(
-            DeviceConfig::parse("path=/path/to/device,fd=7")?,
+            config,
             DeviceConfig {
-                fd: Some(7),
+                fd: config.fd.clone(),
                 ..device_fixture()
             }
         );
         // Non-integer fd fails at parse time.
-        DeviceConfig::parse("fd=notanint").unwrap_err();
+        // SAFETY: This input contains no inherited descriptors.
+        unsafe { DeviceConfig::parse("fd=notanint") }.unwrap_err();
 
         Ok(())
     }
@@ -5567,7 +6729,9 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_platform_smbios_parsing() -> Result<()> {
-        let config = PlatformConfig::parse("system_serial_number=serial,system_uuid=uuid")?;
+        let config =
+            // SAFETY: This test input contains no inherited descriptors.
+            unsafe { PlatformConfig::parse("system_serial_number=serial,system_uuid=uuid") }?;
         assert_eq!(config.system_serial_number.as_deref(), Some("serial"));
         assert_eq!(config.system_uuid.as_deref(), Some("uuid"));
 
@@ -5582,7 +6746,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         for key in ["serial_number", "uuid"] {
             for prefix in ["", "system_serial_number=serial,system_uuid=uuid,"] {
                 assert!(matches!(
-                    PlatformConfig::parse(&format!("{prefix}{key}=legacy")),
+                    // SAFETY: This test input contains no inherited descriptors.
+                    unsafe { PlatformConfig::parse(&format!("{prefix}{key}=legacy")) },
                     Err(Error::ParsePlatform(OptionParserError::UnknownOption(option)))
                         if option == key
                 ));
@@ -5600,21 +6765,21 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_platform_iommufd_fd_parsing() -> Result<()> {
-        // `iommufd_fd=N` alone implies `iommufd=on`.
-        let p = PlatformConfig::parse("iommufd_fd=42")?;
-        assert!(p.iommufd);
-        assert_eq!(p.iommufd_fd, Some(42));
+        // SAFETY: This input contains no inherited descriptors.
+        let platform = unsafe { PlatformConfig::parse("") }?;
+        assert!(!platform.iommufd);
+        assert!(platform.iommufd_fd.is_none());
 
-        // Explicit `iommufd=on,iommufd_fd=N` is the same.
-        let p = PlatformConfig::parse("iommufd=on,iommufd_fd=42")?;
-        assert!(p.iommufd);
-        assert_eq!(p.iommufd_fd, Some(42));
-
-        // No flags → both default to off.
-        let p = PlatformConfig::parse("")?;
-        assert!(!p.iommufd);
-        assert_eq!(p.iommufd_fd, None);
-
+        use std::os::fd::IntoRawFd;
+        for prefix in ["", "iommufd=on,"] {
+            let file = test_fd();
+            let fd = file.into_raw_fd();
+            // SAFETY: The file transferred exclusive ownership to us.
+            let platform = unsafe { PlatformConfig::parse(&format!("{prefix}iommufd_fd={fd}")) }?;
+            assert!(platform.iommufd);
+            assert_eq!(platform.iommufd_fd.as_ref().unwrap().as_raw_fd(), fd);
+            platform.validate().unwrap();
+        }
         Ok(())
     }
 
@@ -5625,6 +6790,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             VsockConfig::parse("socket=/tmp/sock,cid=3")?,
             VsockConfig {
+                socket_type: SocketType::Stream,
                 pci_common: PciDeviceCommonConfig::default(),
                 cid: 3,
                 socket: PathBuf::from("/tmp/sock"),
@@ -5633,6 +6799,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             VsockConfig::parse("socket=/tmp/sock,cid=3,iommu=on")?,
             VsockConfig {
+                socket_type: SocketType::Stream,
                 pci_common: PciDeviceCommonConfig {
                     iommu: IommuType::Virtio,
                     ..Default::default()
@@ -5642,6 +6809,26 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             }
         );
         Ok(())
+    }
+
+    #[test]
+    fn test_remove_vsock_device() {
+        let mut config: VmConfig = serde_json::from_str("{}").unwrap();
+        assert!(!config.remove_device("vsock0"));
+
+        config.vsock = Some(VsockConfig::parse("cid=3,socket=/tmp/vsock,id=vsock0").unwrap());
+        assert!(!config.remove_device("vsock1"));
+        assert_eq!(
+            config.vsock.as_ref().unwrap().pci_common.id.as_deref(),
+            Some("vsock0")
+        );
+        assert!(config.remove_device("vsock0"));
+        assert!(config.vsock.is_none());
+        assert!(!config.remove_device("vsock0"));
+
+        config.vsock = Some(VsockConfig::parse("cid=3,socket=/tmp/vsock").unwrap());
+        assert!(!config.remove_device("vsock0"));
+        assert!(config.vsock.is_some());
     }
 
     #[test]
@@ -5761,137 +6948,181 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_restore_parsing() -> Result<()> {
+        use std::array;
+        use std::os::fd::IntoRawFd;
+
         assert_eq!(
-            RestoreConfig::parse("source_url=/path/to/snapshot")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { RestoreConfig::parse("source_url=/path/to/snapshot") }?,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
-                prefault: false,
-                memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: None,
-                vfio_fds: None,
-                iommufd_fd: None,
-                resume: false,
-                zone_updates: vec![],
+                ..Default::default()
             }
         );
         assert_eq!(
-            RestoreConfig::parse(
-                "source_url=/path/to/snapshot,prefault=off,net_fds=[net0@[3,4],net1@[5,6,7,8]]"
-            )?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                RestoreConfig::parse(
+                    "source_url=/path/to/snapshot,serial_file=/tmp/s,console_socket=/tmp/c",
+                )
+            }?,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
-                prefault: false,
-                memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: Some(vec![
-                    RestoredNetConfig {
-                        id: "net0".to_string(),
-                        num_fds: 2,
-                        fds: Some(vec![3, 4]),
-                    },
-                    RestoredNetConfig {
-                        id: "net1".to_string(),
-                        num_fds: 4,
-                        fds: Some(vec![5, 6, 7, 8]),
-                    }
-                ]),
-                vfio_fds: None,
-                iommufd_fd: None,
-                resume: false,
-                zone_updates: vec![],
+                serial: Some(ConsoleOutput::File {
+                    file: PathBuf::from("/tmp/s"),
+                }),
+                console: Some(ConsoleOutput::Socket {
+                    socket: PathBuf::from("/tmp/c"),
+                }),
+                ..Default::default()
+            }
+        );
+        assert!(matches!(
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                RestoreConfig::parse("source_url=/path/to/snapshot,serial_file=/a,serial_socket=/b")
+            },
+            Err(Error::Validation(
+                ValidationError::ConsoleOutputUpdateAmbiguous(_)
+            ))
+        ));
+        assert!(matches!(
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe { RestoreConfig::parse("source_url=/path/to/snapshot,console_tcp=localhost:1") },
+            Err(Error::ResolveConsoleTcpAddress { .. })
+        ));
+        let files: [File; 6] = array::from_fn(|_| test_fd());
+        let [fd0, fd1, fd2, fd3, fd4, fd5] = files.map(IntoRawFd::into_raw_fd);
+        // SAFETY: The files transferred exclusive ownership to us.
+        let config = unsafe {
+            RestoreConfig::parse(&format!(
+                "source_url=/path/to/snapshot,prefault=off,net_fds=[net0@[{fd0},{fd1}],net1@[{fd2},{fd3},{fd4},{fd5}]]"
+            ))
+        }?;
+        assert!(config.net_fds.is_none());
+        let nets = config.external_fds.entries();
+        let fds: Vec<_> = nets
+            .iter()
+            .flat_map(|(_, _, fds)| fds.iter())
+            .map(|fd| fd.as_ref().unwrap().as_raw_fd())
+            .collect();
+        assert_eq!(fds, [fd0, fd1, fd2, fd3, fd4, fd5]);
+        assert_eq!(
+            config,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
+                external_fds: vec![
+                    (net_target("net0"), nets[0].2.clone()),
+                    (net_target("net1"), nets[1].2.clone()),
+                ]
+                .into(),
+                ..Default::default()
             }
         );
         assert_eq!(
-            RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=ondemand")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=ondemand")
+            }?,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
-                prefault: false,
                 memory_restore_mode: MemoryRestoreMode::OnDemand,
-                net_fds: None,
-                vfio_fds: None,
-                iommufd_fd: None,
-                resume: false,
-                zone_updates: vec![],
+                ..Default::default()
             }
         );
         assert_eq!(
-            RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[zone1@1]")?,
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                RestoreConfig::parse(
+                    "source_url=/path/to/snapshot,memory_restore_mode=ondemand_no_background_fetch_pages",
+                )
+            }?,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
-                prefault: false,
-                memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: None,
-                vfio_fds: None,
-                iommufd_fd: None,
+                memory_restore_mode: MemoryRestoreMode::OnDemandNoBackgroundFetchPages,
+                ..Default::default()
+            }
+        );
+        assert_eq!(
+            // SAFETY: This input contains no inherited descriptors.
+            unsafe {
+                RestoreConfig::parse(
+                    "source_url=/path/to/snapshot,resume=on,zone_updates=[zone1@1]",
+                )
+            }?,
+            RestoreConfig {
+                source_url: PathBuf::from("/path/to/snapshot"),
                 resume: true,
                 zone_updates: vec![VmMemoryZoneUpdateData {
                     host_numa_node: 1,
                     id: "zone1".to_string(),
                 }],
+                ..Default::default()
             }
         );
+        let vfio0 = test_fd();
+        let vfio1 = test_fd();
+        let iommu = test_fd();
+        let fd0 = vfio0.into_raw_fd();
+        let fd1 = vfio1.into_raw_fd();
+        let fd2 = iommu.into_raw_fd();
+        // SAFETY: The files transferred exclusive ownership to us.
+        let config = unsafe {
+            RestoreConfig::parse(&format!(
+                "source_url=/path/to/snapshot,vfio_fds=[vfio0@{fd0},vfio1@{fd1}],iommufd_fd={fd2}"
+            ))
+        }?;
+        assert!(config.vfio_fds.is_none());
+        assert!(config.iommufd_fd.is_none());
+        let entries = config.external_fds.entries();
+        assert_eq!(entries[0].2[0].as_ref().unwrap().as_raw_fd(), fd0);
+        assert_eq!(entries[1].2[0].as_ref().unwrap().as_raw_fd(), fd1);
+        assert_eq!(entries[2].2[0].as_ref().unwrap().as_raw_fd(), fd2);
         assert_eq!(
-            RestoreConfig::parse(
-                "source_url=/path/to/snapshot,vfio_fds=[vfio0@5,vfio1@6],iommufd_fd=7"
-            )?,
+            config,
             RestoreConfig {
                 source_url: PathBuf::from("/path/to/snapshot"),
-                prefault: false,
-                memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: None,
-                vfio_fds: Some(vec![
-                    RestoredVfioConfig {
-                        id: "vfio0".to_string(),
-                        fd: Some(5),
-                    },
-                    RestoredVfioConfig {
-                        id: "vfio1".to_string(),
-                        fd: Some(6),
-                    },
-                ]),
-                iommufd_fd: Some(7),
-                resume: false,
-                zone_updates: vec![],
-            }
-        );
-        assert_eq!(
-            RestoreConfig::parse(
-                "source_url=/path/to/snapshot,vfio_fds=[vfio0@5,vfio1@6],iommufd_fd=7"
-            )?,
-            RestoreConfig {
-                source_url: PathBuf::from("/path/to/snapshot"),
-                prefault: false,
-                memory_restore_mode: MemoryRestoreMode::Copy,
-                net_fds: None,
-                vfio_fds: Some(vec![
-                    RestoredVfioConfig {
-                        id: "vfio0".to_string(),
-                        fd: Some(5),
-                    },
-                    RestoredVfioConfig {
-                        id: "vfio1".to_string(),
-                        fd: Some(6),
-                    },
-                ]),
-                iommufd_fd: Some(7),
-                resume: false,
-                zone_updates: vec![],
+                external_fds: vec![
+                    (vfio_target("vfio0"), entries[0].2.clone()),
+                    (vfio_target("vfio1"), entries[1].2.clone()),
+                    (Target::Iommu, entries[2].2.clone()),
+                ]
+                .into(),
+                ..Default::default()
             }
         );
         // Parsing should fail as source_url is a required field
-        RestoreConfig::parse("prefault=off").unwrap_err();
-        RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=bogus").unwrap_err();
-        RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[@1]")
+        // SAFETY: This input contains no inherited descriptors.
+        unsafe { RestoreConfig::parse("prefault=off") }.unwrap_err();
+        // SAFETY: This input contains no inherited descriptors.
+        unsafe { RestoreConfig::parse("source_url=/path/to/snapshot,memory_restore_mode=bogus") }
             .unwrap_err();
-        RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[@]")
+        // SAFETY: This input contains no inherited descriptors.
+        unsafe { RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[@1]") }
             .unwrap_err();
-        RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[id1@]")
+        // SAFETY: This input contains no inherited descriptors.
+        unsafe { RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[@]") }
             .unwrap_err();
-        RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[id1 1]")
-            .unwrap_err();
-        RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[[id1@1]]")
-            .unwrap_err();
-        RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=id1@1")
-            .unwrap_err();
+        // SAFETY: This input contains no inherited descriptors.
+        unsafe {
+            RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[id1@]")
+        }
+        .unwrap_err();
+        // SAFETY: This input contains no inherited descriptors.
+        unsafe {
+            RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[id1 1]")
+        }
+        .unwrap_err();
+        // SAFETY: This input contains no inherited descriptors.
+        unsafe {
+            RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=[[id1@1]]")
+        }
+        .unwrap_err();
+        // SAFETY: This input contains no inherited descriptors.
+        unsafe {
+            RestoreConfig::parse("source_url=/path/to/snapshot,resume=on,zone_updates=id1@1")
+        }
+        .unwrap_err();
         Ok(())
     }
 
@@ -5913,6 +7144,14 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
         assert_eq!(
             serde_json::from_str::<RestoreConfig>(
+                r#"{"source_url":"/path/to/snapshot","memory_restore_mode":"OnDemandNoBackgroundFetchPages"}"#
+            )
+            .unwrap()
+            .memory_restore_mode,
+            MemoryRestoreMode::OnDemandNoBackgroundFetchPages
+        );
+        assert_eq!(
+            serde_json::from_str::<RestoreConfig>(
                 r#"{"source_url":"/path/to/snapshot","zone_updates":[{"id": "zone1", "host_numa_node": 1}]}"#
             )
             .unwrap()
@@ -5921,6 +7160,28 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     host_numa_node: 1,
                     id: "zone1".to_string(),
                 }],
+        );
+
+        let config = serde_json::from_str::<RestoreConfig>(
+            r#"{"source_url":"/path/to/snapshot",
+                "serial":{"mode":"Tcp","tcp":{"address":"127.0.0.1:4444"}},
+                "console":{"mode":"File","file":"/tmp/console.log"}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            config.serial,
+            Some(ConsoleOutput::Tcp {
+                tcp: TcpConsoleConfig {
+                    address: "127.0.0.1:4444".parse().unwrap(),
+                    server: true,
+                },
+            })
+        );
+        assert_eq!(
+            config.console,
+            Some(ConsoleOutput::File {
+                file: PathBuf::from("/tmp/console.log"),
+            })
         );
     }
 
@@ -5955,6 +7216,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_restore_config_validation() {
+        let fd: ExternalFd = test_fd().into();
+
         // interested in only VmConfig.net, so set rest to default values
         let mut snapshot_vm_config = VmConfig {
             cpus: CpusConfig::default(),
@@ -5987,7 +7250,6 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             pci_segments: None,
             platform: None,
             tpm: None,
-            preserved_fds: None,
             net: Some(vec![
                 NetConfig {
                     pci_common: PciDeviceCommonConfig {
@@ -5995,7 +7257,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                         ..Default::default()
                     },
                     num_queues: 2,
-                    fds: Some(vec![-1, -1, -1, -1]),
+                    fds: Some(vec![ExternalFd::default(); 4]),
                     ..net_fixture()
                 },
                 NetConfig {
@@ -6004,7 +7266,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                         ..Default::default()
                     },
                     num_queues: 1,
-                    fds: Some(vec![-1, -1]),
+                    fds: Some(vec![ExternalFd::default(); 2]),
                     ..net_fixture()
                 },
                 NetConfig {
@@ -6026,90 +7288,63 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
-            net_fds: Some(vec![
-                RestoredNetConfig {
-                    id: "net0".to_string(),
-                    num_fds: 4,
-                    fds: Some(vec![3, 4, 5, 6]),
-                },
-                RestoredNetConfig {
-                    id: "net1".to_string(),
-                    num_fds: 2,
-                    fds: Some(vec![7, 8]),
-                },
-            ]),
-            vfio_fds: None,
-            iommufd_fd: None,
+            external_fds: vec![
+                (net_target("net0"), vec![fd.clone(); 4]),
+                (net_target("net1"), vec![fd.clone(); 2]),
+            ]
+            .into(),
             resume: false,
             zone_updates: vec![],
+            ..Default::default()
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 
         let mut invalid_config = valid_config.clone();
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "netx".to_string(),
-            num_fds: 4,
-            fds: Some(vec![3, 4, 5, 6]),
-        }]);
+        invalid_config.external_fds = vec![(net_target("netx"), vec![fd.clone(); 4])].into();
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingRequiredNetId(
-                "net0".to_string()
-            ))
+            Err(ValidationError::Fd(UpdateFdsError::MissingFds(net_target(
+                "net0"
+            ))))
         );
 
-        invalid_config.net_fds = Some(vec![
-            RestoredNetConfig {
-                id: "net0".to_string(),
-                num_fds: 4,
-                fds: Some(vec![3, 4, 5, 6]),
-            },
-            RestoredNetConfig {
-                id: "net0".to_string(),
-                num_fds: 4,
-                fds: Some(vec![3, 4, 5, 6]),
-            },
-        ]);
+        invalid_config.external_fds = vec![
+            (net_target("net0"), vec![fd.clone(); 4]),
+            (net_target("net0"), vec![fd.clone(); 4]),
+        ]
+        .into();
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::IdentifierNotUnique("net0".to_string()))
+            Err(ValidationError::Fd(UpdateFdsError::DuplicatedTargetEntry(
+                net_target("net0")
+            )))
         );
 
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "net0".to_string(),
-            num_fds: 4,
-            fds: Some(vec![3, 4, 5, 6]),
-        }]);
+        invalid_config.external_fds = vec![(net_target("net0"), vec![fd.clone(); 4])].into();
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingRequiredNetId(
-                "net1".to_string()
-            ))
+            Err(ValidationError::Fd(UpdateFdsError::MissingFds(net_target(
+                "net1"
+            ))))
         );
 
-        invalid_config.net_fds = Some(vec![RestoredNetConfig {
-            id: "net0".to_string(),
-            num_fds: 2,
-            fds: Some(vec![3, 4]),
-        }]);
+        invalid_config.external_fds = vec![(net_target("net0"), vec![fd.clone(); 2])].into();
         assert_eq!(
             invalid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreNetFdCountMismatch(
-                "net0".to_string(),
-                2,
-                4
-            ))
+            Err(ValidationError::Fd(UpdateFdsError::FdAmountMismatch {
+                target: net_target("net0"),
+                expected: 4,
+                actual: 2,
+            }))
         );
 
         let another_valid_config = RestoreConfig {
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
-            net_fds: None,
-            vfio_fds: None,
-            iommufd_fd: None,
             resume: false,
             zone_updates: vec![],
+            ..Default::default()
         };
         snapshot_vm_config.net = Some(vec![NetConfig {
             pci_common: PciDeviceCommonConfig {
@@ -6125,11 +7360,9 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: true,
             memory_restore_mode: MemoryRestoreMode::OnDemand,
-            net_fds: None,
-            vfio_fds: None,
-            iommufd_fd: None,
             resume: false,
             zone_updates: vec![],
+            ..Default::default()
         };
         assert_eq!(
             invalid_restore_mode.validate(&snapshot_vm_config),
@@ -6137,7 +7370,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         // It is invalid to submit more than one update for a single zone.
-        let mut invalid_config_zone_updates = valid_config.clone();
+        let mut invalid_config_zone_updates = another_valid_config.clone();
         invalid_config_zone_updates.zone_updates = vec![
             VmMemoryZoneUpdateData {
                 id: "id1".to_string(),
@@ -6154,7 +7387,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         );
 
         // It is invalid to submit an update without referring to a memory zone by specifying an ID.
-        let mut invalid_config_zone_updates = valid_config.clone();
+        let mut invalid_config_zone_updates = another_valid_config.clone();
         invalid_config_zone_updates.zone_updates = vec![VmMemoryZoneUpdateData {
             id: String::new(),
             host_numa_node: 0,
@@ -6168,11 +7401,9 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: true,
             memory_restore_mode: MemoryRestoreMode::CopyOnWrite,
-            net_fds: None,
-            vfio_fds: None,
-            iommufd_fd: None,
             resume: false,
             zone_updates: vec![],
+            ..Default::default()
         };
         assert_eq!(
             invalid_cow_prefault.validate(&snapshot_vm_config),
@@ -6182,6 +7413,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_restore_config_vfio_fds_validation() {
+        let fd: ExternalFd = test_fd().into();
+
         // interested in only VmConfig.devices and platform, so set rest to
         // default values
         let mut snapshot_vm_config = VmConfig {
@@ -6204,8 +7437,9 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                     id: Some("vfio0".to_owned()),
                     ..Default::default()
                 },
-                path: Some(PathBuf::from("/sys/bus/pci/devices/0000:01:00.0")),
-                fd: None,
+                // recv_vm_config removes source paths before restore validation.
+                path: None,
+                fd: Default::default(),
                 x_nv_gpudirect_clique: None,
                 x_exclude_mmap_bars: Vec::new(),
                 iommufd_dev_id: None,
@@ -6228,7 +7462,6 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
                 ..platform_fixture()
             }),
             tpm: None,
-            preserved_fds: None,
             net: None,
             landlock_enable: false,
             landlock_rules: None,
@@ -6240,78 +7473,114 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             source_url: PathBuf::from("/path/to/snapshot"),
             prefault: false,
             memory_restore_mode: MemoryRestoreMode::Copy,
-            net_fds: None,
-            vfio_fds: Some(vec![RestoredVfioConfig {
-                id: "vfio0".to_string(),
-                fd: Some(5),
-            }]),
-            iommufd_fd: Some(6),
             resume: false,
             zone_updates: vec![],
+            external_fds: vec![
+                (vfio_target("vfio0"), vec![fd.clone()]),
+                (Target::Iommu, vec![fd.clone()]),
+            ]
+            .into(),
+            ..Default::default()
         };
         valid_config.validate(&snapshot_vm_config).unwrap();
 
         let missing_iommufd = RestoreConfig {
-            iommufd_fd: None,
+            external_fds: vec![(vfio_target("vfio0"), vec![fd.clone()])].into(),
             ..valid_config.clone()
         };
         assert_eq!(
             missing_iommufd.validate(&snapshot_vm_config),
-            Err(ValidationError::VfioFdRequiresIommufdFd)
+            Err(ValidationError::Fd(UpdateFdsError::VfioFdsWithoutIommuFd))
         );
 
         let unknown_id = RestoreConfig {
-            vfio_fds: Some(vec![RestoredVfioConfig {
-                id: "missing".to_string(),
-                fd: Some(5),
-            }]),
+            external_fds: vec![
+                (vfio_target("vfio0"), vec![fd.clone()]),
+                (vfio_target("missing"), vec![fd.clone()]),
+                (Target::Iommu, vec![fd.clone()]),
+            ]
+            .into(),
             ..valid_config.clone()
         };
         assert_eq!(
             unknown_id.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreUnknownVfioId("missing".to_string()))
+            Err(ValidationError::Fd(UpdateFdsError::SuperfluousFds(vec![
+                vfio_target("missing")
+            ])))
         );
 
         let duplicate_id = RestoreConfig {
-            vfio_fds: Some(vec![
-                RestoredVfioConfig {
-                    id: "vfio0".to_string(),
-                    fd: Some(5),
-                },
-                RestoredVfioConfig {
-                    id: "vfio0".to_string(),
-                    fd: Some(6),
-                },
-            ]),
+            external_fds: vec![
+                (vfio_target("vfio0"), vec![fd.clone()]),
+                (vfio_target("vfio0"), vec![fd.clone()]),
+            ]
+            .into(),
             ..valid_config.clone()
         };
         assert_eq!(
             duplicate_id.validate(&snapshot_vm_config),
-            Err(ValidationError::IdentifierNotUnique("vfio0".to_string()))
+            Err(ValidationError::Fd(UpdateFdsError::DuplicatedTargetEntry(
+                vfio_target("vfio0")
+            )))
         );
 
-        // A device saved with an FD must get a replacement FD.
-        snapshot_vm_config.devices.as_mut().unwrap()[0].path = None;
-        snapshot_vm_config.devices.as_mut().unwrap()[0].fd = Some(-1);
         let no_substitution = RestoreConfig {
             vfio_fds: None,
-            iommufd_fd: None,
+            iommufd_fd: Default::default(),
+            external_fds: Default::default(),
             ..valid_config.clone()
         };
         assert_eq!(
             no_substitution.validate(&snapshot_vm_config),
-            Err(ValidationError::RestoreMissingVfioFd("vfio0".to_string()))
+            Err(ValidationError::Fd(UpdateFdsError::MissingFds(
+                vfio_target("vfio0")
+            )))
+        );
+
+        // Every device requires a replacement after source paths are removed.
+        let mut second_device = snapshot_vm_config.devices.as_ref().unwrap()[0].clone();
+        second_device.pci_common.id = Some("vfio1".to_string());
+        snapshot_vm_config
+            .devices
+            .as_mut()
+            .unwrap()
+            .push(second_device);
+        assert_eq!(
+            valid_config.validate(&snapshot_vm_config),
+            Err(ValidationError::Fd(UpdateFdsError::MissingFds(
+                vfio_target("vfio1")
+            )))
+        );
+        let mut complete_substitution = valid_config.clone();
+        complete_substitution.external_fds = vec![
+            (vfio_target("vfio0"), vec![fd.clone()]),
+            (vfio_target("vfio1"), vec![fd.clone()]),
+            (Target::Iommu, vec![fd.clone()]),
+        ]
+        .into();
+        complete_substitution.validate(&snapshot_vm_config).unwrap();
+        snapshot_vm_config.devices.as_mut().unwrap().pop();
+
+        snapshot_vm_config.devices.as_mut().unwrap()[0].path = None;
+        snapshot_vm_config.devices.as_mut().unwrap()[0].fd = Default::default();
+        assert_eq!(
+            no_substitution.validate(&snapshot_vm_config),
+            Err(ValidationError::Fd(UpdateFdsError::MissingFds(
+                vfio_target("vfio0")
+            )))
         );
 
         // The iommufd backend must be enabled in the snapshot config.
         snapshot_vm_config.platform = Some(platform_fixture());
         assert_eq!(
             valid_config.validate(&snapshot_vm_config),
-            Err(ValidationError::IommufdFdRequiresIommufd)
+            Err(ValidationError::Fd(
+                UpdateFdsError::IommufdFdRequiresIommufdBackend
+            ))
         );
     }
 
-    fn platform_fixture() -> PlatformConfig {
+    pub(crate) fn platform_fixture() -> PlatformConfig {
         PlatformConfig {
             num_pci_segments: MAX_NUM_PCI_SEGMENTS,
             iommu_segments: None,
@@ -6320,7 +7589,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             system_uuid: None,
             oem_strings: None,
             iommufd: false,
-            iommufd_fd: None,
+            iommufd_fd: Default::default(),
             vfio_p2p_dma: default_platformconfig_vfio_p2p_dma(),
             system_manufacturer: None,
             system_product_name: None,
@@ -6387,6 +7656,8 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
     #[test]
     fn test_config_validation() {
+        let fd: ExternalFd = test_fd().into();
+
         let mut valid_config = VmConfig {
             cpus: CpusConfig {
                 boot_vcpus: 1,
@@ -6433,18 +7704,10 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             generic_vhost_user: None,
             pmem: None,
             serial: SerialConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Null,
-                    socket: None,
-                },
+                output: ConsoleOutput::Null,
             },
             console: ConsoleConfig {
-                common: CommonConsoleConfig {
-                    file: None,
-                    mode: ConsoleOutputMode::Tty,
-                    socket: None,
-                },
+                output: ConsoleOutput::Tty,
                 pci_common: PciDeviceCommonConfig::default(),
             },
             #[cfg(target_arch = "x86_64")]
@@ -6465,7 +7728,6 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             pci_segments: None,
             platform: None,
             tpm: None,
-            preserved_fds: None,
             landlock_enable: false,
             landlock_rules: None,
             #[cfg(feature = "ivshmem")]
@@ -6484,9 +7746,59 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             Err(ValidationError::ImageTypeRequired)
         );
 
+        for max_phys_bits in [0, 31, 65, u8::MAX] {
+            let mut invalid_config = valid_config.clone();
+            invalid_config.cpus.max_phys_bits = max_phys_bits;
+            assert_eq!(
+                invalid_config.validate(),
+                Err(ValidationError::InvalidMaxPhysBits(max_phys_bits))
+            );
+        }
+
+        for max_phys_bits in [MIN_PHYS_BITS, MAX_PHYS_BITS] {
+            let mut valid_phys_config = valid_config.clone();
+            valid_phys_config.cpus.max_phys_bits = max_phys_bits;
+            valid_phys_config.validate().unwrap();
+        }
+
         let mut invalid_config = valid_config.clone();
-        invalid_config.serial.common.mode = ConsoleOutputMode::Tty;
-        invalid_config.console.common.mode = ConsoleOutputMode::Tty;
+        invalid_config.disks = Some(vec![DiskConfig {
+            num_queues: 0,
+            ..raw_disk_fixture()
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::InvalidNumQueues(0))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.vdpa = Some(vec![VdpaConfig {
+            pci_common: PciDeviceCommonConfig::default(),
+            path: PathBuf::from("/dev/vhost-vdpa-0"),
+            num_queues: 0,
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::InvalidNumQueues(0))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.memory.shared = true;
+        invalid_config.fs = Some(vec![FsConfig {
+            pci_common: PciDeviceCommonConfig::default(),
+            tag: "test".to_string(),
+            socket: PathBuf::from("/tmp/fs.sock"),
+            num_queues: 0,
+            queue_size: 1024,
+        }]);
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::InvalidNumQueues(0))
+        );
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.serial.output = ConsoleOutput::Tty;
+        invalid_config.console.output = ConsoleOutput::Tty;
         valid_config.validate().unwrap();
 
         let mut invalid_config = valid_config.clone();
@@ -6565,27 +7877,11 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         }
 
         let mut invalid_config = valid_config.clone();
-        invalid_config.serial.common.mode = ConsoleOutputMode::File;
-        invalid_config.serial.common.file = None;
+        invalid_config.cpus.max_vcpus = 0;
+        invalid_config.cpus.boot_vcpus = 0;
         assert_eq!(
             invalid_config.validate(),
-            Err(ValidationError::ConsoleFileMissing)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.serial.common.mode = ConsoleOutputMode::Socket;
-        invalid_config.serial.common.socket = None;
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::ConsoleSocketPathMissing)
-        );
-
-        let mut invalid_config = valid_config.clone();
-        invalid_config.console.common.mode = ConsoleOutputMode::Tty;
-        invalid_config.console.common.socket = Some(PathBuf::from("/tmp/console.sock"));
-        assert_eq!(
-            invalid_config.validate(),
-            Err(ValidationError::ConsoleSocketPathUnexpected)
+            Err(ValidationError::CpusBootZero)
         );
 
         let mut invalid_config = valid_config.clone();
@@ -6595,6 +7891,18 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_config.validate(),
             Err(ValidationError::CpusMaxLowerThanBoot(16, 32))
         );
+
+        #[cfg(target_arch = "x86_64")]
+        {
+            let mut hint_config = valid_config.clone();
+            hint_config.cpus.kvm_hint_realtime = true;
+            hint_config.validate().unwrap();
+            hint_config.cpus.kvm_hyperv = true;
+            assert_eq!(
+                hint_config.validate(),
+                Err(ValidationError::KvmHintRealtimeWithKvmHyperv)
+            );
+        }
 
         let mut invalid_config = valid_config.clone();
         invalid_config.cpus.max_vcpus = 16;
@@ -6631,6 +7939,20 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             packages: 1,
         });
         still_valid_config.validate().unwrap();
+
+        let mut invalid_config = valid_config.clone();
+        invalid_config.cpus.boot_vcpus = 1;
+        invalid_config.cpus.max_vcpus = 1;
+        invalid_config.cpus.topology = Some(CpuTopology {
+            threads_per_core: 2,
+            cores_per_die: 65535,
+            dies_per_package: 1,
+            packages: 1,
+        });
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::TooManyCpus(65535))
+        );
 
         // Don't test MAX_SUPPORTED_CPUS because it's not guaranteed
         // as other limitation might come in earlier.
@@ -6701,6 +8023,13 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         assert_eq!(
             invalid_config.validate(),
             Err(ValidationError::VhostUserRequiresSharedMemory)
+        );
+
+        // Checking for shared memory must not assume memory zones.
+        invalid_config.memory.size = 0;
+        assert_eq!(
+            invalid_config.validate(),
+            Err(ValidationError::MemoryZonesMissing)
         );
 
         let mut still_valid_config = valid_config.clone();
@@ -6914,12 +8243,12 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
 
         let mut invalid_config = valid_config.clone();
         invalid_config.net = Some(vec![NetConfig {
-            fds: Some(vec![0]),
+            fds: Some(vec![ExternalFd::default(); 1]),
             ..net_fixture()
         }]);
         assert_eq!(
             invalid_config.validate(),
-            Err(ValidationError::VnetReservedFd(0))
+            Err(ValidationError::VnetReservedFd(-1))
         );
 
         let mut invalid_config = valid_config.clone();
@@ -7164,6 +8493,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ..platform_fixture()
         });
         still_valid_config.vsock = Some(VsockConfig {
+            socket_type: SocketType::Stream,
             pci_common: PciDeviceCommonConfig {
                 iommu: IommuType::Virtio,
                 pci_segment: 1,
@@ -7252,6 +8582,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             ..platform_fixture()
         });
         invalid_config.vsock = Some(VsockConfig {
+            socket_type: SocketType::Stream,
             pci_common: PciDeviceCommonConfig {
                 pci_segment: 1,
                 ..Default::default()
@@ -7491,12 +8822,12 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut fd_valid_config = valid_config.clone();
         fd_valid_config.platform = Some(PlatformConfig {
             iommufd: true,
-            iommufd_fd: Some(8),
+            iommufd_fd: fd.clone(),
             ..platform_fixture()
         });
         fd_valid_config.devices = Some(vec![DeviceConfig {
             path: None,
-            fd: Some(7),
+            fd: fd.clone(),
             ..device_fixture()
         }]);
         fd_valid_config.validate().unwrap();
@@ -7504,7 +8835,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut fd_without_iommufd_fd = fd_valid_config.clone();
         fd_without_iommufd_fd.platform = Some(PlatformConfig {
             iommufd: true,
-            iommufd_fd: None,
+            iommufd_fd: Default::default(),
             ..platform_fixture()
         });
         assert!(matches!(
@@ -7516,7 +8847,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut iommufd_fd_without_iommufd = valid_config.clone();
         iommufd_fd_without_iommufd.platform = Some(PlatformConfig {
             iommufd: false,
-            iommufd_fd: Some(8),
+            iommufd_fd: fd.clone(),
             ..platform_fixture()
         });
         assert!(matches!(
@@ -7528,7 +8859,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut both_path_and_fd = fd_valid_config.clone();
         both_path_and_fd.devices = Some(vec![DeviceConfig {
             path: Some("/device1".into()),
-            fd: Some(7),
+            fd: fd.clone(),
             ..device_fixture()
         }]);
         assert!(matches!(
@@ -7539,7 +8870,7 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
         let mut neither_path_nor_fd = fd_valid_config.clone();
         neither_path_nor_fd.devices = Some(vec![DeviceConfig {
             path: None,
-            fd: None,
+            fd: Default::default(),
             ..device_fixture()
         }]);
         assert!(matches!(
@@ -7785,17 +9116,6 @@ id=\"{id}\",pci_segment={pci_segment},queue_sizes={queue_sizes}"
             invalid_config.validate(),
             Err(ValidationError::InvalidDeviceExcludeMmapBar(6))
         );
-
-        let mut still_valid_config = valid_config.clone();
-        // SAFETY: Safe as the file was just opened
-        let fd1 = unsafe { libc::dup(File::open("/dev/null").unwrap().as_raw_fd()) };
-        // SAFETY: Safe as the file was just opened
-        let fd2 = unsafe { libc::dup(File::open("/dev/null").unwrap().as_raw_fd()) };
-        // SAFETY: safe as both FDs are valid
-        unsafe {
-            still_valid_config.add_preserved_fds(vec![fd1, fd2]);
-        }
-        let _still_valid_config = still_valid_config.clone();
 
         // Valid BDF test
         let mut still_valid_config = valid_config.clone();

@@ -39,8 +39,8 @@ use super::pci_common_config::VirtioPciCommonConfigState;
 use crate::transport::{VIRTIO_PCI_COMMON_CONFIG_ID, VirtioPciCommonConfig, VirtioTransport};
 use crate::{
     ActivateResult, ActivationContext, DEVICE_ACKNOWLEDGE, DEVICE_DRIVER, DEVICE_DRIVER_OK,
-    DEVICE_FAILED, DEVICE_FEATURES_OK, DEVICE_INIT, GuestMemoryMmap, VirtioDevice,
-    VirtioDeviceType, VirtioInterrupt, VirtioInterruptType, mark_device_needs_reset,
+    DEVICE_FAILED, DEVICE_FEATURES_OK, DEVICE_INIT, GuestMemory, VirtioDevice, VirtioDeviceType,
+    VirtioInterrupt, VirtioInterruptType, mark_device_needs_reset,
 };
 
 /// Vector value used to disable MSI for a queue.
@@ -321,7 +321,7 @@ pub(super) struct VirtioPciDeviceState {
 
 pub struct VirtioPciDeviceActivator {
     interrupt: Arc<dyn VirtioInterrupt>,
-    memory: Option<GuestMemoryAtomic<GuestMemoryMmap>>,
+    memory: Option<GuestMemoryAtomic<GuestMemory>>,
     device: Arc<Mutex<dyn VirtioDevice>>,
     device_activated: Arc<AtomicBool>,
     queues: Option<Vec<(u16, Queue, EventFd)>>,
@@ -396,7 +396,7 @@ pub struct VirtioPciDevice {
     queue_evts: Vec<EventFd>,
 
     // Guest memory
-    memory: GuestMemoryAtomic<GuestMemoryMmap>,
+    memory: GuestMemoryAtomic<GuestMemory>,
 
     // Whether to use 64-bit bar location or 32-bit
     use_64bit_bar: bool,
@@ -429,7 +429,7 @@ impl VirtioPciDevice {
     #[expect(clippy::too_many_arguments)]
     pub fn new(
         id: String,
-        memory: GuestMemoryAtomic<GuestMemoryMmap>,
+        memory: GuestMemoryAtomic<GuestMemory>,
         device: Arc<Mutex<dyn VirtioDevice>>,
         access_platform: Option<&Arc<dyn AccessPlatform>>,
         interrupt_manager: &dyn InterruptManager<GroupConfig = MsiIrqGroupConfig>,
@@ -553,8 +553,10 @@ impl VirtioPciDevice {
                 VirtioPciCommonConfigState {
                     driver_status: 0,
                     config_generation: 0,
+                    config_changed: false,
                     device_feature_select: 0,
                     driver_feature_select: 0,
+                    driver_features: 0,
                     queue_select: 0,
                     msix_config: VIRTQ_MSI_NO_VECTOR,
                     msix_queues: vec![VIRTQ_MSI_NO_VECTOR; num_queues as usize],
@@ -984,7 +986,7 @@ impl VirtioInterrupt for VirtioInterruptMsix {
             .trigger(vector as InterruptIndex)
     }
 
-    fn notifier(&self, int_type: VirtioInterruptType) -> Option<EventFd> {
+    fn notifier(&self, int_type: VirtioInterruptType) -> io::Result<Option<EventFd>> {
         let vector = match int_type {
             VirtioInterruptType::Config => self.config_vector.load(Ordering::Acquire),
             VirtioInterruptType::Queue(queue_index) => {
@@ -993,12 +995,12 @@ impl VirtioInterrupt for VirtioInterruptMsix {
         };
 
         if vector == VIRTQ_MSI_NO_VECTOR {
-            return None;
+            return Ok(None);
         }
 
         if vector as usize >= self.msix_table_size {
             warn!("MSI-X vector {vector} out of range, notifier unavailable");
-            return None;
+            return Ok(None);
         }
 
         self.interrupt_source_group
@@ -1146,21 +1148,25 @@ impl PciDevice for VirtioPciDevice {
 
         // Allocate a dedicated BAR if there are some shared memory regions.
         if let Some(shm_list) = device.get_shm_regions() {
+            let shm_addr = shm_list.addr().raw_value();
             let bar = PciBarConfiguration::default()
                 .set_index(VIRTIO_SHM_BAR_INDEX)
-                .set_address(shm_list.addr.raw_value())
-                .set_size(shm_list.mapping.size() as _);
+                .set_address(shm_addr)
+                .set_size(shm_list.len());
 
             // The creation of the PCI BAR and its associated capabilities must
             // happen only during the creation of a brand new VM. When a VM is
             // restored from a known state, the BARs are already created with the
             // right content, therefore we don't need to go through this codepath.
             if !restoring {
-                self.configuration.add_pci_bar(&bar).map_err(|e| {
-                    PciDeviceError::IoRegistrationFailed(shm_list.addr.raw_value(), e)
-                })?;
+                self.configuration
+                    .add_pci_bar(&bar)
+                    .map_err(|e| PciDeviceError::IoRegistrationFailed(shm_addr, e))?;
 
-                for (idx, shm) in shm_list.region_list.iter().enumerate() {
+                for (idx, shm) in shm_list.region_list().iter().enumerate() {
+                    if shm.len == 0 {
+                        continue;
+                    }
                     let shm_cap = VirtioPciCap64::new(
                         PciCapabilityType::SharedMemory,
                         VIRTIO_SHM_BAR_INDEX as u8,
@@ -1203,8 +1209,12 @@ impl PciDevice for VirtioPciDevice {
     }
 
     fn move_bar(&mut self, bar_idx: usize, new_base: u64) -> io::Result<()> {
-        // We only update our idea of the bar in order to support free_bars() above.
-        // The majority of the reallocation is done inside DeviceManager.
+        if bar_idx == VIRTIO_SHM_BAR_INDEX
+            && let Some(shm_list) = self.device.lock().unwrap().get_shm_regions()
+        {
+            shm_list.move_bar(GuestAddress(new_base))?;
+        }
+
         for bar in self.bar_regions.iter_mut() {
             if bar.idx() == bar_idx {
                 *bar = bar.set_address(new_base);
@@ -1427,8 +1437,8 @@ mod tests {
         fn trigger(&self, _index: InterruptIndex) -> io::Result<()> {
             self.event_fd.write(1)
         }
-        fn notifier(&self, _index: InterruptIndex) -> Option<EventFd> {
-            Some(self.event_fd.try_clone().unwrap())
+        fn notifier(&self, _index: InterruptIndex) -> io::Result<Option<EventFd>> {
+            self.event_fd.try_clone().map(Some)
         }
         fn update(
             &self,
@@ -1489,7 +1499,11 @@ mod tests {
     fn notifier_with_oob_vector_returns_none() {
         let intr = make_msix_interrupt(2);
         intr.queues_vectors.lock().unwrap()[0] = 0xFFFE;
-        assert!(intr.notifier(VirtioInterruptType::Queue(0)).is_none());
+        assert!(
+            intr.notifier(VirtioInterruptType::Queue(0))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -1670,9 +1684,8 @@ mod tests {
         let device = Arc::new(Mutex::new(TestVirtioDevice {
             result: Mutex::new(Some(result)),
         }));
-        let memory = GuestMemoryAtomic::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap(),
-        );
+        let memory =
+            GuestMemoryAtomic::new(GuestMemory::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap());
         let barrier = Arc::new(Barrier::new(2));
         let interrupt_cb = Arc::clone(&interrupt) as Arc<dyn VirtioInterrupt>;
         let activator = VirtioPciDeviceActivator {
@@ -1748,16 +1761,11 @@ mod tests {
                 event_fd: EventFd::new(0).unwrap(),
             }))
         }
-
-        fn destroy_group(&self, _group: Arc<dyn InterruptSourceGroup>) -> io::Result<()> {
-            Ok(())
-        }
     }
 
     fn make_virtio_pci_device() -> VirtioPciDevice {
-        let memory = GuestMemoryAtomic::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap(),
-        );
+        let memory =
+            GuestMemoryAtomic::new(GuestMemory::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap());
         let device = Arc::new(Mutex::new(TestVirtioDevice {
             result: Mutex::new(None),
         }));
@@ -1836,9 +1844,8 @@ mod tests {
     }
 
     fn make_virtio_pci_device_with_queues(num_queues: u16) -> VirtioPciDevice {
-        let memory = GuestMemoryAtomic::new(
-            GuestMemoryMmap::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap(),
-        );
+        let memory =
+            GuestMemoryAtomic::new(GuestMemory::from_ranges(&[(GuestAddress(0), 0x1000)]).unwrap());
         let device = Arc::new(Mutex::new(QueuedTestDevice {
             queue_sizes: vec![256; num_queues as usize],
         }));

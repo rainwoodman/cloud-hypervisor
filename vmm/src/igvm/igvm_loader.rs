@@ -47,7 +47,7 @@ use zerocopy::IntoBytes;
 use zerocopy::{FromBytes, FromZeros};
 
 #[cfg(feature = "sev_snp")]
-use crate::GuestMemoryMmap;
+use crate::GuestMemory;
 use crate::cpu;
 use crate::cpu::CpuManager;
 use crate::igvm::loader::Loader;
@@ -102,6 +102,9 @@ pub enum Error {
     Loader(#[source] loader::Error),
     #[error("Parameter too large for parameter area")]
     ParameterTooLarge,
+    #[cfg(feature = "mshv")]
+    #[error("Invalid CPUID page at GPA 0x{0:x} in IGVM file")]
+    InvalidCpuidPage(u64),
     #[error("Error importing isolated pages")]
     ImportIsolatedPages(#[source] hypervisor::HypervisorVmError),
     #[error("Error completing importing isolated pages")]
@@ -174,9 +177,7 @@ fn igvm_memmap_from_ram_range(ram_range: (u64, u64)) -> IGVM_VHS_MEMORY_MAP_ENTR
 }
 
 #[cfg(feature = "sev_snp")]
-fn generate_memory_map(
-    guest_mem: &GuestMemoryMmap,
-) -> Result<Vec<IGVM_VHS_MEMORY_MAP_ENTRY>, Error> {
+fn generate_memory_map(guest_mem: &GuestMemory) -> Result<Vec<IGVM_VHS_MEMORY_MAP_ENTRY>, Error> {
     let mut memory_map = Vec::new();
 
     // Get usable physical memory ranges
@@ -200,6 +201,7 @@ fn import_parameter(
         .expect("parameter area should be present")
     {
         ParameterAreaState::Allocated { data, max_size } => (data, max_size),
+        #[expect(clippy::panic, reason = "invalid IGVM file")]
         ParameterAreaState::Inserted => panic!("igvmfile is not valid"),
     };
     let offset = info.byte_offset as usize;
@@ -218,7 +220,6 @@ fn import_parameter(
     Ok(())
 }
 
-///
 /// Extract guest policy from the IGVM initialization headers.
 #[cfg(feature = "sev_snp")]
 pub(crate) fn extract_guest_policy(igvm_file: &IgvmFile) -> Option<igvm_defs::SnpPolicy> {
@@ -232,9 +233,7 @@ pub(crate) fn extract_guest_policy(igvm_file: &IgvmFile) -> Option<igvm_defs::Sn
     None
 }
 
-///
 /// Extract sev_features from the boot CPU (vp_index 0) VMSA.
-///
 #[cfg(feature = "sev_snp")]
 pub(crate) fn extract_sev_features(igvm_file: &IgvmFile) -> u64 {
     for header in igvm_file.directives() {
@@ -247,7 +246,6 @@ pub(crate) fn extract_sev_features(igvm_file: &IgvmFile) -> u64 {
     0
 }
 
-///
 /// Load the given IGVM file to guest memory.
 /// Right now it only supports SNP based isolation.
 /// We can boot legacy VM with an igvm file without
@@ -393,31 +391,40 @@ pub(crate) fn load_igvm(
                     IgvmPageDataType::CPUID_DATA => {
                         #[cfg(feature = "mshv")]
                         if hypervisor_type == HypervisorType::Mshv {
-                            // SAFETY: CPUID is readonly
-                            unsafe {
-                                let cpuid_page_p = data.as_mut_ptr().cast();
-                                let cpuid_page: &mut hv_psp_cpuid_page = &mut *cpuid_page_p;
-                                for i in 0..cpuid_page.count {
-                                    let leaf = cpuid_page.cpuid_leaf_info[i as usize];
-                                    let mut in_leaf = cpu_manager
-                                        .lock()
-                                        .unwrap()
-                                        .get_cpuid_leaf(
-                                            0,
-                                            leaf.eax_in,
-                                            leaf.ecx_in,
-                                            leaf.xfem_in,
-                                            leaf.xss_in,
-                                        )
-                                        .unwrap();
-                                    if leaf.eax_in == 1 {
-                                        in_leaf[2] &= 0x7FFFFFFF;
-                                    }
-                                    cpuid_page.cpuid_leaf_info[i as usize].eax_out = in_leaf[0];
-                                    cpuid_page.cpuid_leaf_info[i as usize].ebx_out = in_leaf[1];
-                                    cpuid_page.cpuid_leaf_info[i as usize].ecx_out = in_leaf[2];
-                                    cpuid_page.cpuid_leaf_info[i as usize].edx_out = in_leaf[3];
+                            // The page data comes from the IGVM file, which may
+                            // leave it empty (a zero page).
+                            if data.len() < size_of::<hv_psp_cpuid_page>() {
+                                return Err(Error::InvalidCpuidPage(*gpa));
+                            }
+                            // SAFETY: `data` is an owned buffer holding at least
+                            // size_of::<hv_psp_cpuid_page>() bytes, checked above.
+                            // hv_psp_cpuid_page is packed, so it has no alignment
+                            // requirement, and any bit pattern is a valid value.
+                            let cpuid_page: &mut hv_psp_cpuid_page =
+                                unsafe { &mut *data.as_mut_ptr().cast() };
+                            if cpuid_page.count as usize > cpuid_page.cpuid_leaf_info.len() {
+                                return Err(Error::InvalidCpuidPage(*gpa));
+                            }
+                            for i in 0..cpuid_page.count {
+                                let leaf = cpuid_page.cpuid_leaf_info[i as usize];
+                                let mut in_leaf = cpu_manager
+                                    .lock()
+                                    .unwrap()
+                                    .get_cpuid_leaf(
+                                        0,
+                                        leaf.eax_in,
+                                        leaf.ecx_in,
+                                        leaf.xfem_in,
+                                        leaf.xss_in,
+                                    )
+                                    .unwrap();
+                                if leaf.eax_in == 1 {
+                                    in_leaf[2] &= 0x7FFFFFFF;
                                 }
+                                cpuid_page.cpuid_leaf_info[i as usize].eax_out = in_leaf[0];
+                                cpuid_page.cpuid_leaf_info[i as usize].ebx_out = in_leaf[1];
+                                cpuid_page.cpuid_leaf_info[i as usize].ecx_out = in_leaf[2];
+                                cpuid_page.cpuid_leaf_info[i as usize].edx_out = in_leaf[3];
                             }
                         }
                         gpas.push(GpaPages {
@@ -522,12 +529,13 @@ pub(crate) fn load_igvm(
                         .map_err(Error::Loader)?;
                 }
             }
+            #[expect(clippy::panic, reason = "invalid IGVM file")]
             IgvmDirectiveHeader::ParameterArea {
                 number_of_bytes,
                 parameter_area_index,
                 initial_data,
             } => {
-                debug_assert!(number_of_bytes % HV_PAGE_SIZE == 0);
+                debug_assert!(number_of_bytes.is_multiple_of(HV_PAGE_SIZE));
                 debug_assert!(
                     initial_data.is_empty() || initial_data.len() as u64 == *number_of_bytes
                 );
@@ -615,9 +623,6 @@ pub(crate) fn load_igvm(
                             vcpu_locked
                                 .setup_sev_snp_regs(loaded_info.vmsa, nested)
                                 .map_err(Error::SetVmsa)?;
-                            vcpu_locked
-                                .set_sev_control_register(0)
-                                .map_err(Error::SetVmsa)?;
                         }
                     }
                 }
@@ -680,7 +685,7 @@ pub(crate) fn load_igvm(
                 compatibility_mask: _,
                 parameter_area_index,
             }) => {
-                debug_assert!(gpa % HV_PAGE_SIZE == 0);
+                debug_assert!(gpa.is_multiple_of(HV_PAGE_SIZE));
 
                 let area = parameter_areas
                     .get_mut(parameter_area_index)
@@ -688,6 +693,7 @@ pub(crate) fn load_igvm(
                 #[cfg(feature = "kvm")]
                 let page_count = match area {
                     ParameterAreaState::Allocated { max_size, .. } => *max_size / HV_PAGE_SIZE,
+                    #[expect(clippy::panic, reason = "invalid IGVM file")]
                     ParameterAreaState::Inserted => panic!("igvmfile is invalid, multiple insert"),
                 };
                 match area {
@@ -717,6 +723,7 @@ pub(crate) fn load_igvm(
                             )
                             .map_err(Error::Loader)?;
                     }
+                    #[expect(clippy::panic, reason = "invalid IGVM file")]
                     ParameterAreaState::Inserted => panic!("igvmfile is invalid, multiple insert"),
                 }
                 *area = ParameterAreaState::Inserted;

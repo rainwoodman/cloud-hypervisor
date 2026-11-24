@@ -5,8 +5,7 @@
 
 use std::ops::Deref;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::{io, result};
 
@@ -19,7 +18,8 @@ use thiserror::Error;
 use virtio_queue::{Queue, QueueT};
 use vm_memory::{Address, ByteValued, Bytes, GuestAddressSpace, GuestMemoryAtomic, guest_memory};
 use vm_migration::{Migratable, MigratableError, Pausable, Snapshot, Snapshottable, Transportable};
-use vm_virtio::{AccessPlatform, Translatable};
+use vm_virtio::AccessPlatform;
+use vm_virtio::checked_descriptor::DescriptorChainExt;
 use vmm_sys_util::eventfd::EventFd;
 
 use super::{
@@ -29,7 +29,8 @@ use super::{
 };
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
-use crate::{GuestMemoryMmap, VirtioInterrupt, VirtioInterruptType};
+use crate::thread_helper::PauseCommon;
+use crate::{GuestMemory, VirtioInterrupt, VirtioInterruptType};
 
 const QUEUE_SIZE: u16 = 256;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
@@ -176,8 +177,6 @@ enum Error {
     DescriptorChainTooShort,
     #[error("Invalid descriptor")]
     InvalidDescriptor,
-    #[error("Failed to translate guest address")]
-    AddressTranslation(#[source] io::Error),
     #[error("Failed to read request from guest memory")]
     GuestMemoryRead(#[source] guest_memory::Error),
     #[error("Failed to write to guest memory")]
@@ -187,7 +186,7 @@ enum Error {
 }
 
 struct RtcEpollHandler {
-    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    mem: GuestMemoryAtomic<GuestMemory>,
     queue: Queue,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
     queue_evt: EventFd,
@@ -230,9 +229,12 @@ impl RtcEpollHandler {
     ) -> Result<u32, Error>
     where
         M: Deref,
-        M::Target: vm_memory::GuestMemory,
+        M::Target: vm_memory::GuestMemoryBackend,
     {
-        let req_desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
+        let req_desc = desc_chain
+            .next_checked(access_platform)
+            .map_err(|addr| Error::GuestMemoryRead(guest_memory::Error::InvalidGuestAddress(addr)))?
+            .ok_or(Error::DescriptorChainTooShort)?;
         let req_len = req_desc.len();
 
         // The request descriptor must be readable by the device.
@@ -240,18 +242,14 @@ impl RtcEpollHandler {
             return Err(Error::InvalidDescriptor);
         }
 
-        let req_addr = req_desc
-            .addr()
-            .translate_gva(access_platform, req_desc.len() as usize)
-            .map_err(Error::AddressTranslation)?;
-
         // Read the request header
         let req_head: VirtioRtcReqHead = desc_chain
             .memory()
-            .read_obj(req_addr)
+            .read_obj(req_desc.addr())
             .map_err(Error::GuestMemoryRead)?;
 
-        let body_addr = req_addr
+        let body_addr = req_desc
+            .addr()
             .checked_add(size_of::<VirtioRtcReqHead>() as u64)
             .ok_or(Error::InvalidDescriptor)?;
 
@@ -309,17 +307,17 @@ impl RtcEpollHandler {
 
         let response = Self::handle_request(&request);
 
-        let resp_desc = desc_chain.next().ok_or(Error::DescriptorChainTooShort)?;
+        let resp_desc = desc_chain
+            .next_checked(access_platform)
+            .map_err(|addr| {
+                Error::GuestMemoryWrite(guest_memory::Error::InvalidGuestAddress(addr))
+            })?
+            .ok_or(Error::DescriptorChainTooShort)?;
 
         // The response descriptor must be writable by the device.
         if !resp_desc.is_write_only() {
             return Err(Error::InvalidDescriptor);
         }
-
-        let resp_addr = resp_desc
-            .addr()
-            .translate_gva(access_platform, resp_desc.len() as usize)
-            .map_err(Error::AddressTranslation)?;
 
         let resp_len = match &response {
             VirtioRtcResponse::Cfg(_) => size_of::<VirtioRtcRespCfg>() as u32,
@@ -339,7 +337,7 @@ impl RtcEpollHandler {
                 };
                 desc_chain
                     .memory()
-                    .write_obj(einval, resp_addr)
+                    .write_obj(einval, resp_desc.addr())
                     .map_err(Error::GuestMemoryWrite)?;
                 return Ok(size_of::<VirtioRtcRespHead>() as u32);
             }
@@ -350,32 +348,32 @@ impl RtcEpollHandler {
             VirtioRtcResponse::Cfg(resp) => {
                 desc_chain
                     .memory()
-                    .write_obj(*resp, resp_addr)
+                    .write_obj(*resp, resp_desc.addr())
                     .map_err(Error::GuestMemoryWrite)?;
             }
             VirtioRtcResponse::ClockCap(resp) => {
                 desc_chain
                     .memory()
-                    .write_obj(*resp, resp_addr)
+                    .write_obj(*resp, resp_desc.addr())
                     .map_err(Error::GuestMemoryWrite)?;
             }
             VirtioRtcResponse::Read(resp) => {
                 desc_chain
                     .memory()
-                    .write_obj(*resp, resp_addr)
+                    .write_obj(*resp, resp_desc.addr())
                     .map_err(Error::GuestMemoryWrite)?;
             }
             VirtioRtcResponse::CrossCap(resp) => {
                 desc_chain
                     .memory()
-                    .write_obj(*resp, resp_addr)
+                    .write_obj(*resp, resp_desc.addr())
                     .map_err(Error::GuestMemoryWrite)?;
             }
             VirtioRtcResponse::Error(resp) => {
                 warn!("virtio-rtc: responding with error status {}", resp.status);
                 desc_chain
                     .memory()
-                    .write_obj(*resp, resp_addr)
+                    .write_obj(*resp, resp_desc.addr())
                     .map_err(Error::GuestMemoryWrite)?;
             }
         }
@@ -490,14 +488,10 @@ impl RtcEpollHandler {
             })
     }
 
-    fn run(
-        &mut self,
-        paused: &AtomicBool,
-        paused_sync: &Barrier,
-    ) -> result::Result<(), EpollHelperError> {
+    fn run(&mut self, pause_common: &PauseCommon) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
         helper.add_event(self.queue_evt.as_raw_fd(), QUEUE_AVAIL_EVENT)?;
-        helper.run(paused, paused_sync, self)?;
+        helper.run(pause_common, self)?;
 
         Ok(())
     }
@@ -574,12 +568,10 @@ impl Rtc {
             common: VirtioCommon {
                 device_type: VirtioDeviceType::Rtc as u32,
                 queue_sizes: QUEUE_SIZES.to_vec(),
-                paused_sync: Some(Arc::new(Barrier::new(2))),
                 avail_features,
                 acked_features,
                 min_queues: 1,
-                paused: Arc::new(AtomicBool::new(paused)),
-                ..Default::default()
+                ..VirtioCommon::new(paused)?
             },
             id,
             seccomp_action,
@@ -643,8 +635,6 @@ impl VirtioDevice for Rtc {
             access_platform: self.common.access_platform.clone(),
         };
 
-        let paused = Arc::clone(&self.common.paused);
-        let paused_sync = self.common.paused_sync.clone();
         self.common.spawn_worker(
             &self.id,
             &self.seccomp_action,
@@ -652,7 +642,7 @@ impl VirtioDevice for Rtc {
             &self.exit_evt,
             Arc::clone(&device_status),
             Arc::clone(&interrupt_cb),
-            move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+            move |pause_common| handler.run(pause_common),
         )?;
 
         event!("virtio-device", "activated", "id", &self.id);

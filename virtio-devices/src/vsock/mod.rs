@@ -15,6 +15,7 @@ mod unix;
 
 use std::os::unix::io::RawFd;
 use std::result;
+use std::str::FromStr;
 
 use packet::VsockPacket;
 use thiserror::Error;
@@ -55,13 +56,61 @@ mod defs {
         /// Valid with a VSOCK_OP_SHUTDOWN packet: the packet sender will send no more data.
         pub(crate) const VSOCK_FLAGS_SHUTDOWN_SEND: u32 = 2;
 
-        /// Vsock packet type.
+        /// Vsock packet types.
         /// Defined in `/include/uapi/linux/virtio_vsock.h`.
-        ///
-        /// Stream / connection-oriented packet (the only currently valid type).
         pub(crate) const VSOCK_TYPE_STREAM: u16 = 1;
+        pub(crate) const VSOCK_TYPE_SEQPACKET: u16 = 2;
+        pub(crate) const VIRTIO_VSOCK_F_SEQPACKET: u32 = 1;
+        pub(crate) const VSOCK_FLAGS_SEQ_EOM: u32 = 1;
 
         pub(crate) const VSOCK_HOST_CID: u64 = 2;
+    }
+}
+
+pub type ConnectionInfo = (
+    u32, /* local port */
+    u32, /* peer port */
+    u16, /* socket type */
+);
+
+#[derive(
+    Clone, Copy, Debug, Default, Eq, Hash, PartialEq, serde::Serialize, serde::Deserialize,
+)]
+pub enum SocketType {
+    #[default]
+    Stream,
+    SeqPacket,
+}
+
+impl FromStr for SocketType {
+    type Err = &'static str;
+    fn from_str(value: &str) -> result::Result<Self, Self::Err> {
+        match value {
+            "stream" => Ok(Self::Stream),
+            "seqpacket" => Ok(Self::SeqPacket),
+            _ => Err("Socket type must be stream or seqpacket"),
+        }
+    }
+}
+
+impl From<SocketType> for u16 {
+    fn from(socket_type: SocketType) -> Self {
+        match socket_type {
+            SocketType::Stream => defs::uapi::VSOCK_TYPE_STREAM,
+            SocketType::SeqPacket => defs::uapi::VSOCK_TYPE_SEQPACKET,
+        }
+    }
+}
+
+impl TryFrom<u16> for SocketType {
+    type Error = &'static str;
+
+    fn try_from(socket_type: u16) -> result::Result<Self, Self::Error> {
+        match socket_type {
+            defs::uapi::VSOCK_TYPE_STREAM => Ok(Self::Stream),
+            defs::uapi::VSOCK_TYPE_SEQPACKET => Ok(Self::SeqPacket),
+            _ => Err("Unsupported vsock socket type"),
+        }
     }
 }
 
@@ -108,7 +157,6 @@ type Result<T> = result::Result<T, VsockError>;
 /// An event-polling control loop will use `get_polled_fd()` and `get_polled_evset()` to query
 /// the listener for the file descriptor and the set of events it's interested in. When such an
 /// event occurs, the control loop will route the event to the listener via `notify()`.
-///
 pub trait VsockEpollListener {
     /// Get the file descriptor the listener needs polled.
     fn get_polled_fd(&self) -> RawFd;
@@ -148,10 +196,14 @@ pub trait VsockChannel {
 /// Currently, the only implementation we have is `crate::virtio::unix::muxer::VsockMuxer`, which
 /// translates guest-side vsock connections to host-side Unix domain socket connections.
 pub trait VsockBackend: VsockChannel + VsockEpollListener + Send {
-    fn connections(&self) -> Vec<(u32, u32)> {
+    fn connections(&self) -> Vec<ConnectionInfo> {
         Vec::new()
     }
-    fn queue_rst_for_connections(&mut self, _conns: Vec<(u32, u32)>) {}
+    fn queue_rst_for_connections(&mut self, _conns: Vec<ConnectionInfo>) {}
+    fn local_port_last(&self) -> Option<u32> {
+        None
+    }
+    fn set_local_port_last(&mut self, _local_port_last: u32) {}
 }
 
 #[cfg(any(test, fuzzing))]
@@ -172,7 +224,7 @@ pub mod tests {
     use super::*;
     use crate::device::{VirtioInterrupt, VirtioInterruptType};
     use crate::epoll_helper::EpollHelperHandler;
-    use crate::{EpollHelper, GuestMemoryMmap};
+    use crate::{EpollHelper, GuestMemory};
 
     pub struct NoopVirtioInterrupt {}
 
@@ -284,7 +336,7 @@ pub mod tests {
 
     pub struct TestContext {
         pub cid: u64,
-        pub mem: GuestMemoryMmap,
+        pub mem: GuestMemory,
         pub device: Vsock<TestBackend>,
     }
 
@@ -295,7 +347,7 @@ pub mod tests {
             const MEM_SIZE: usize = 1024 * 1024 * 128;
             Self {
                 cid: CID as u64,
-                mem: GuestMemoryMmap::from_ranges(&[(GuestAddress(0), MEM_SIZE)]).unwrap(),
+                mem: GuestMemory::from_ranges(&[(GuestAddress(0), MEM_SIZE)]).unwrap(),
                 device: Vsock::new(
                     String::from("vsock"),
                     CID,
@@ -363,6 +415,8 @@ pub mod tests {
                     interrupt_cb,
                     backend: Arc::new(RwLock::new(TestBackend::new())),
                     access_platform: None,
+                    backend_parked: false,
+                    seqpacket_negotiated: false,
                 },
             }
         }
@@ -370,9 +424,9 @@ pub mod tests {
 
     pub struct EpollHandlerContext<'a> {
         pub(crate) handler: VsockEpollHandler<TestBackend>,
-        pub guest_rxvq: GuestQ<'a>,
-        pub guest_txvq: GuestQ<'a>,
-        pub guest_evvq: GuestQ<'a>,
+        pub guest_rxvq: GuestQ<'a, GuestMemory>,
+        pub guest_txvq: GuestQ<'a, GuestMemory>,
+        pub guest_evvq: GuestQ<'a, GuestMemory>,
     }
 
     // The event helpers are inline so external callers instantiate the

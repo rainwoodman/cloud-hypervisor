@@ -8,8 +8,7 @@
 
 use std::fs::File;
 use std::os::unix::io::AsRawFd;
-use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, Barrier};
+use std::sync::Arc;
 use std::{io, result};
 
 use anyhow::anyhow;
@@ -19,7 +18,7 @@ use seccompiler::SeccompAction;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use virtio_queue::{DescriptorChain, Queue, QueueT};
-use vm_device::UserspaceMapping;
+use vm_allocator::GuestRegion;
 use vm_memory::{
     Address, ByteValued, Bytes, GuestAddress, GuestAddressSpace, GuestMemoryAtomic,
     GuestMemoryError, GuestMemoryLoadGuard,
@@ -36,7 +35,8 @@ use super::{
 };
 use crate::device::ActivationContext;
 use crate::seccomp_filters::Thread;
-use crate::{GuestMemoryMmap, VirtioInterrupt, VirtioInterruptType};
+use crate::thread_helper::PauseCommon;
+use crate::{GuestMemory, VirtioInterrupt, VirtioInterruptType};
 
 const QUEUE_SIZE: u16 = 256;
 const QUEUE_SIZES: &[u16] = &[QUEUE_SIZE];
@@ -107,7 +107,7 @@ struct Request {
 
 impl Request {
     fn parse(
-        desc_chain: &mut DescriptorChain<GuestMemoryLoadGuard<GuestMemoryMmap>>,
+        desc_chain: &mut DescriptorChain<GuestMemoryLoadGuard<GuestMemory>>,
         access_platform: Option<&dyn AccessPlatform>,
     ) -> result::Result<Request, Error> {
         let desc = desc_chain
@@ -155,7 +155,7 @@ impl Request {
 }
 
 struct PmemEpollHandler {
-    mem: GuestMemoryAtomic<GuestMemoryMmap>,
+    mem: GuestMemoryAtomic<GuestMemory>,
     queue: Queue,
     disk: File,
     interrupt_cb: Arc<dyn VirtioInterrupt>,
@@ -218,14 +218,10 @@ impl PmemEpollHandler {
             })
     }
 
-    fn run(
-        &mut self,
-        paused: &AtomicBool,
-        paused_sync: &Barrier,
-    ) -> result::Result<(), EpollHelperError> {
+    fn run(&mut self, pause_common: &PauseCommon) -> result::Result<(), EpollHelperError> {
         let mut helper = EpollHelper::new(&self.kill_evt, &self.pause_evt)?;
         helper.add_event(self.queue_evt.as_raw_fd(), QUEUE_AVAIL_EVENT)?;
-        helper.run(paused, paused_sync, self)?;
+        helper.run(pause_common, self)?;
 
         Ok(())
     }
@@ -269,7 +265,7 @@ pub struct Pmem {
     id: String,
     disk: Option<File>,
     config: VirtioPmemConfig,
-    mapping: UserspaceMapping,
+    _mapping: GuestRegion,
     seccomp_action: SeccompAction,
     exit_evt: EventFd,
 }
@@ -287,7 +283,7 @@ impl Pmem {
         id: String,
         disk: File,
         addr: GuestAddress,
-        mapping: UserspaceMapping,
+        mapping: GuestRegion,
         access_platform_enabled: bool,
         seccomp_action: SeccompAction,
         exit_evt: EventFd,
@@ -304,7 +300,7 @@ impl Pmem {
         } else {
             let config = VirtioPmemConfig {
                 start: addr.raw_value().to_le(),
-                size: (mapping.mapping.size() as u64).to_le(),
+                size: (mapping.size() as u64).to_le(),
             };
 
             let mut avail_features = 1u64 << VIRTIO_F_VERSION_1;
@@ -319,17 +315,15 @@ impl Pmem {
             common: VirtioCommon {
                 device_type: VirtioDeviceType::Pmem as u32,
                 queue_sizes: QUEUE_SIZES.to_vec(),
-                paused_sync: Some(Arc::new(Barrier::new(2))),
                 avail_features,
                 acked_features,
                 min_queues: 1,
-                paused: Arc::new(AtomicBool::new(paused)),
-                ..Default::default()
+                ..VirtioCommon::new(paused)?
             },
             id,
             disk: Some(disk),
             config,
-            mapping,
+            _mapping: mapping,
             seccomp_action,
             exit_evt,
         })
@@ -398,9 +392,6 @@ impl VirtioDevice for Pmem {
                 access_platform: self.common.access_platform(),
             };
 
-            let paused = Arc::clone(&self.common.paused);
-            let paused_sync = self.common.paused_sync.clone();
-
             self.common.spawn_worker(
                 &self.id,
                 &self.seccomp_action,
@@ -408,7 +399,7 @@ impl VirtioDevice for Pmem {
                 &self.exit_evt,
                 Arc::clone(&device_status),
                 Arc::clone(&interrupt_cb),
-                move || handler.run(&paused, paused_sync.as_ref().unwrap()),
+                move |pause_common| handler.run(pause_common),
             )?;
 
             event!("virtio-device", "activated", "id", &self.id);
@@ -420,10 +411,6 @@ impl VirtioDevice for Pmem {
     fn reset(&mut self) {
         self.common.reset();
         event!("virtio-device", "reset", "id", &self.id);
-    }
-
-    fn userspace_mappings(&self) -> Vec<UserspaceMapping> {
-        vec![self.mapping.clone()]
     }
 
     fn set_access_platform(&mut self, access_platform: Arc<dyn AccessPlatform>) {

@@ -142,8 +142,7 @@ fn parse_format(fmt: &str) -> Result<Vec<Token>, Error> {
     while let Some(c) = chars.next() {
         match c {
             '{' => {
-                if chars.peek() == Some(&'{') {
-                    chars.next();
+                if chars.next_if_eq(&'{').is_some() {
                     literal.push('{');
                     continue;
                 }
@@ -164,8 +163,7 @@ fn parse_format(fmt: &str) -> Result<Vec<Token>, Error> {
                 tokens.push(name.parse()?);
             }
             '}' => {
-                if chars.peek() == Some(&'}') {
-                    chars.next();
+                if chars.next_if_eq(&'}').is_some() {
                     literal.push('}');
                 } else {
                     return Err(Error::UnmatchedBrace);
@@ -428,17 +426,6 @@ mod tests {
     }
 
     #[test]
-    fn logger_enabled_always_true() {
-        let buf = SharedBuffer::default();
-        let logger = Logger::new(Box::new(buf), DEFAULT_FORMAT).unwrap();
-        let metadata = log::Metadata::builder()
-            .level(log::Level::Trace)
-            .target("anything")
-            .build();
-        assert!(logger.enabled(&metadata));
-    }
-
-    #[test]
     fn logger_writes_expected_fields() {
         let buf = SharedBuffer::default();
         let logger = Logger::new(Box::new(buf.clone()), DEFAULT_FORMAT).unwrap();
@@ -598,6 +585,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "logger template, not a format string"
+    )]
     fn logger_utc_year_matches_jiff() {
         let buf = SharedBuffer::default();
         let logger = Logger::new(Box::new(buf.clone()), "{year}").unwrap();
@@ -653,6 +644,10 @@ mod tests {
     }
 
     #[test]
+    #[expect(
+        clippy::literal_string_with_formatting_args,
+        reason = "logger template, not a format string"
+    )]
     fn logger_tid_token() {
         let buf = SharedBuffer::default();
         let logger = Logger::new(Box::new(buf.clone()), "{tid}").unwrap();

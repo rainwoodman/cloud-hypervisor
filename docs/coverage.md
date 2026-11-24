@@ -5,9 +5,6 @@ in human-consumable forms.
 
 ## Building a suitable binary
 
-The compiler flag to generate code coverage data has been stabilized since Rust
-1.60.
-
 An instrumented binary can be built with the following command:
 
 ```shell
@@ -34,7 +31,8 @@ Raw data files can be combined with `llvm-profdata`.
 ```shell
 rustup component add llvm-tools-preview
 # Assuming profraw files reside in the current directory and its children directories
-find . -name '*.profraw' -exec llvm-profdata merge -sparse {} -o coverage.profdata \;
+find . -name '*.profraw' \
+    -exec llvm-profdata merge -sparse -o coverage.profdata {} +
 ```
 
 A file named `coverage.profdata` will be generated.
@@ -74,7 +72,6 @@ scripts/dev_cli.sh tests --unit --libc gnu
 
 # Run integration tests
 scripts/dev_cli.sh tests --integration --libc gnu
-scripts/dev_cli.sh tests --integration-live-migration --libc gnu
 
 # Export code coverage report
 scripts/dev_cli.sh tests --coverage -- -- html

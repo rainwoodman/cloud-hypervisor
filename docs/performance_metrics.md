@@ -4,7 +4,8 @@ Cloud Hypervisor provides a [performance metrics](https://github.com/cloud-hyper
 binary for users to generate metrics data from their own
 environment. This document describes how to generate metrics data
 quickly by using Cloud Hypervisor's development script,
-e.g. `dev_cli.sh`. The only prerequisite is [Docker installation](https://docs.docker.com/engine/install/).
+e.g. `dev_cli.sh`. See [testing.md](testing.md#prerequisites) for the
+prerequisites.
 Please note that upon its first invocation, this script will pull a
 fairly large container image.
 
@@ -15,8 +16,13 @@ boot time, block I/O throughput, and network throughput & latency) and
 output the result into a json file:
 
 ```
-$ ./scripts/dev_cli.sh tests --metrics -- -- --report-file /tmp/metrics.json
+$ ./scripts/dev_cli.sh tests --metrics -- -- \
+    --report-file /root/workloads/metrics.json
 ```
+
+The report file must be in a directory that is mounted from the host.
+`/root/workloads` in the container is `$HOME/workloads` on the host.
+Files in the container's `/tmp` are lost when the container exits.
 
 To get a list of available performance tests:
 
@@ -27,7 +33,8 @@ $ ./scripts/dev_cli.sh tests --metrics -- -- --list-tests
 To generate metrics data for selected performance tests, e.g. boot time only:
 
 ```
-$ ./scripts/dev_cli.sh tests --metrics -- -- --report-file /tmp/metrics.json --test-filter boot_time
+$ ./scripts/dev_cli.sh tests --metrics -- -- \
+    --report-file /root/workloads/metrics.json --test-filter boot_time
 ```
 
 To set custom timeout or test iterations for all performance tests:
@@ -38,40 +45,10 @@ $ ./scripts/dev_cli.sh tests --metrics -- -- --timeout 5 --iterations 10
 
 ## Performance Tests Details
 
-The following table lists the supported performance tests with default
-timeout and number of iterations. The `timeout` defines the maximum
+The `timeout` defines the maximum
 execution time of each test for each iteration. The `iteration` defines
 how many times a test needs to be executed to generate the final metrics
 data.
-
-| **Type**   | **Metric**                                 | **Timeout(s)** | **Iterations** |
-|------------|--------------------------------------------|----------------|----------------|
-| Boot Time  | boot_time_ms                               | 2              | 10             |
-|            | boot_time_pmem_ms                          | 2              | 10             |
-|            | boot_time_16_vcpus_ms                      | 2              | 10             |
-|            | boot_time_16_vcpus_pmem_ms                 | 2              | 10             |
-| Virtio Net | virtio_net_latency_us                      | 10             | 5              |
-|            | virtio_net_throughput_single_queue_rx_gbps | 10             | 5              |
-|            | virtio_net_throughput_single_queue_tx_gbps | 10             | 5              |
-|            | virtio_net_throughput_multi_queue_rx_gbps  | 10             | 5              |
-|            | virtio_net_throughput_multi_queue_tx_gbps  | 10             | 5              |
-| Block      | block_read_MiBps                           | 10             | 5              |
-|            | block_write_MiBps                          | 10             | 5              |
-|            | block_random_read_MiBps                    | 10             | 5              |
-|            | block_random_write_MiBps                   | 10             | 5              |
-|            | block_multi_queue_read_MiBps               | 10             | 5              |
-|            | block_multi_queue_write_MiBps              | 10             | 5              |
-|            | block_multi_queue_random_read_MiBps        | 10             | 5              |
-|            | block_multi_queue_random_write_MiBps       | 10             | 5              |
-|            | block_read_IOPS                            | 10             | 5              |
-|            | block_write_IOPS                           | 10             | 5              |
-|            | block_random_read_IOPS                     | 10             | 5              |
-|            | block_random_write_IOPS                    | 10             | 5              |
-|            | block_multi_queue_read_IOPS                | 10             | 5              |
-|            | block_multi_queue_write_IOPS               | 10             | 5              |
-|            | block_multi_queue_random_read_IOPS         | 10             | 5              |
-|            | block_multi_queue_random_write_IOPS        | 10             | 5              |
-| Other      | restore_latency_time_ms                    | 2              | 10             |
 
 ## Output Format
 
@@ -109,7 +86,8 @@ Here is a sample output:
       "mean": 105.9461,
       "std_dev": 7.140993312558129,
       "max": 120.01499999999999,
-      "min": 92.37600000000002
+      "min": 92.37600000000002,
+      "status": "PASSED"
     }
   ]
 }

@@ -7,7 +7,6 @@ use std::any::Any;
 use std::sync::{Arc, Barrier};
 use std::{io, result};
 
-use anyhow::anyhow;
 use event_monitor::event;
 use log::{debug, info};
 use pci::{
@@ -27,6 +26,7 @@ const PVPANIC_DEVICE_ID: u16 = 0x0011;
 const PVPANIC_SUBSYSTEM_VENDOR_ID: u16 = 0x1af4;
 const PVPANIC_SUBSYSTEM_ID: u16 = 0x1100;
 
+const PCI_BAR_REGION_SIZE_MIN: u64 = 0x10;
 pub const PVPANIC_DEVICE_MMIO_SIZE: u64 = 0x2;
 pub const PVPANIC_DEVICE_MMIO_ALIGNMENT: u64 = 0x10;
 
@@ -36,9 +36,9 @@ const PVPANIC_CRASH_LOADED: u8 = 1 << 1;
 #[derive(Debug, Error)]
 pub enum PvPanicError {
     #[error("Failed creating PvPanicDevice")]
-    CreatePvPanicDevice(#[source] anyhow::Error),
+    CreatePvPanicDevice(#[source] MigratableError),
     #[error("Failed to retrieve PciConfigurationState")]
-    RetrievePciConfigurationState(#[source] anyhow::Error),
+    RetrievePciConfigurationState(#[source] MigratableError),
 }
 
 #[derive(Copy, Clone)]
@@ -71,13 +71,9 @@ pub struct PvPanicDeviceState {
 impl PvPanicDevice {
     pub fn new(id: String, bdf: PciBdf, snapshot: Option<&Snapshot>) -> Result<Self, PvPanicError> {
         let pci_configuration_state = vm_migration::state_from_id(snapshot, PCI_CONFIGURATION_ID)
-            .map_err(|e| {
-            PvPanicError::RetrievePciConfigurationState(anyhow!(
-                "Failed to get PciConfigurationState from Snapshot: {e}"
-            ))
-        })?;
+            .map_err(PvPanicError::RetrievePciConfigurationState)?;
 
-        let mut configuration = PciConfiguration::new(
+        let configuration = PciConfiguration::new(
             PVPANIC_VENDOR_ID,
             PVPANIC_DEVICE_ID,
             0x1, // modern pci devices
@@ -91,22 +87,11 @@ impl PvPanicDevice {
             pci_configuration_state,
         );
 
-        let command: [u8; 2] = [0x03, 0x01];
-        let bar_reprogram = configuration.write_config_register(1, 0, &command);
-        assert!(
-            bar_reprogram.is_empty(),
-            "No bar reprogrammig is expected from writing to the COMMAND register"
-        );
-
         let state: Option<PvPanicDeviceState> = snapshot
             .as_ref()
             .map(|s| s.to_state())
             .transpose()
-            .map_err(|e| {
-                PvPanicError::CreatePvPanicDevice(anyhow!(
-                    "Failed to get PvPanicDeviceState from Snapshot: {e}"
-                ))
-            })?;
+            .map_err(PvPanicError::CreatePvPanicDevice)?;
         let events = if let Some(state) = state {
             state.events
         } else {
@@ -147,6 +132,10 @@ impl BusDevice for PvPanicDevice {
     }
 
     fn write(&mut self, _base: u64, _offset: u64, data: &[u8]) -> Option<Arc<Barrier>> {
+        if data.len() != 1 {
+            debug!("Invalid sized write of pvpanic register: {}", data.len());
+            return None;
+        }
         let event = self.event_to_string(data[0]);
         info!("pvpanic got guest event {event}");
         event!("guest", "panic", "event", &event);
@@ -182,10 +171,29 @@ impl PciDevice for PvPanicDevice {
         let mut bars = Vec::new();
         let region_type = PciBarRegionType::Memory32BitRegion;
         let bar_id = 0;
-        let region_size = PVPANIC_DEVICE_MMIO_SIZE;
+        let mut region_size = PVPANIC_DEVICE_MMIO_SIZE.max(PCI_BAR_REGION_SIZE_MIN);
         let restoring = resources.is_some();
+
+        let mut bar_addr = None;
+        if let Some(resources) = resources {
+            for resource in resources {
+                if let Resource::PciBar {
+                    index, base, size, ..
+                } = resource
+                    && index == bar_id as usize
+                {
+                    bar_addr = Some(GuestAddress(base));
+                    region_size = size;
+                    break;
+                }
+            }
+            if bar_addr.is_none() {
+                return Err(PciDeviceError::MissingResource);
+            }
+        }
+
         let bar_addr = mmio32_allocator
-            .allocate(None, region_size, Some(PVPANIC_DEVICE_MMIO_ALIGNMENT))
+            .allocate(bar_addr, region_size, Some(PVPANIC_DEVICE_MMIO_ALIGNMENT))
             .ok_or(PciDeviceError::IoAllocationFailed(region_size))?;
 
         let bar = PciBarConfiguration::default()
@@ -236,6 +244,10 @@ impl PciDevice for PvPanicDevice {
     }
 
     fn read_bar(&mut self, _base: u64, _offset: u64, data: &mut [u8]) {
+        if data.len() != 1 {
+            debug!("Invalid sized read of pvpanic register: {}", data.len());
+            return;
+        }
         data[0] = self.events;
     }
 

@@ -10,6 +10,7 @@ use std::os::unix::io::{AsRawFd, FromRawFd};
 use std::sync::atomic::AtomicU8;
 use std::sync::{Arc, Mutex};
 
+use cloud_hypervisor_fuzz::FuzzCursor;
 use libfuzzer_sys::{fuzz_target, Corpus};
 use seccompiler::SeccompAction;
 use virtio_devices::mem::{MemState, VirtioMemConfig};
@@ -18,14 +19,11 @@ use virtio_devices::{
     VirtioMemMappingSource,
 };
 use virtio_queue::{Queue, QueueT};
-use vm_device::dma_mapping::ExternalDmaMapping;
-use vm_memory::bitmap::AtomicBitmap;
+use vm_allocator::{GuestMemory, GuestRegion};
+use vm_device::dma_mapping::{ExternalDmaMapping, ExternalDmaMappingError};
 use vm_memory::{Bytes, GuestAddress, GuestMemoryAtomic};
 use vm_migration::{Pausable, Snapshottable};
 use vmm_sys_util::eventfd::{EventFd, EFD_NONBLOCK};
-
-type GuestMemoryMmap = vm_memory::GuestMemoryMmap<AtomicBitmap>;
-type GuestRegionMmap = vm_memory::GuestRegionMmap<AtomicBitmap>;
 
 macro_rules! align {
     ($n:expr, $align:expr) => {{
@@ -123,52 +121,27 @@ impl FuzzDmaMapping {
 }
 
 impl ExternalDmaMapping for FuzzDmaMapping {
-    fn map(&self, _iova: u64, _gpa: u64, _size: u64) -> io::Result<()> {
+    fn map(&self, iova: u64, gpa: u64, size: u64) -> Result<(), ExternalDmaMappingError> {
         if self.fail_on_map {
-            return Err(io::Error::other("fuzz map failure"));
+            return Err(ExternalDmaMappingError::Map {
+                iova,
+                gpa,
+                size,
+                source: io::Error::from_raw_os_error(libc::EIO).into(),
+            });
         }
         Ok(())
     }
 
-    fn unmap(&self, _iova: u64, _size: u64) -> io::Result<()> {
+    fn unmap(&self, iova: u64, size: u64) -> Result<(), ExternalDmaMappingError> {
         if self.fail_on_unmap {
-            return Err(io::Error::other("fuzz unmap failure"));
+            return Err(ExternalDmaMappingError::Unmap {
+                iova,
+                size,
+                source: io::Error::from_raw_os_error(libc::EIO).into(),
+            });
         }
         Ok(())
-    }
-}
-
-struct ByteStream<'a> {
-    bytes: &'a [u8],
-    cursor: usize,
-}
-
-impl<'a> ByteStream<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, cursor: 0 }
-    }
-
-    fn next_u8(&mut self) -> u8 {
-        let value = self.bytes[self.cursor % self.bytes.len()];
-        self.cursor = self.cursor.wrapping_add(1);
-        value
-    }
-
-    fn next_u64(&mut self) -> u64 {
-        u64::from_le_bytes([
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-            self.next_u8(),
-        ])
-    }
-
-    fn next_bool(&mut self) -> bool {
-        self.next_u8() & 1 != 0
     }
 }
 
@@ -217,7 +190,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
         return Corpus::Reject;
     }
 
-    let mut stream = ByteStream::new(bytes);
+    let mut stream = FuzzCursor::new(bytes);
     exercise_constructor_paths(&mut stream);
 
     let mut success = false;
@@ -234,7 +207,7 @@ fuzz_target!(|bytes: &[u8]| -> Corpus {
     }
 });
 
-fn exercise_constructor_paths(stream: &mut ByteStream) {
+fn exercise_constructor_paths(stream: &mut FuzzCursor) {
     if let Some(region) = create_region(MEM_SIZE / 2, None) {
         let blocks_state = Arc::new(Mutex::new(BlocksState::new(region.size() as u64)));
         let _ = Mem::new(
@@ -310,10 +283,8 @@ fn exercise_constructor_paths(stream: &mut ByteStream) {
         let _ = virtio_mem.resize(MEM_SIZE as u64 + BLOCK_SIZE);
         let _ = virtio_mem.resize(BLOCK_SIZE * (1 + u64::from(stream.next_u8() % 8)));
 
-        let _ = virtio_mem.add_dma_mapping_handler(
-            VirtioMemMappingSource::Device(7),
-            Arc::new(FuzzDmaMapping::new(false, false)),
-        );
+        let dma_handler: Arc<dyn ExternalDmaMapping> = Arc::new(FuzzDmaMapping::new(false, false));
+        let _ = virtio_mem.add_dma_mapping_handler(VirtioMemMappingSource::Device(7), &dma_handler);
         let _ = virtio_mem.remove_dma_mapping_handler(&VirtioMemMappingSource::Device(7));
         let _ = virtio_mem.remove_dma_mapping_handler(&VirtioMemMappingSource::Device(8));
 
@@ -347,7 +318,7 @@ fn exercise_constructor_paths(stream: &mut ByteStream) {
     let _ = blocks.memory_ranges(0, false);
 }
 
-fn run_device_scenario(stream: &mut ByteStream, kind: ScenarioKind) -> Result<(), ()> {
+fn run_device_scenario(stream: &mut FuzzCursor, kind: ScenarioKind) -> Result<(), ()> {
     let (mut virtio_mem, virtio_mem_region) = create_mem_device_with_options(
         REQUESTED_SIZE,
         stream.next_bool(),
@@ -362,9 +333,8 @@ fn run_device_scenario(stream: &mut ByteStream, kind: ScenarioKind) -> Result<()
 
     let mut queue = setup_virt_queue(stream).ok_or(())?;
 
-    let mut mem =
-        GuestMemoryMmap::from_ranges(&[(GuestAddress(DESC_TABLE_ADDR), QUEUE_REGION_SIZE)])
-            .map_err(|_| ())?;
+    let mut mem = GuestMemory::from_ranges(&[(GuestAddress(DESC_TABLE_ADDR), QUEUE_REGION_SIZE)])
+        .map_err(|_| ())?;
     mem = mem.insert_region(virtio_mem_region).map_err(|_| ())?;
 
     let chains = build_chains(kind, stream);
@@ -377,8 +347,8 @@ fn run_device_scenario(stream: &mut ByteStream, kind: ScenarioKind) -> Result<()
         ScenarioKind::UnmapFailure => FuzzDmaMapping::new(false, true),
         _ => FuzzDmaMapping::new(false, false),
     };
-    let _ = virtio_mem
-        .add_dma_mapping_handler(VirtioMemMappingSource::Container, Arc::new(dma_handler));
+    let dma_handler: Arc<dyn ExternalDmaMapping> = Arc::new(dma_handler);
+    let _ = virtio_mem.add_dma_mapping_handler(VirtioMemMappingSource::Container, &dma_handler);
 
     let guest_memory = GuestMemoryAtomic::new(mem);
 
@@ -425,11 +395,13 @@ fn run_device_scenario(stream: &mut ByteStream, kind: ScenarioKind) -> Result<()
     if kind == ScenarioKind::UnmapFailure {
         let source_id = u32::from(stream.next_u8());
         let source = VirtioMemMappingSource::Device(source_id);
-        let _ =
-            virtio_mem.add_dma_mapping_handler(source, Arc::new(FuzzDmaMapping::new(false, false)));
+        let handler: Arc<dyn ExternalDmaMapping> = Arc::new(FuzzDmaMapping::new(false, false));
+        let map_failing_handler: Arc<dyn ExternalDmaMapping> =
+            Arc::new(FuzzDmaMapping::new(true, false));
+        let _ = virtio_mem.add_dma_mapping_handler(source, &handler);
         let _ = virtio_mem.add_dma_mapping_handler(
             VirtioMemMappingSource::Device(source_id + 1),
-            Arc::new(FuzzDmaMapping::new(true, false)),
+            &map_failing_handler,
         );
         let _ = virtio_mem.remove_dma_mapping_handler(&VirtioMemMappingSource::Device(source_id));
     }
@@ -443,7 +415,7 @@ fn run_device_scenario(stream: &mut ByteStream, kind: ScenarioKind) -> Result<()
     Ok(())
 }
 
-fn create_region(size: usize, numa_id: Option<u32>) -> Option<Arc<GuestRegionMmap>> {
+fn create_region(size: usize, numa_id: Option<u32>) -> Option<Arc<GuestRegion>> {
     create_region_with_options(size, GuestAddress(0), numa_id, false)
 }
 
@@ -452,14 +424,17 @@ fn create_region_with_options(
     start_addr: GuestAddress,
     numa_id: Option<u32>,
     shared: bool,
-) -> Option<Arc<GuestRegionMmap>> {
-    vmm::memory_manager::MemoryManager::create_ram_region(
-        &None, 0, start_addr, size, false, false, shared, None, numa_id, None, false,
+) -> Option<Arc<GuestRegion>> {
+    let mapping = vmm::memory_manager::MemoryManager::create_ram_region_raw(
+        &None, 0, size, false, false, shared, None, numa_id, None, false,
     )
-    .ok()
+    .ok()?;
+    Some(Arc::new(
+        vm_memory::GuestRegionMmap::new(mapping, start_addr)?.into(),
+    ))
 }
 
-fn create_mem_device(initial_size: u64, with_numa: bool) -> Option<(Mem, Arc<GuestRegionMmap>)> {
+fn create_mem_device(initial_size: u64, with_numa: bool) -> Option<(Mem, Arc<GuestRegion>)> {
     create_mem_device_with_options(initial_size, with_numa, false)
 }
 
@@ -467,7 +442,7 @@ fn create_mem_device_with_options(
     initial_size: u64,
     with_numa: bool,
     shared: bool,
-) -> Option<(Mem, Arc<GuestRegionMmap>)> {
+) -> Option<(Mem, Arc<GuestRegion>)> {
     let numa_id = if with_numa { Some(0) } else { None };
 
     let region = create_region_with_options(MEM_SIZE, GuestAddress(0), numa_id, shared)?;
@@ -488,7 +463,7 @@ fn create_mem_device_with_options(
     .map(|mem| (mem, region))
 }
 
-fn setup_virt_queue(stream: &mut ByteStream) -> Option<Queue> {
+fn setup_virt_queue(stream: &mut FuzzCursor) -> Option<Queue> {
     let mut queue = Queue::new(QUEUE_SIZE).ok()?;
     queue.set_size(QUEUE_SIZE);
     queue.set_next_avail(0);
@@ -509,7 +484,7 @@ fn setup_virt_queue(stream: &mut ByteStream) -> Option<Queue> {
     Some(queue)
 }
 
-fn build_chains(kind: ScenarioKind, stream: &mut ByteStream) -> Vec<ChainSpec> {
+fn build_chains(kind: ScenarioKind, stream: &mut FuzzCursor) -> Vec<ChainSpec> {
     match kind {
         ScenarioKind::Nominal => {
             let mut chains = vec![
@@ -584,7 +559,7 @@ fn build_chains(kind: ScenarioKind, stream: &mut ByteStream) -> Vec<ChainSpec> {
     }
 }
 
-fn populate_queue_memory(mem: &GuestMemoryMmap, queue: &mut Queue, chains: &[ChainSpec]) -> bool {
+fn populate_queue_memory(mem: &GuestMemory, queue: &mut Queue, chains: &[ChainSpec]) -> bool {
     if chains.len() * 2 > QUEUE_SIZE as usize {
         return false;
     }
@@ -685,19 +660,12 @@ fn populate_queue_memory(mem: &GuestMemoryMmap, queue: &mut Queue, chains: &[Cha
     true
 }
 
-fn write_u16(mem: &GuestMemoryMmap, addr: u64, value: u16) -> bool {
+fn write_u16(mem: &GuestMemory, addr: u64, value: u16) -> bool {
     mem.write_slice(&value.to_le_bytes(), GuestAddress(addr))
         .is_ok()
 }
 
-fn write_desc(
-    mem: &GuestMemoryMmap,
-    index: u16,
-    addr: u64,
-    len: u32,
-    flags: u16,
-    next: u16,
-) -> bool {
+fn write_desc(mem: &GuestMemory, index: u16, addr: u64, len: u32, flags: u16, next: u16) -> bool {
     let desc_addr = DESC_TABLE_ADDR + u64::from(index) * 16;
     let mut raw = [0u8; 16];
     raw[..8].copy_from_slice(&addr.to_le_bytes());
